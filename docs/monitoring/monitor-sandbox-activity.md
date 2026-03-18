@@ -47,7 +47,7 @@ Key fields in the output include the following:
 - Blueprint run ID, which is the identifier for the most recent blueprint execution.
 - Inference provider, which shows the active provider, model, and endpoint.
 
-If you run `openclaw nemoclaw status` from inside the sandbox, the command detects the sandbox context and reports it. Host-level sandbox and inference details are not available from within the sandbox. Run `openshell sandbox status` on the host for full host-side details.
+If you run `openclaw nemoclaw status` from inside the sandbox, the command detects the sandbox context and reports it. Host-level sandbox and inference details are not available from within the sandbox. Run `openshell sandbox list` on the host to check the underlying sandbox state.
 
 ## View Blueprint and Sandbox Logs
 

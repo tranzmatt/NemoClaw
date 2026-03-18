@@ -89,7 +89,7 @@ This is expected behavior.
 When running `openclaw nemoclaw status` inside an active sandbox, host-side sandbox state and inference configuration are not inspectable.
 The status command detects the sandbox context and reports "active (inside sandbox)" instead.
 
-Run `openshell sandbox status` on the host for full details.
+Run `openshell sandbox list` on the host to check the underlying sandbox state.
 
 ### Inference requests time out
 

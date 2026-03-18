@@ -65,7 +65,7 @@ $ openclaw nemoclaw status [--json]
 
 When running inside an active OpenShell sandbox, the status command detects the sandbox context and reports "active (inside sandbox)" instead of false negatives.
 Host-side sandbox state and inference configuration are not inspectable from inside the sandbox.
-Run `openshell sandbox status` on the host for full details.
+Run `openshell sandbox list` on the host to check the underlying sandbox state.
 
 ### `openclaw nemoclaw logs`
 
