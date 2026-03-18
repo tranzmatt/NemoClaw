@@ -12,6 +12,7 @@ const {
   getLocalProviderContainerReachabilityCheck,
   getLocalProviderHealthCheck,
   getOllamaModelOptions,
+  getOllamaWarmupCommand,
   parseOllamaList,
   validateLocalProvider,
 } = require("../bin/lib/local-inference");
@@ -114,5 +115,12 @@ describe("local inference helpers", () => {
       getDefaultOllamaModel(() => "qwen3:32b  abc  20 GB  now\ngemma3:4b  def  3 GB  now"),
       "qwen3:32b",
     );
+  });
+
+  it("builds a background warmup command for ollama models", () => {
+    const command = getOllamaWarmupCommand("nemotron-3-nano:30b");
+    assert.match(command, /^nohup curl -s http:\/\/localhost:11434\/api\/generate /);
+    assert.match(command, /"model":"nemotron-3-nano:30b"/);
+    assert.match(command, /"keep_alive":"15m"/);
   });
 });

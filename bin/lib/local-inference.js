@@ -114,6 +114,20 @@ function getDefaultOllamaModel(runCapture) {
   return models.includes(DEFAULT_OLLAMA_MODEL) ? DEFAULT_OLLAMA_MODEL : models[0];
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function getOllamaWarmupCommand(model, keepAlive = "15m") {
+  const payload = JSON.stringify({
+    model,
+    prompt: "hello",
+    stream: false,
+    keep_alive: keepAlive,
+  });
+  return `nohup curl -s http://localhost:11434/api/generate -H 'Content-Type: application/json' -d ${shellQuote(payload)} >/dev/null 2>&1 &`;
+}
+
 module.exports = {
   CONTAINER_REACHABILITY_IMAGE,
   DEFAULT_OLLAMA_MODEL,
@@ -123,6 +137,7 @@ module.exports = {
   getLocalProviderContainerReachabilityCheck,
   getLocalProviderHealthCheck,
   getOllamaModelOptions,
+  getOllamaWarmupCommand,
   parseOllamaList,
   validateLocalProvider,
 };

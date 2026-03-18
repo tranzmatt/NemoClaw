@@ -12,6 +12,7 @@ const {
   getDefaultOllamaModel,
   getLocalProviderBaseUrl,
   getOllamaModelOptions,
+  getOllamaWarmupCommand,
   validateLocalProvider,
 } = require("./local-inference");
 const {
@@ -686,6 +687,8 @@ async function setupInference(sandboxName, model, provider) {
       `openshell inference set --no-verify --provider ollama-local --model ${model} 2>/dev/null || true`,
       { ignoreError: true }
     );
+    console.log(`  Priming Ollama model: ${model}`);
+    run(getOllamaWarmupCommand(model), { ignoreError: true });
   }
 
   registry.updateSandbox(sandboxName, { model, provider });
@@ -706,7 +709,7 @@ async function setupOpenclaw(sandboxName, model, provider) {
     const script = buildSandboxConfigSyncScript(sandboxConfig);
     run(`cat <<'EOF_NEMOCLAW_SYNC' | openshell sandbox connect "${sandboxName}"
 ${script}
-EOF_NEMOCLAW_SYNC`);
+EOF_NEMOCLAW_SYNC`, { stdio: ["ignore", "ignore", "inherit"] });
   }
 
   console.log("  ✓ OpenClaw gateway launched inside sandbox");
