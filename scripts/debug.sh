@@ -81,6 +81,20 @@ done
 
 TMPDIR_BASE="${TMPDIR:-/tmp}"
 COLLECT_DIR=$(mktemp -d "${TMPDIR_BASE}/nemoclaw-debug-XXXXXX")
+SANDBOX_SSH_CONFIG=""
+cleanup() {
+  rm -rf "$COLLECT_DIR"
+  if [ -n "$SANDBOX_SSH_CONFIG" ]; then
+    rm -f "$SANDBOX_SSH_CONFIG"
+  fi
+}
+trap cleanup EXIT
+
+# Platform detection
+IS_MACOS=false
+if [ "$(uname -s)" = "Darwin" ]; then
+  IS_MACOS=true
+fi
 
 # Detect timeout binary (GNU coreutils; gtimeout on macOS via brew)
 TIMEOUT_BIN=""
@@ -134,7 +148,10 @@ collect() {
 
 if [ -z "$SANDBOX_NAME" ]; then
   if command -v openshell &>/dev/null; then
-    SANDBOX_NAME=$(openshell sandbox list 2>/dev/null | head -1 | awk '{print $1}' || true)
+    SANDBOX_NAME=$(
+      openshell sandbox list 2>/dev/null \
+        | awk 'NF { if (tolower($1) == "name") next; print $1; exit }'
+    ) || true
   fi
   SANDBOX_NAME="${SANDBOX_NAME:-default}"
 fi
@@ -152,7 +169,12 @@ section "System"
 collect "date" date
 collect "uname" uname -a
 collect "uptime" uptime
-collect "free" free -m
+if [ "$IS_MACOS" = true ]; then
+  # shellcheck disable=SC2016
+  collect "memory" sh -c 'echo "Physical: $(($(sysctl -n hw.memsize) / 1048576)) MB"; vm_stat'
+else
+  collect "free" free -m
+fi
 
 if [ "$QUICK" = false ]; then
   collect "df" df -h
@@ -161,12 +183,20 @@ fi
 # -- Processes --
 
 section "Processes"
-collect "ps-cpu" sh -c 'ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -30'
+if [ "$IS_MACOS" = true ]; then
+  collect "ps-cpu" sh -c 'ps -eo pid,ppid,comm,%mem,%cpu | sort -k5 -rn | head -30'
+else
+  collect "ps-cpu" sh -c 'ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -30'
+fi
 
 if [ "$QUICK" = false ]; then
-  collect "ps-mem" sh -c 'ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%mem | head -30'
-  collect "ps-all" ps -ef
-  collect "top" sh -c 'top -b -n 1 | head -50'
+  if [ "$IS_MACOS" = true ]; then
+    collect "ps-mem" sh -c 'ps -eo pid,ppid,comm,%mem,%cpu | sort -k4 -rn | head -30'
+    collect "top" sh -c 'top -l 1 | head -50'
+  else
+    collect "ps-mem" sh -c 'ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%mem | head -30'
+    collect "top" sh -c 'top -b -n 1 | head -50'
+  fi
 fi
 
 # -- GPU --
@@ -204,21 +234,35 @@ section "OpenShell"
 collect "openshell-status" openshell status
 collect "openshell-sandbox-list" openshell sandbox list
 collect "openshell-sandbox-get" openshell sandbox get "$SANDBOX_NAME"
-collect "openshell-sandbox-logs" openshell sandbox logs "$SANDBOX_NAME"
+collect "openshell-logs" openshell logs "$SANDBOX_NAME"
 
 if [ "$QUICK" = false ]; then
   collect "openshell-gateway-info" openshell gateway info
 fi
 
-# -- Sandbox internals (via openshell sandbox exec) --
+# -- Sandbox internals (via SSH using openshell ssh-config) --
 
-if command -v openshell &>/dev/null && openshell sandbox list 2>/dev/null | grep -q "$SANDBOX_NAME"; then
+if command -v openshell &>/dev/null \
+  && openshell sandbox list 2>/dev/null \
+    | awk 'NF { if (tolower($1) == "name") next; print $1 }' \
+    | grep -Fxq -- "$SANDBOX_NAME"; then
   section "Sandbox Internals"
-  collect "sandbox-ps" openshell sandbox exec "$SANDBOX_NAME" -- ps -ef
-  collect "sandbox-free" openshell sandbox exec "$SANDBOX_NAME" -- free -m
-  if [ "$QUICK" = false ]; then
-    collect "sandbox-top" openshell sandbox exec "$SANDBOX_NAME" -- sh -c 'top -b -n 1 | head -50'
-    collect "sandbox-gateway-log" openshell sandbox exec "$SANDBOX_NAME" -- tail -200 /tmp/gateway.log
+
+  # Build a temporary SSH config so we can run commands inside the sandbox.
+  # This follows the pattern from OpenShell's own demo.sh.
+  SANDBOX_SSH_CONFIG=$(mktemp "${TMPDIR_BASE}/nemoclaw-ssh-XXXXXX")
+  if openshell sandbox ssh-config "$SANDBOX_NAME" > "$SANDBOX_SSH_CONFIG" 2>/dev/null; then
+    SANDBOX_SSH_HOST="openshell-${SANDBOX_NAME}"
+    SANDBOX_SSH_OPTS=(-F "$SANDBOX_SSH_CONFIG" -o StrictHostKeyChecking=no -o ConnectTimeout=10)
+
+    collect "sandbox-ps" ssh "${SANDBOX_SSH_OPTS[@]}" "$SANDBOX_SSH_HOST" ps -ef
+    collect "sandbox-free" ssh "${SANDBOX_SSH_OPTS[@]}" "$SANDBOX_SSH_HOST" free -m
+    if [ "$QUICK" = false ]; then
+      collect "sandbox-top" ssh "${SANDBOX_SSH_OPTS[@]}" "$SANDBOX_SSH_HOST" 'top -b -n 1 | head -50'
+      collect "sandbox-gateway-log" ssh "${SANDBOX_SSH_OPTS[@]}" "$SANDBOX_SSH_HOST" tail -200 /tmp/gateway.log
+    fi
+  else
+    warn "Could not generate SSH config for sandbox '${SANDBOX_NAME}', skipping internals"
   fi
 fi
 
@@ -226,13 +270,21 @@ fi
 
 if [ "$QUICK" = false ]; then
   section "Network"
-  collect "ss" ss -ltnp
-  collect "ip-addr" ip addr
-  collect "ip-route" ip route
-  collect "resolv-conf" cat /etc/resolv.conf
+  if [ "$IS_MACOS" = true ]; then
+    collect "listening" sh -c 'netstat -anp tcp | grep LISTEN'
+    collect "ifconfig" ifconfig
+    collect "routes" netstat -rn
+    collect "dns-config" scutil --dns
+  else
+    collect "ss" ss -ltnp
+    collect "ip-addr" ip addr
+    collect "ip-route" ip route
+    collect "resolv-conf" cat /etc/resolv.conf
+  fi
   collect "nslookup" nslookup integrate.api.nvidia.com
-  collect "curl-models" curl -I -s https://integrate.api.nvidia.com/v1/models
-  collect "lsof-net" lsof -i -P -n
+  # shellcheck disable=SC2016
+  collect "curl-models" sh -c 'code=$(curl -s -o /dev/null -w "%{http_code}" https://integrate.api.nvidia.com/v1/models); echo "HTTP $code"; if [ "$code" -ge 200 ] && [ "$code" -lt 500 ]; then echo "NIM API reachable"; else echo "NIM API unreachable"; exit 1; fi'
+  collect "lsof-net" sh -c 'lsof -i -P -n 2>/dev/null | head -50'
   collect "lsof-18789" lsof -i :18789
 fi
 
@@ -240,14 +292,23 @@ fi
 
 if [ "$QUICK" = false ]; then
   section "Kernel / IO"
-  collect "vmstat" vmstat 1 5
-  collect "iostat" iostat -xz 1 5
+  if [ "$IS_MACOS" = true ]; then
+    collect "vmstat" vm_stat
+    collect "iostat" iostat -c 5 -w 1
+  else
+    collect "vmstat" vmstat 1 5
+    collect "iostat" iostat -xz 1 5
+  fi
 fi
 
 # -- dmesg (always, last 100 lines) --
 
 section "Kernel Messages"
-collect "dmesg" sh -c 'dmesg | tail -100'
+if [ "$IS_MACOS" = true ]; then
+  collect "system-log" sh -c 'log show --last 5m --predicate "eventType == logEvent" --style compact 2>/dev/null | tail -100'
+else
+  collect "dmesg" sh -c 'dmesg | tail -100'
+fi
 
 # ── Produce tarball if requested ─────────────────────────────────
 
@@ -256,14 +317,6 @@ if [ -n "$OUTPUT" ]; then
   info "Tarball written to ${OUTPUT}"
   warn "Known secrets are auto-redacted, but please review for any remaining sensitive data before sharing."
   info "Attach this file to your GitHub issue."
-fi
-
-# ── Cleanup ──────────────────────────────────────────────────────
-
-if [ -z "$OUTPUT" ]; then
-  rm -rf "$COLLECT_DIR"
-else
-  info "Raw files kept in ${COLLECT_DIR}"
 fi
 
 echo ""
