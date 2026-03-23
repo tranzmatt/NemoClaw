@@ -180,5 +180,6 @@ RUN setfacl -m u:gateway:r /sandbox/.openclaw/openclaw.json 2>/dev/null \
 
 # Entrypoint runs as root to start the gateway as the gateway user,
 # then drops to sandbox for agent commands. See nemoclaw-start.sh.
+# hadolint ignore=DL3002
 ENTRYPOINT ["/usr/local/bin/nemoclaw-start"]
 CMD []
