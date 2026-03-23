@@ -85,6 +85,9 @@ describe("onboard/config", () => {
 
     const endpointCases: [EndpointType, string][] = [
       ["build", "NVIDIA Endpoints"],
+      ["openai", "OpenAI"],
+      ["anthropic", "Anthropic"],
+      ["gemini", "Google Gemini"],
       ["ollama", "Local Ollama"],
       ["vllm", "Local vLLM"],
       ["nim-local", "Local NVIDIA NIM"],
@@ -98,6 +101,11 @@ describe("onboard/config", () => {
         expect(describeOnboardProvider(config)).toBe(expected);
       });
     }
+
+    it("returns Unknown for unsupported endpoint types", () => {
+      const config = makeConfig({ endpointType: "build", providerLabel: undefined }) as NemoClawOnboardConfig;
+      expect(describeOnboardProvider({ ...config, endpointType: "bogus" as EndpointType })).toBe("Unknown");
+    });
   });
 
   // -------------------------------------------------------------------------

@@ -197,13 +197,6 @@ if nemoclaw --help > /dev/null 2>&1; then
 else
   fail "nemoclaw --help failed"
 fi
-=======
-if nemoclaw --help > /dev/null 2>&1; then
-  pass "nemoclaw --help exits 0"
-else
-  fail "nemoclaw --help failed"
-fi
->>>>>>> 9c46be6 (fix: align provider onboarding follow-up checks)
 
 # ══════════════════════════════════════════════════════════════════
 # Phase 3: Sandbox verification
