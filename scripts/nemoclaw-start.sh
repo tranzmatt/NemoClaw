@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# NemoClaw sandbox entrypoint. Configures OpenClaw and starts the dashboard
-# gateway inside the sandbox so the forwarded host port has a live upstream.
+# NemoClaw sandbox entrypoint. Runs as root (via ENTRYPOINT) to start the
+# gateway as the 'gateway' user, then drops to 'sandbox' for agent commands.
+#
+# SECURITY: The gateway runs as a separate user so the sandboxed agent cannot
+# kill it or restart it with a tampered config (CVE: fake-HOME bypass).
+# The config hash is verified at startup to detect tampering.
 #
 # Optional env:
 #   NVIDIA_API_KEY   API key for NVIDIA-hosted inference
@@ -14,6 +18,24 @@ set -euo pipefail
 NEMOCLAW_CMD=("$@")
 CHAT_UI_URL="${CHAT_UI_URL:-http://127.0.0.1:18789}"
 PUBLIC_PORT=18789
+
+# ── Config integrity check ──────────────────────────────────────
+# The config hash was pinned at build time. If it doesn't match,
+# someone (or something) has tampered with the config.
+
+verify_config_integrity() {
+  local hash_file="/sandbox/.openclaw/.config-hash"
+  if [ ! -f "$hash_file" ]; then
+    echo "[SECURITY] Config hash file missing — cannot verify openclaw.json integrity"
+    return 0  # Don't block on older images that predate this check
+  fi
+  if ! (cd /sandbox/.openclaw && sha256sum -c "$hash_file" --status 2>/dev/null); then
+    echo "[SECURITY] openclaw.json integrity check FAILED — config may have been tampered with"
+    echo "[SECURITY] Expected hash: $(cat "$hash_file")"
+    echo "[SECURITY] Actual hash:   $(sha256sum /sandbox/.openclaw/openclaw.json)"
+    return 1
+  fi
+}
 
 write_auth_profile() {
   if [ -z "${NVIDIA_API_KEY:-}" ]; then
@@ -40,11 +62,10 @@ PYAUTH
 print_dashboard_urls() {
   local token chat_ui_base local_url remote_url
 
-  token="$(
-    python3 - <<'PYTOKEN'
+  token="$(python3 - <<'PYTOKEN'
 import json
 import os
-path = os.path.expanduser('~/.openclaw/openclaw.json')
+path = '/sandbox/.openclaw/openclaw.json'
 try:
     cfg = json.load(open(path))
 except Exception:
@@ -52,7 +73,7 @@ except Exception:
 else:
     print(cfg.get('gateway', {}).get('auth', {}).get('token', ''))
 PYTOKEN
-  )"
+)"
 
   chat_ui_base="${CHAT_UI_URL%/}"
   local_url="http://127.0.0.1:${PUBLIC_PORT}/"
@@ -67,7 +88,8 @@ PYTOKEN
 }
 
 start_auto_pair() {
-  nohup python3 - <<'PYAUTOPAIR' >>/tmp/gateway.log 2>&1 &
+  # Run auto-pair as sandbox user (it talks to the gateway via CLI)
+  nohup gosu sandbox python3 - <<'PYAUTOPAIR' >> /tmp/gateway.log 2>&1 &
 import json
 import subprocess
 import time
@@ -127,17 +149,28 @@ PYAUTOPAIR
   echo "[gateway] auto-pair watcher launched (pid $!)"
 }
 
-echo 'Setting up NemoClaw...'
-# openclaw doctor --fix and openclaw plugins install already ran at build time
-# (Dockerfile Step 28). At runtime they fail with EPERM against the locked
-# /sandbox/.openclaw directory and accomplish nothing.
-write_auth_profile
+# ── Main ─────────────────────────────────────────────────────────
 
+echo 'Setting up NemoClaw...'
+
+# Verify config integrity before starting anything
+verify_config_integrity
+
+# Write auth profile as sandbox user (needs writable .openclaw-data)
+gosu sandbox bash -c "$(declare -f write_auth_profile); write_auth_profile"
+
+# If a command was passed (e.g., "openclaw agent ..."), run it as sandbox user
 if [ ${#NEMOCLAW_CMD[@]} -gt 0 ]; then
-  exec "${NEMOCLAW_CMD[@]}"
+  exec gosu sandbox "${NEMOCLAW_CMD[@]}"
 fi
 
-nohup openclaw gateway run >/tmp/gateway.log 2>&1 &
-echo "[gateway] openclaw gateway launched (pid $!)"
+# Start the gateway as the 'gateway' user.
+# SECURITY: The sandbox user cannot kill this process because it runs
+# under a different UID. The fake-HOME attack no longer works because
+# the agent cannot restart the gateway with a tampered config.
+nohup gosu gateway openclaw gateway run > /tmp/gateway.log 2>&1 &
+GATEWAY_PID=$!
+echo "[gateway] openclaw gateway launched as 'gateway' user (pid $GATEWAY_PID)"
+
 start_auto_pair
 print_dashboard_urls
