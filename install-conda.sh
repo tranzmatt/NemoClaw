@@ -8,7 +8,7 @@
 # Usage:
 #   bash install-conda.sh --conda-env <name> [--reprocess] [--non-interactive]
 #
-# The conda environment will be created with nodejs (22.x) and python (3.11+)
+# The conda environment will be created with nodejs (22.x) and python (3.12.x)
 # via conda-forge if it does not already exist.  All binaries (openshell,
 # nemoclaw) are installed into the environment's prefix so nothing leaks into
 # the system or the user's home PATH.
@@ -230,10 +230,10 @@ ensure_conda_env() {
     fi
     warn "Conda environment '${env_name}' already exists — continuing (--reprocess)."
   else
-    info "Creating conda environment '${env_name}' with Python 3.11 and Node.js 22…"
+    info "Creating conda environment '${env_name}' with Python 3.12 and Node.js 22…"
     spin "Creating conda env '${env_name}'" \
       conda create -y -n "$env_name" -c conda-forge \
-        "python>=3.11,<3.13" \
+        "python>=3.12,<3.13" \
         "nodejs>=22.16"
     ok "Conda environment '${env_name}' created."
   fi
