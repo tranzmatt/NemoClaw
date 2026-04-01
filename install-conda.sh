@@ -304,9 +304,9 @@ install_openshell_to_prefix() {
 
   info "Downloading openshell ${ASSET}…"
   if command_exists gh; then
-    GH_TOKEN="${GITHUB_TOKEN:-}" gh release download --repo NVIDIA/OpenShell \
+    GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" gh release download --repo NVIDIA/OpenShell \
       --pattern "$ASSET" --dir "$tmpdir"
-    GH_TOKEN="${GITHUB_TOKEN:-}" gh release download --repo NVIDIA/OpenShell \
+    GH_TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}" gh release download --repo NVIDIA/OpenShell \
       --pattern "$CHECKSUM_FILE" --dir "$tmpdir"
   else
     curl -fsSL "https://github.com/NVIDIA/OpenShell/releases/latest/download/${ASSET}" \
