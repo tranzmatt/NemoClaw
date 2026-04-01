@@ -186,7 +186,7 @@ usage() {
   printf "    NEMOCLAW_NON_INTERACTIVE=1    Same as --non-interactive\n"
   printf "    NEMOCLAW_SANDBOX_NAME         Sandbox name to create/use\n"
   printf "    NEMOCLAW_RECREATE_SANDBOX=1   Recreate an existing sandbox\n"
-  printf "    NEMOCLAW_INSTALL_TAG          Git ref to install (default: latest release)\n"
+  printf "    NEMOCLAW_INSTALL_TAG          Branch or tag to install (default: latest release)\n"
   printf "    NEMOCLAW_PROVIDER             cloud | ollama | nim | vllm\n"
   printf "    NEMOCLAW_MODEL                Inference model to configure\n"
   printf "    NEMOCLAW_POLICY_MODE          suggested | custom | skip\n"
@@ -215,7 +215,7 @@ conda_env_exists() {
   local env_name="$1"
   conda env list 2>/dev/null \
     | awk '{print $1}' \
-    | grep -qx "$env_name"
+    | grep -Fxq -- "$env_name"
 }
 
 ensure_conda_env() {
@@ -316,8 +316,13 @@ install_openshell_to_prefix() {
   fi
 
   info "Verifying SHA-256 checksum…"
-  (cd "$tmpdir" && grep -F "$ASSET" "$CHECKSUM_FILE" | shasum -a 256 -c -) \
-    || error "SHA-256 checksum verification failed for $ASSET"
+  if command_exists shasum; then
+    (cd "$tmpdir" && grep -F "$ASSET" "$CHECKSUM_FILE" | shasum -a 256 -c -) \
+      || error "SHA-256 checksum verification failed for $ASSET"
+  else
+    (cd "$tmpdir" && grep -F "$ASSET" "$CHECKSUM_FILE" | sha256sum -c -) \
+      || error "SHA-256 checksum verification failed for $ASSET"
+  fi
 
   tar xzf "${tmpdir}/${ASSET}" -C "$tmpdir"
   install -m 755 "${tmpdir}/openshell" "${openshell_bin}"
@@ -595,6 +600,14 @@ main() {
   fi
   info "conda found: $(conda --version 2>&1)"
 
+  # Verify external tools used by OpenShell download and checksum verification.
+  if ! command_exists gh && ! command_exists curl; then
+    error "Missing required download tool: install 'gh' or 'curl' to download OpenShell releases."
+  fi
+  if ! command_exists shasum && ! command_exists sha256sum; then
+    error "Missing required checksum tool: install 'shasum' or 'sha256sum' to verify OpenShell downloads."
+  fi
+
   # ── Step 1: Conda environment ─────────────────────────────────────────────
   step 1 "Conda environment"
   ensure_conda_env "$CONDA_ENV_NAME" "$REPROCESS"
@@ -609,9 +622,8 @@ main() {
   # at the front of PATH on activation).  Verify the runtime before proceeding.
   ensure_supported_runtime
 
-  # Ensure npm global installs go into $CONDA_PREFIX (already the default when
-  # using conda's node, but set explicitly for safety).
-  npm config set prefix "$CONDA_PREFIX"
+  # Ensure npm global installs go into $CONDA_PREFIX for this run only.
+  export NPM_CONFIG_PREFIX="$CONDA_PREFIX"
 
   # ── Step 2: OpenShell ─────────────────────────────────────────────────────
   step 2 "OpenShell"
