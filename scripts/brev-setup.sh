@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Brev VM bootstrap — installs prerequisites then runs setup.sh.
+# Brev VM bootstrap — installs prerequisites then runs nemoclaw onboard.
 #
 # Run on a fresh Brev VM:
 #   export NVIDIA_API_KEY=nvapi-...
@@ -12,7 +12,7 @@
 #   1. Installs Docker (if missing)
 #   2. Installs NVIDIA Container Toolkit (if GPU present)
 #   3. Installs openshell CLI from GitHub release (binary, no Rust build)
-#   4. Runs setup.sh
+#   4. Installs nemoclaw CLI and runs nemoclaw onboard
 
 set -euo pipefail
 
@@ -177,9 +177,33 @@ elif command -v nvidia-smi >/dev/null 2>&1; then
   fi
 fi
 
-# --- 5. Run setup.sh ---
+# --- 5. Install nemoclaw CLI and run onboard ---
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+info "Installing nemoclaw CLI..."
+export npm_config_prefix="$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+(cd "$REPO_DIR/nemoclaw" && npm install && npm run build) >/dev/null 2>&1
+(cd "$REPO_DIR" && npm install --ignore-scripts && npm link) >/dev/null 2>&1
+info "nemoclaw $(nemoclaw --version) installed"
+
 # Use sg docker to ensure docker group is active (usermod -aG doesn't
 # take effect in the current session without re-login)
-info "Running setup.sh..."
+
+# CHAT_UI_URL tells onboard which browser origin to allow in the gateway
+# config.  On Brev, the launchable config should set this to the public URL
+# (e.g. https://openclaw0-<id>.brevlab.com).  Without it the dashboard
+# rejects remote browsers with "origin not allowed".
+# Ref: https://github.com/NVIDIA/NemoClaw/issues/795
+if [ -n "${CHAT_UI_URL:-}" ]; then
+  export CHAT_UI_URL
+  info "CHAT_UI_URL=${CHAT_UI_URL}"
+elif [ -z "${DISPLAY:-}" ] && [ ! -e /tmp/.X11-unix ]; then
+  warn "CHAT_UI_URL is not set.  Remote browser access will fail with"
+  warn "'origin not allowed' unless you set CHAT_UI_URL to the public URL"
+  warn "of this instance (e.g. https://openclaw0-<id>.brevlab.com)."
+fi
+
+info "Running nemoclaw onboard..."
 export NVIDIA_API_KEY
-exec sg docker -c "bash $SCRIPT_DIR/setup.sh"
+exec sg docker -c "nemoclaw onboard --non-interactive"
