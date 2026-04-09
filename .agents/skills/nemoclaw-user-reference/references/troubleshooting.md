@@ -16,8 +16,7 @@ Run `source ~/.bashrc` (or `source ~/.zshrc` for zsh), or open a new terminal wi
 ### Installer fails on unsupported platform
 
 The installer checks for a supported OS and architecture before proceeding.
-NemoClaw requires Linux Ubuntu 22.04 LTS or later.
-If you see an unsupported platform error, verify that you are running on a supported Linux distribution.
+If you see an unsupported platform error, verify that you are running on a tested platform listed in the Container Runtimes table in the quickstart guide.
 
 ### Node.js version is too old
 
@@ -54,6 +53,18 @@ $ sudo systemctl start docker
 ```
 
 On macOS with Docker Desktop, open the Docker Desktop application and wait for it to finish starting before retrying.
+
+### Docker permission denied on Linux
+
+On Linux, if the Docker daemon is running but you see "permission denied" errors, your user may not be in the `docker` group.
+Add your user and activate the group in the current shell:
+
+```console
+$ sudo usermod -aG docker $USER
+$ newgrp docker
+```
+
+Then retry `nemoclaw onboard`.
 
 ### macOS first-run failures
 
@@ -113,8 +124,8 @@ If onboarding reports that Docker is missing or unreachable, fix Docker first an
 $ nemoclaw onboard
 ```
 
-If you are using Podman, NemoClaw warns and continues, but OpenShell officially documents Docker-based runtimes only.
-If onboarding or sandbox lifecycle fails, switch to Docker Desktop, Colima, or Docker Engine and rerun onboarding.
+Podman is not a tested runtime.
+If onboarding or sandbox lifecycle fails, switch to a tested runtime (Docker Desktop, Colima, or Docker Engine) and rerun onboarding.
 
 ### Invalid sandbox name
 
@@ -232,6 +243,14 @@ $ nemoclaw <name> status
 If the endpoint is correct but requests still fail, check for network policy rules that may block the connection.
 Then verify the credential and base URL for the provider you selected during onboarding.
 
+For local providers (Ollama, vLLM, NIM), the default timeout is 180 seconds.
+If large prompts still cause timeouts, increase it with `NEMOCLAW_LOCAL_INFERENCE_TIMEOUT` before re-running onboard:
+
+```console
+$ export NEMOCLAW_LOCAL_INFERENCE_TIMEOUT=300
+$ nemoclaw onboard
+```
+
 ### `NEMOCLAW_DISABLE_DEVICE_AUTH=1` does not change an existing sandbox
 
 This is expected behavior.
@@ -240,6 +259,26 @@ Changing or exporting it later does not rewrite the baked `openclaw.json` inside
 
 If you need a different device-auth setting, rerun onboarding so NemoClaw rebuilds the sandbox image with the desired configuration.
 For the security trade-offs, refer to Security Best Practices (see the `nemoclaw-user-configure-security` skill).
+
+### Sandbox lost after gateway restart
+
+Sandboxes created with OpenShell versions older than 0.0.24 can become unreachable after a gateway restart because SSH secrets were not persisted.
+Running `nemoclaw onboard` automatically upgrades OpenShell to 0.0.24 or later during the preflight check.
+After the upgrade, recreate the sandbox with `nemoclaw onboard`.
+
+### Agent cannot reach external hosts through a proxy
+
+NemoClaw uses a default proxy address of `10.200.0.1:3128` (the OpenShell-injected gateway).
+If your environment uses a different proxy, set `NEMOCLAW_PROXY_HOST` and `NEMOCLAW_PROXY_PORT` before onboarding:
+
+```console
+$ export NEMOCLAW_PROXY_HOST=proxy.example.com
+$ export NEMOCLAW_PROXY_PORT=8080
+$ nemoclaw onboard
+```
+
+These are build-time settings baked into the sandbox image.
+Changing them after onboarding requires re-running `nemoclaw onboard` to rebuild the image.
 
 ### Agent cannot reach an external host
 
@@ -265,53 +304,6 @@ Use `--follow` to stream logs in real time while debugging.
 
 ## Podman
 
-### `open /dev/kmsg: operation not permitted`
-
-This error appears when the Podman machine is running in rootless mode.
-K3s kubelet requires `/dev/kmsg` access for its OOM watcher, which is not available in rootless containers.
-
-Switch the Podman machine to rootful mode and restart:
-
-```console
-$ podman machine stop
-$ podman machine set --rootful
-$ podman machine start
-```
-
-Then destroy and recreate the gateway:
-
-```console
-$ openshell gateway destroy --name nemoclaw
-$ nemoclaw onboard
-```
-
-### Image push timeout with Podman
-
-When creating a sandbox, the 1.5 GB sandbox image push into K3s may time out through Podman's API socket.
-This is a known limitation of the bollard Docker client's default timeout.
-
-Manually push the image using the Docker CLI, which has no such timeout:
-
-```console
-$ docker images --format '{{.Repository}}:{{.Tag}}' | grep sandbox-from
-$ docker save <IMAGE_NAME:TAG> | \
-    docker exec -i openshell-cluster-nemoclaw \
-    ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images import -
-```
-
-After the import completes, create the sandbox manually:
-
-```console
-$ openshell sandbox create --name my-assistant --from <IMAGE_NAME:TAG>
-```
-
-### Podman machine resources
-
-The default Podman machine has 2 GB RAM, which is insufficient for the sandbox image push and K3s cluster overhead.
-Allocate at least 8 GB RAM and 4 CPUs:
-
-```console
-$ podman machine stop
-$ podman machine set --cpus 6 --memory 8192
-$ podman machine start
-```
+Podman is not a tested runtime.
+OpenShell officially documents Docker-based runtimes only.
+If you encounter issues with Podman, switch to a tested runtime (Docker Engine, Docker Desktop, or Colima) and rerun onboarding.
