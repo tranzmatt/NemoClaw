@@ -19,14 +19,15 @@ const path = require("path");
 const { promises: dnsPromises } = require("node:dns");
 const { isIP } = require("node:net");
 const { validateName } = require("./runner");
+const { shellQuote } = require("./core/shell-quote");
 const { dockerExecFileSync } = require("./adapters/docker/exec");
-const credentialFilter: typeof import("./credential-filter") = require("./credential-filter");
+const credentialFilter: typeof import("./security/credential-filter") = require("./security/credential-filter");
 const { stripCredentials, isConfigObject, isConfigValue, isCredentialField } = credentialFilter;
-const { appendAuditEntry } = require("./shields-audit");
+const { appendAuditEntry } = require("./shields/audit");
 const { isPrivateHostname, isPrivateIp } = require("./private-networks");
 
-type ConfigObject = import("./credential-filter").ConfigObject;
-type ConfigValue = import("./credential-filter").ConfigValue;
+type ConfigObject = import("./security/credential-filter").ConfigObject;
+type ConfigValue = import("./security/credential-filter").ConfigValue;
 const { runOpenshellCommand, captureOpenshellCommand } = require("./adapters/openshell/client");
 
 function parseJson<T>(text: string): T {
@@ -47,7 +48,7 @@ const K3S_CONTAINER = "openshell-cluster-nemoclaw";
 // to read/write that agent's config from the host.
 // ---------------------------------------------------------------------------
 
-interface AgentConfigTarget {
+export interface AgentConfigTarget {
   /** Agent name (e.g. "openclaw", "hermes") */
   agentName: string;
   /** Absolute path inside sandbox to the config file */
@@ -98,7 +99,7 @@ function resolveAgentConfig(sandboxName: string): AgentConfigTarget {
     const entry = registry.getSandbox(sandboxName);
     if (!entry || !entry.agent) return DEFAULT_AGENT_CONFIG;
 
-    const agentDefs = require("./agent-defs");
+    const agentDefs = require("./agent/defs");
     const agent = agentDefs.loadAgent(entry.agent);
     const cfg = agent.configPaths;
 
@@ -357,6 +358,97 @@ function readSandboxConfig(sandboxName: string, target: AgentConfigTarget): Conf
     console.error(`  Failed to parse ${target.agentName} config: ${message}`);
     process.exit(1);
   }
+}
+
+function writeSandboxConfig(
+  sandboxName: string,
+  target: AgentConfigTarget,
+  config: ConfigObject,
+): void {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-config-"));
+  const tmpFile = path.join(tmpDir, target.configFile);
+  try {
+    fs.writeFileSync(tmpFile, serializeConfig(config, target.format), { mode: 0o600 });
+
+    const content = fs.readFileSync(tmpFile, "utf-8");
+    dockerExecFileSync(
+      [
+        "exec",
+        "-i",
+        K3S_CONTAINER,
+        "kubectl",
+        "exec",
+        "-n",
+        "openshell",
+        sandboxName,
+        "-c",
+        "agent",
+        "-i",
+        "--",
+        "sh",
+        "-c",
+        `cat > ${shellQuote(target.configPath)}`,
+      ],
+      { input: content, stdio: ["pipe", "pipe", "pipe"], timeout: 15000 },
+    );
+
+    try {
+      dockerExecFileSync(
+        [
+          "exec",
+          K3S_CONTAINER,
+          "kubectl",
+          "exec",
+          "-n",
+          "openshell",
+          sandboxName,
+          "-c",
+          "agent",
+          "--",
+          "chown",
+          "sandbox:sandbox",
+          target.configPath,
+        ],
+        { stdio: ["ignore", "pipe", "pipe"], timeout: 15000 },
+      );
+    } catch {
+      // Best effort — chown failure is non-fatal.
+    }
+  } finally {
+    try {
+      fs.unlinkSync(tmpFile);
+      fs.rmdirSync(tmpDir);
+    } catch {
+      // Best effort.
+    }
+  }
+}
+
+function recomputeSandboxConfigHash(sandboxName: string, target: AgentConfigTarget): void {
+  if (!target.sensitiveFiles?.includes(`${target.configDir}/.config-hash`)) return;
+  dockerExecFileSync(
+    [
+      "exec",
+      K3S_CONTAINER,
+      "kubectl",
+      "exec",
+      "-n",
+      "openshell",
+      sandboxName,
+      "-c",
+      "agent",
+      "--",
+      "sh",
+      "-c",
+      [
+        `cd ${shellQuote(target.configDir)}`,
+        `sha256sum ${shellQuote(target.configFile)} > .config-hash`,
+        "(chown sandbox:sandbox .config-hash 2>/dev/null || true)",
+        "(chmod 660 .config-hash 2>/dev/null || true)",
+      ].join(" && "),
+    ],
+    { stdio: ["ignore", "pipe", "pipe"], timeout: 15000 },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -829,7 +921,7 @@ async function configRotateToken(sandboxName: string, opts: RotateTokenOpts = {}
 
   // 1. Determine which provider and credentialEnv the sandbox uses.
   //    Load the onboard session and verify it matches this sandbox.
-  const { loadSession } = require("./onboard-session");
+  const { loadSession } = require("./state/onboard-session");
   const session = loadSession();
 
   if (!session || !session.credentialEnv) {
@@ -866,7 +958,7 @@ async function configRotateToken(sandboxName: string, opts: RotateTokenOpts = {}
   } else if (opts.fromStdin) {
     newToken = await readStdin();
   } else {
-    const { promptSecret } = require("./credentials");
+    const { promptSecret } = require("./credentials/store");
     newToken = await promptSecret(`  New ${credentialEnv} value: `);
   }
 
@@ -886,7 +978,7 @@ async function configRotateToken(sandboxName: string, opts: RotateTokenOpts = {}
   // 4. Stage the new value in the current process so the openshell update
   //    that follows can read it via --credential <ENV>. The OpenShell
   //    gateway becomes the system of record once the update succeeds.
-  const { saveCredential } = require("./credentials");
+  const { saveCredential } = require("./credentials/store");
   saveCredential(credentialEnv, newToken);
 
   // 5. Update the openshell provider
@@ -992,6 +1084,8 @@ export {
   parseConfigGetArgs,
   resolveAgentConfig,
   readSandboxConfig,
+  writeSandboxConfig,
+  recomputeSandboxConfigHash,
   extractDotpath,
   setDotpath,
   validateConfigDotpath,
