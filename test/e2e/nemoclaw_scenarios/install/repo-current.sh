@@ -22,10 +22,32 @@ e2e_install_repo() {
   fi
   local repo_root
   repo_root="$(cd "${_E2E_INST_REPO_DIR}/../../../.." && pwd)"
-  (
-    cd "${repo_root}" || exit
-    npm install
-    npm link
-  )
-  nemoclaw_refresh_install_env
+  cd "${repo_root}" || return
+  echo "repo-current: npm ci"
+  npm ci --ignore-scripts
+  mkdir -p .e2e
+  echo "repo-current: build cli"
+  build_status=0
+  npm run build:cli >.e2e/build-cli.log 2>&1 || build_status=$?
+  if [ "${build_status}" -ne 0 ]; then
+    cat .e2e/build-cli.log >&2
+    echo "CLI build failed with status ${build_status}" >&2
+    return "${build_status}"
+  fi
+  if [ ! -s dist/lib/cli/oclif-command-metadata.generated.json ]; then
+    cat .e2e/build-cli.log >&2
+    echo "CLI build did not generate oclif command metadata" >&2
+    return 1
+  fi
+  echo "repo-current: link cli"
+  chmod +x bin/nemoclaw.js
+  mkdir -p "${HOME}/.local/bin"
+  ln -sf "${repo_root}/bin/nemoclaw.js" "${HOME}/.local/bin/nemoclaw"
+  nemoclaw_ensure_local_bin_on_path
+  echo "repo-current: verify cli"
+  if ! command -v nemoclaw >.e2e/npm-link-or-shim.log 2>&1; then
+    cat .e2e/npm-link-or-shim.log >&2
+    echo "npm link/shim failed: nemoclaw is not on PATH after direct repo shim" >&2
+    return 127
+  fi
 }

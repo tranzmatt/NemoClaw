@@ -51,6 +51,37 @@ describe("docker helpers", () => {
     ]);
   });
 
+  it("adds --quiet to dockerBuild argv and drops the quiet key from options (#3584)", () => {
+    dockerBuild("Dockerfile.base", "sandbox-base:latest", "/repo/root", {
+      quiet: true,
+      ignoreError: true,
+      suppressOutput: true,
+    });
+
+    expect(runMock).toHaveBeenCalledWith(
+      [
+        "docker",
+        "build",
+        "--quiet",
+        "-f",
+        "Dockerfile.base",
+        "-t",
+        "sandbox-base:latest",
+        "/repo/root",
+      ],
+      { ignoreError: true, suppressOutput: true, env: { DOCKER_BUILDKIT: "1" } },
+    );
+  });
+
+  it("omits --quiet by default", () => {
+    dockerBuild("Dockerfile", "example:tag", "/tmp/build", { ignoreError: true });
+
+    expect(runMock).toHaveBeenCalledWith(
+      ["docker", "build", "-f", "Dockerfile", "-t", "example:tag", "/tmp/build"],
+      { ignoreError: true, env: { DOCKER_BUILDKIT: "1" } },
+    );
+  });
+
   it("forces DOCKER_BUILDKIT=1 on dockerBuild so Dockerfile.base --mount works on legacy-builder hosts (#3583)", () => {
     dockerBuild("Dockerfile.base", "sandbox-base:latest", "/repo/root", {
       stdio: ["ignore", "inherit", "inherit"],

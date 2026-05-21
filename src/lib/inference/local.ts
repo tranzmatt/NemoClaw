@@ -11,17 +11,34 @@ import os from "node:os";
 import nodePath from "node:path";
 import type { CurlProbeResult } from "../adapters/http/probe";
 import { runCurlProbe } from "../adapters/http/probe";
+import type { CaptureResult } from "../runner";
 import { buildSubprocessEnv } from "../subprocess-env";
 
-const { shellQuote, runCapture } = require("../runner");
+const { shellQuote, runCapture, runCaptureEx } = require("../runner");
 
 import { OLLAMA_PORT, OLLAMA_PROXY_PORT, VLLM_PORT } from "../core/ports";
 import { sleepSeconds } from "../core/wait";
 
-const { isWsl } = require("../platform");
+const { containerCanReachHostLoopback, inferContainerRuntime, isWsl } = require("../platform");
+const { dockerInfo } = require("../adapters/docker/info");
+const { detectNvidiaPlatform } = require("./nim");
 
-/** Port containers use to reach Ollama — proxy on non-WSL, direct on WSL2. */
-export const OLLAMA_CONTAINER_PORT = isWsl() ? OLLAMA_PORT : OLLAMA_PROXY_PORT;
+/**
+ * Port containers use to reach Ollama. Returns the raw Ollama port when the
+ * container can reach the host's 127.0.0.1 directly (Docker Desktop on WSL),
+ * and the auth proxy port otherwise (native Docker on any host, macOS, etc.).
+ * Memoised — call resetOllamaContainerPortCache() in tests.
+ */
+let _ollamaContainerPort: number | null = null;
+export function getOllamaContainerPort(): number {
+  if (_ollamaContainerPort !== null) return _ollamaContainerPort;
+  const runtime = inferContainerRuntime(dockerInfo({ ignoreError: true }));
+  _ollamaContainerPort = containerCanReachHostLoopback(runtime) ? OLLAMA_PORT : OLLAMA_PROXY_PORT;
+  return _ollamaContainerPort;
+}
+export function resetOllamaContainerPortCache(): void {
+  _ollamaContainerPort = null;
+}
 
 export const HOST_GATEWAY_URL = "http://host.openshell.internal";
 export const LOCAL_INFERENCE_SANDBOX_HOST_URL_ENV = "NEMOCLAW_LOCAL_INFERENCE_SANDBOX_HOST_URL";
@@ -32,6 +49,8 @@ export const SMALL_OLLAMA_MODEL = "qwen2.5:7b";
 export const LARGE_OLLAMA_MIN_MEMORY_MB = 32768;
 
 export type RunCaptureFn = (cmd: string | string[], opts?: { ignoreError?: boolean }) => string;
+
+export type RunCaptureExFn = (cmd: string[]) => CaptureResult;
 
 // Hosts that the WSL-side onboard CLI tries when probing Ollama. Native Linux
 // and macOS only ever reach Ollama on the local loopback. WSL with Docker
@@ -208,7 +227,7 @@ export function getLocalProviderBaseUrl(
       return `${hostUrl}:${VLLM_PORT}/v1`;
     case "ollama-local":
       // Containers reach Ollama through the auth proxy, not directly.
-      return `${hostUrl}:${OLLAMA_CONTAINER_PORT}/v1`;
+      return `${hostUrl}:${getOllamaContainerPort()}/v1`;
     default:
       return null;
   }
@@ -435,7 +454,7 @@ export function getLocalProviderContainerReachabilityCheck(provider: string): st
         "/dev/null",
         "-w",
         "%{http_code}",
-        `http://host.openshell.internal:${OLLAMA_CONTAINER_PORT}/api/tags`,
+        `http://host.openshell.internal:${getOllamaContainerPort()}/api/tags`,
       ];
     default:
       return null;
@@ -511,7 +530,7 @@ export function validateLocalProvider(
     case "ollama-local":
       return {
         ok: false,
-        message: `Local Ollama is responding on ${getResolvedOllamaHost()}, but the Docker container reachability check failed for http://host.openshell.internal:${OLLAMA_CONTAINER_PORT}. This may be a Docker networking issue — the sandbox uses a different network path and may still work.`,
+        message: `Local Ollama is responding on ${getResolvedOllamaHost()}, but the Docker container reachability check failed for http://host.openshell.internal:${getOllamaContainerPort()}. This may be a Docker networking issue — the sandbox uses a different network path and may still work.`,
         diagnostic,
       };
     default:
@@ -528,7 +547,7 @@ function getContainerCheckUrl(provider: string): string {
     case "vllm-local":
       return `http://host.openshell.internal:${VLLM_PORT}/v1/models`;
     case "ollama-local":
-      return `http://host.openshell.internal:${OLLAMA_CONTAINER_PORT}/api/tags`;
+      return `http://host.openshell.internal:${getOllamaContainerPort()}/api/tags`;
     default:
       return "http://host.openshell.internal/";
   }
@@ -720,10 +739,22 @@ export function getOllamaProbeCommand(
 export function validateOllamaModel(
   model: string,
   runCaptureImpl?: RunCaptureFn,
+  isSparkImpl?: () => boolean,
+  runCaptureExImpl?: RunCaptureExFn,
 ): ValidationResult {
   const capture = runCaptureImpl ?? runCapture;
+  const captureEx = runCaptureExImpl ?? runCaptureEx;
+  const isSpark = isSparkImpl ?? (() => detectNvidiaPlatform() === "spark");
   const probeCmd = getOllamaProbeCommand(model);
-  const output = capture(probeCmd, { ignoreError: true });
+  const probeResult = captureEx(probeCmd);
+  let output = probeResult.stdout;
+  // On DGX Spark (128 GB unified memory), loading a large model from disk can take >2 min.
+  // Only retry with a 300 s timeout when the initial probe genuinely timed out — fast
+  // failures (connection refused, Ollama not running) surface immediately. (#3251)
+  if (isSpark() && probeResult.timedOut) {
+    const retryResult = captureEx(getOllamaProbeCommand(model, 300));
+    output = retryResult.stdout;
+  }
   if (!output) {
     return {
       ok: false,
@@ -745,6 +776,25 @@ export function validateOllamaModel(
             `NemoClaw agents require. Run \`ollama show <model>\` to inspect a ` +
             `model's capabilities and pick one whose list includes 'tools'.`,
         };
+      }
+      // Ollama checks available RAM instead of total; false positive on DGX Spark
+      // unified-memory hosts where GPU and CPU share the same 128 GB pool. (#3251)
+      const memMatch = errText.match(
+        /model requires more system memory \(([0-9.]+)\s*GiB\) than is available \([0-9.]+\s*GiB\)/i,
+      );
+      if (memMatch && isSpark()) {
+        const requiresGiB = parseFloat(memMatch[1]);
+        const freeOut = capture(["free", "-m"], { ignoreError: true });
+        if (freeOut) {
+          const memLine = freeOut.split("\n").find((l: string) => l.includes("Mem:"));
+          if (memLine) {
+            const totalMB = parseInt(memLine.trim().split(/\s+/)[1], 10) || 0;
+            const totalGiB = totalMB / 1024;
+            if (totalGiB >= requiresGiB) {
+              return { ok: true };
+            }
+          }
+        }
       }
       return {
         ok: false,

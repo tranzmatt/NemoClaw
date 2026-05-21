@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import fs from "node:fs";
+import path from "node:path";
 import YAML from "yaml";
 
 import * as policies from "../policy";
@@ -17,11 +18,18 @@ const CREATE_TIME_POLICY_PRESETS_BY_CHANNEL: Record<string, string[]> = {
   slack: ["slack"],
 };
 
+const HERMES_MESSAGING_POLICY_KEYS: Record<string, string[]> = {
+  discord: ["discord"],
+  slack: ["slack"],
+  telegram: ["telegram"],
+  wechat: ["wechat_bridge"],
+};
+
 const PROC_PATH = "/proc";
-const STALE_PROC_COMM_READ_WRITE_PATH = "/proc/self/task/*/comm";
+const PROC_COMM_READ_WRITE_PATHS = ["/proc/self/comm", "/proc/self/task/*/comm"];
 
 function isProcEntryOwnedByOpenShell(entry: string): boolean {
-  return entry === PROC_PATH || entry === STALE_PROC_COMM_READ_WRITE_PATH;
+  return entry === PROC_PATH || PROC_COMM_READ_WRITE_PATHS.includes(entry);
 }
 
 type DirectGpuPolicyOptions = {
@@ -61,7 +69,7 @@ export function buildDirectGpuPolicyYaml(
 
 const PROC_COMM_WRITE_PROBE = [
   "set -eu;",
-  'comm="/proc/$$/task/$$/comm";',
+  'comm="/proc/self/comm";',
   'old="$(cat "$comm" 2>/dev/null || true)";',
   'printf nemoclaw-gpu >"$comm";',
   'if [ -n "$old" ]; then',
@@ -89,20 +97,32 @@ const NVIDIA_SMI_OPTIONAL_PROBE = [
   'echo "nvidia-smi not installed; skipping optional visibility check"',
 ].join(" ");
 
+export type DirectSandboxGpuProofCommand = {
+  id: string;
+  label: string;
+  args: string[];
+  optional?: boolean;
+};
+
 export function buildDirectSandboxGpuProofCommands(
   sandboxName: string,
-): { label: string; args: string[] }[] {
+): DirectSandboxGpuProofCommand[] {
   return [
     {
+      id: "nvidia-smi",
       label: "nvidia-smi when available",
       args: ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-lc", NVIDIA_SMI_OPTIONAL_PROBE],
     },
     {
+      id: "proc-comm-write",
       label: "/proc/<pid>/task/<tid>/comm write",
+      optional: true,
       args: ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-lc", PROC_COMM_WRITE_PROBE],
     },
     {
+      id: "cuda-init",
       label: "cuInit(0) via libcuda.so.1",
+      optional: true,
       args: ["sandbox", "exec", "-n", sandboxName, "--", "sh", "-lc", CUDA_INIT_PROBE],
     },
   ];
@@ -149,45 +169,114 @@ export function getNetworkPolicyNames(policyContent: string): Set<string> | null
   }
 }
 
+function isYamlObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function filterHermesInactiveMessagingPolicies(
+  policyContent: string,
+  activeMessagingChannels: string[],
+): { content: string; changed: boolean } {
+  const parsed = YAML.parse(policyContent);
+  if (!isYamlObject(parsed) || !isYamlObject(parsed.network_policies)) {
+    return { content: policyContent, changed: false };
+  }
+
+  const active = new Set(activeMessagingChannels);
+  let changed = false;
+  for (const [channel, policyKeys] of Object.entries(HERMES_MESSAGING_POLICY_KEYS)) {
+    if (active.has(channel)) continue;
+    for (const key of policyKeys) {
+      if (Object.prototype.hasOwnProperty.call(parsed.network_policies, key)) {
+        delete parsed.network_policies[key];
+        changed = true;
+      }
+    }
+  }
+
+  return {
+    content: changed ? YAML.stringify(parsed) : policyContent,
+    changed,
+  };
+}
+
+function isHermesPolicyPath(policyPath: string): boolean {
+  const normalized = policyPath.split(path.sep).join("/");
+  return /(^|\/)agents\/hermes\/policy-additions\.yaml$/.test(normalized);
+}
+
 export function prepareInitialSandboxCreatePolicy(
   basePolicyPath: string,
   activeMessagingChannels: string[],
-  options: { directGpu?: boolean; dockerGpuPatch?: boolean } = {},
+  options: {
+    directGpu?: boolean;
+    dockerGpuPatch?: boolean;
+    additionalPresets?: string[];
+    agentName?: string | null;
+  } = {},
 ): InitialSandboxPolicy {
   const directGpuPolicy = options.directGpu
     ? prepareDirectGpuSandboxPolicy(basePolicyPath, {
         procReadWrite: options.dockerGpuPatch === true,
       })
     : null;
-  const effectiveBasePolicyPath = directGpuPolicy?.policyPath || basePolicyPath;
+  let effectiveBasePolicyPath = directGpuPolicy?.policyPath || basePolicyPath;
   const cleanupFns = directGpuPolicy?.cleanup ? [directGpuPolicy.cleanup] : [];
+  const buildCleanup = () =>
+    cleanupFns.length > 0
+      ? () => cleanupFns.map((cleanup) => cleanup()).every(Boolean)
+      : undefined;
   const requestedCreateTimePresets = [
     ...new Set(
-      activeMessagingChannels.flatMap(
-        (channel) => CREATE_TIME_POLICY_PRESETS_BY_CHANNEL[channel] || [],
-      ),
+      [
+        ...activeMessagingChannels.flatMap(
+          (channel) => CREATE_TIME_POLICY_PRESETS_BY_CHANNEL[channel] || [],
+        ),
+        ...(options.additionalPresets || []),
+      ],
     ),
   ];
-  const combinedCleanup =
-    cleanupFns.length > 0 ? () => cleanupFns.map((cleanup) => cleanup()).every(Boolean) : undefined;
+  const dedupe = (values: string[]) => [...new Set(values.filter(Boolean))];
 
-  if (requestedCreateTimePresets.length === 0) {
-    return {
-      policyPath: effectiveBasePolicyPath,
-      appliedPresets: [],
-      cleanup: combinedCleanup,
-    };
+  let basePolicy = fs.readFileSync(effectiveBasePolicyPath, "utf-8");
+  if (options.agentName === "hermes" || isHermesPolicyPath(basePolicyPath)) {
+    const filtered = filterHermesInactiveMessagingPolicies(basePolicy, activeMessagingChannels);
+    if (filtered.changed) {
+      const policyPath = secureTempFile("nemoclaw-agent-policy", ".yaml");
+      fs.writeFileSync(policyPath, filtered.content, { encoding: "utf-8", mode: 0o600 });
+      cleanupFns.push(() => {
+        try {
+          cleanupTempDir(policyPath, "nemoclaw-agent-policy");
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      effectiveBasePolicyPath = policyPath;
+      basePolicy = filtered.content;
+    }
   }
 
-  const basePolicy = fs.readFileSync(effectiveBasePolicyPath, "utf-8");
   const basePolicyNames = getNetworkPolicyNames(basePolicy);
   if (basePolicyNames === null) {
     return {
       policyPath: effectiveBasePolicyPath,
       appliedPresets: [],
-      cleanup: combinedCleanup,
+      cleanup: buildCleanup(),
     };
   }
+  const existingChannelPresets = activeMessagingChannels.filter((channel) =>
+    basePolicyNames.has(channel),
+  );
+
+  if (requestedCreateTimePresets.length === 0) {
+    return {
+      policyPath: effectiveBasePolicyPath,
+      appliedPresets: dedupe(existingChannelPresets),
+      cleanup: buildCleanup(),
+    };
+  }
+
   const existingCreateTimePresets = requestedCreateTimePresets.filter((preset) =>
     basePolicyNames.has(preset),
   );
@@ -197,8 +286,8 @@ export function prepareInitialSandboxCreatePolicy(
   if (createTimePresets.length === 0) {
     return {
       policyPath: effectiveBasePolicyPath,
-      appliedPresets: existingCreateTimePresets,
-      cleanup: combinedCleanup,
+      appliedPresets: dedupe([...existingChannelPresets, ...existingCreateTimePresets]),
+      cleanup: buildCleanup(),
     };
   }
 
@@ -222,7 +311,11 @@ export function prepareInitialSandboxCreatePolicy(
 
   return {
     policyPath,
-    appliedPresets: [...existingCreateTimePresets, ...mergedPolicy.appliedPresets],
-    cleanup: () => cleanupFns.map((cleanup) => cleanup()).every(Boolean),
+    appliedPresets: dedupe([
+      ...existingChannelPresets,
+      ...existingCreateTimePresets,
+      ...mergedPolicy.appliedPresets,
+    ]),
+    cleanup: buildCleanup(),
   };
 }

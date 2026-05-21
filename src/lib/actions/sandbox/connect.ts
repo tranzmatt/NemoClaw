@@ -16,6 +16,7 @@ import {
 } from "../../adapters/openshell/timeouts";
 import { CLI_NAME } from "../../cli/branding";
 import { D, G, R, YW } from "../../cli/terminal-style";
+import * as agentRuntime from "../../agent/runtime";
 import { parseGatewayInference } from "../../inference/config";
 import { findReachableOllamaHost, probeLocalProviderHealth } from "../../inference/local";
 import {
@@ -40,8 +41,6 @@ import {
   shouldApplyVmDnsMonkeypatch,
 } from "./vm-dns-monkeypatch";
 
-const agentRuntime = require("../../../../bin/lib/agent-runtime");
-
 const NEMOCLAW_GATEWAY_NAME = "nemoclaw";
 
 export type SandboxConnectOptions = {
@@ -63,6 +62,14 @@ type SandboxInferenceRouteEnsureResult = {
   sandbox: SandboxEntry | null;
   routeHealthy: boolean | null;
 };
+
+type InferenceRouteProbeOptions = {
+  attempts?: number;
+  delayMs?: number;
+};
+
+const INFERENCE_ROUTE_POST_REPAIR_PROBE_ATTEMPTS = 3;
+const INFERENCE_ROUTE_POST_REPAIR_PROBE_DELAY_MS = 2_000;
 
 const SANDBOX_CONNECT_FLAGS = new Set([
   "--dangerously-skip-permissions",
@@ -128,7 +135,7 @@ function runSandboxConnectProbe(sandboxName: string): void {
     process.exit(1);
   }
   if (processCheck.wasRunning) {
-    ensureSandboxInferenceRouteOrExit(sandboxName, { quiet: false });
+    ensureSandboxInferenceRoute(sandboxName, { quiet: true });
     if (processCheck.forwardRecovered) {
       console.log(
         `  Probe complete: ${agentName} gateway is running in '${sandboxName}'; restored dashboard port forward.`,
@@ -139,11 +146,11 @@ function runSandboxConnectProbe(sandboxName: string): void {
     return;
   }
   if (processCheck.recovered) {
-    ensureSandboxInferenceRouteOrExit(sandboxName, { quiet: false });
+    ensureSandboxInferenceRoute(sandboxName, { quiet: true });
     console.log(`  Probe complete: recovered ${agentName} gateway in '${sandboxName}'.`);
     return;
   }
-  ensureSandboxInferenceRouteOrExit(sandboxName, { quiet: false });
+  ensureSandboxInferenceRoute(sandboxName, { quiet: true });
   console.error(
     `  Probe failed: ${agentName} gateway is not running in '${sandboxName}' and automatic recovery failed.`,
   );
@@ -151,32 +158,56 @@ function runSandboxConnectProbe(sandboxName: string): void {
   process.exit(1);
 }
 
-function probeSandboxInferenceRoute(sandboxName: string): SandboxInferenceRouteProbe {
-  // Keep the shell string inside the sandbox: curl write-out, body capture,
-  // and status classification must run as one bounded probe. sandboxName
-  // remains an argv value, so no user input is interpolated into the script.
-  const probe = captureOpenshell(
-    [
-      "sandbox",
-      "exec",
-      "--name",
-      sandboxName,
-      "--",
-      "sh",
-      "-c",
+function sleepSync(ms: number): void {
+  if (ms <= 0) return;
+  spawnSync(process.execPath, ["-e", `setTimeout(() => {}, ${ms})`], {
+    stdio: "ignore",
+    timeout: ms + 1_000,
+  });
+}
+
+function probeSandboxInferenceRoute(
+  sandboxName: string,
+  { attempts = 1, delayMs = 0 }: InferenceRouteProbeOptions = {},
+): SandboxInferenceRouteProbe {
+  let lastProbe: SandboxInferenceRouteProbe | null = null;
+  const boundedAttempts = Math.max(1, attempts);
+
+  for (let attempt = 1; attempt <= boundedAttempts; attempt += 1) {
+    // Keep the shell string inside the sandbox: curl write-out, body capture,
+    // and status classification must run as one bounded probe. sandboxName
+    // remains an argv value, so no user input is interpolated into the script.
+    const probe = captureOpenshell(
       [
-        "OUT=/tmp/nemoclaw-inference-route-probe.out",
-        "HTTP_CODE=$(curl -sk -o \"$OUT\" -w '%{http_code}' --connect-timeout 3 --max-time 8 https://inference.local/v1/models 2>/dev/null) || HTTP_CODE=000",
-        "case \"$HTTP_CODE\" in 000|5*) printf 'BROKEN %s ' \"$HTTP_CODE\"; head -c 160 \"$OUT\" 2>/dev/null || true ;; *) printf 'OK %s' \"$HTTP_CODE\" ;; esac",
-      ].join("; "),
-    ],
-    { ignoreError: true, timeout: OPENSHELL_INFERENCE_ROUTE_PROBE_TIMEOUT_MS },
-  );
-  const detail = probe.output.trim();
-  return {
-    healthy: probe.status === 0 && /^OK\s+[0-9]{3}\b/.test(detail),
-    broken: /^BROKEN\s+[0-9]{3}\b/.test(detail),
-    detail: detail || `openshell sandbox exec exited with status ${String(probe.status)}`,
+        "sandbox",
+        "exec",
+        "--name",
+        sandboxName,
+        "--",
+        "sh",
+        "-c",
+        [
+          "OUT=/tmp/nemoclaw-inference-route-probe.out",
+          "HTTP_CODE=$(curl -sk -o \"$OUT\" -w '%{http_code}' --connect-timeout 3 --max-time 8 https://inference.local/v1/models 2>/dev/null) || HTTP_CODE=000",
+          "case \"$HTTP_CODE\" in 000|5*) printf 'BROKEN %s ' \"$HTTP_CODE\"; head -c 160 \"$OUT\" 2>/dev/null || true ;; *) printf 'OK %s' \"$HTTP_CODE\" ;; esac",
+        ].join("; "),
+      ],
+      { ignoreError: true, timeout: OPENSHELL_INFERENCE_ROUTE_PROBE_TIMEOUT_MS },
+    );
+    const detail = probe.output.trim();
+    lastProbe = {
+      healthy: probe.status === 0 && /^OK\s+[0-9]{3}\b/.test(detail),
+      broken: /^BROKEN\s+[0-9]{3}\b/.test(detail),
+      detail: detail || `openshell sandbox exec exited with status ${String(probe.status)}`,
+    };
+    if (lastProbe.healthy || attempt === boundedAttempts) return lastProbe;
+    sleepSync(delayMs);
+  }
+
+  return lastProbe ?? {
+    healthy: false,
+    broken: false,
+    detail: "inference route probe did not run",
   };
 }
 
@@ -237,7 +268,10 @@ function repairSandboxInferenceRouteIfNeeded(
         );
       }
       const patch = applyOpenShellVmDnsMonkeypatch(sandboxName, sb);
-      const patchedProbe = patch.ok ? probeSandboxInferenceRoute(sandboxName) : null;
+      const patchedProbe = patch.ok ? probeSandboxInferenceRoute(sandboxName, {
+        attempts: INFERENCE_ROUTE_POST_REPAIR_PROBE_ATTEMPTS,
+        delayMs: INFERENCE_ROUTE_POST_REPAIR_PROBE_DELAY_MS,
+      }) : null;
       if (patchedProbe?.healthy) {
         if (!quiet) {
           console.log("  inference.local route repaired.");
@@ -316,7 +350,10 @@ function repairSandboxInferenceRouteIfNeeded(
     };
   }
 
-  const repairedProbe = probeSandboxInferenceRoute(sandboxName);
+  const repairedProbe = probeSandboxInferenceRoute(sandboxName, {
+    attempts: INFERENCE_ROUTE_POST_REPAIR_PROBE_ATTEMPTS,
+    delayMs: INFERENCE_ROUTE_POST_REPAIR_PROBE_DELAY_MS,
+  });
   if (!quiet) {
     if (repairedProbe.healthy) {
       console.log("  inference.local route repaired.");
@@ -411,7 +448,10 @@ function resetManagedInferenceRoute(
     timeout: OPENSHELL_OPERATION_TIMEOUT_MS,
   });
   if (resetResult.status !== 0) {
-    const finalProbe = probeSandboxInferenceRoute(sandboxName);
+    const finalProbe = probeSandboxInferenceRoute(sandboxName, {
+      attempts: INFERENCE_ROUTE_POST_REPAIR_PROBE_ATTEMPTS,
+      delayMs: INFERENCE_ROUTE_POST_REPAIR_PROBE_DELAY_MS,
+    });
     if (finalProbe.healthy) {
       if (!quiet) {
         console.log("  inference.local route repaired.");
@@ -433,7 +473,10 @@ function resetManagedInferenceRoute(
     return false;
   }
 
-  const finalProbe = probeSandboxInferenceRoute(sandboxName);
+  const finalProbe = probeSandboxInferenceRoute(sandboxName, {
+    attempts: INFERENCE_ROUTE_POST_REPAIR_PROBE_ATTEMPTS,
+    delayMs: INFERENCE_ROUTE_POST_REPAIR_PROBE_DELAY_MS,
+  });
   if (finalProbe.healthy) {
     if (!quiet) {
       console.log("  inference.local route repaired.");
@@ -509,6 +552,23 @@ function ensureSandboxInferenceRouteOrExit(
     process.exit(1);
   }
   return result.sandbox;
+}
+
+function maybeEnsureHermesToolGatewayBroker(sb: SandboxEntry | null): void {
+  if (
+    !sb ||
+    sb.agent !== "hermes" ||
+    !Array.isArray(sb.hermesToolGateways) ||
+    sb.hermesToolGateways.length === 0
+  ) {
+    return;
+  }
+  try {
+    const hermesToolGatewayBroker = require("../../hermes-tool-gateway-broker");
+    hermesToolGatewayBroker.ensureHermesToolGatewayBrokerForSandboxEntry(sb);
+  } catch {
+    /* non-fatal — managed-tool calls will surface broker guidance if needed */
+  }
 }
 
 function exitWithSpawnResult(result: SpawnLikeResult): void {
@@ -660,6 +720,7 @@ export async function connectSandbox(
   // cluster-wide inference.local route may still point at the other provider.
   // After the sandbox is Ready, verify and recover the route before SSH.
   sb = ensureSandboxInferenceRouteOrExit(sandboxName);
+  maybeEnsureHermesToolGatewayBroker(sb);
 
   // Print a one-shot hint before dropping the user into the sandbox
   // shell so a fresh user knows the first thing to type. Without this,
