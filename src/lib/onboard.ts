@@ -36,6 +36,7 @@ const {
 const {
   buildSandboxConfigSyncScript,
   writeSandboxConfigSyncFile,
+  runSandboxConfigSync,
 }: typeof import("./onboard/config-sync") = require("./onboard/config-sync");
 const dockerGpuPatch: typeof import("./onboard/docker-gpu-patch") = require("./onboard/docker-gpu-patch");
 const dockerGpuLocalInference: typeof import("./onboard/docker-gpu-local-inference") = require("./onboard/docker-gpu-local-inference");
@@ -2847,7 +2848,7 @@ function getOpenShellDockerSupervisorImage(versionOutput: string | null = null):
   if (shouldUseOpenshellDevChannel() || isOpenshellDevVersion(versionOutput)) {
     return "ghcr.io/nvidia/openshell/supervisor:dev";
   }
-  const supportedVersion = installedVersion ?? getBlueprintMaxOpenshellVersion() ?? "0.0.39";
+  const supportedVersion = installedVersion ?? getBlueprintMaxOpenshellVersion() ?? "0.0.44";
   return `ghcr.io/nvidia/openshell/supervisor:${supportedVersion}`;
 }
 
@@ -4100,7 +4101,7 @@ async function startDockerDriverGateway({ exitOnFailure = true, skipSandboxBridg
   }
   if (!gatewayBin) {
     console.error("  OpenShell Docker-driver gateway binary not found.");
-    console.error("  Install OpenShell v0.0.39, or set NEMOCLAW_OPENSHELL_GATEWAY_BIN.");
+    console.error("  Install OpenShell v0.0.44, or set NEMOCLAW_OPENSHELL_GATEWAY_BIN.");
     if (exitOnFailure) process.exit(1);
     throw new Error("OpenShell gateway binary not found");
   }
@@ -5354,14 +5355,14 @@ async function createSandbox(
   // Pull the base image and resolve its digest so the Dockerfile is pinned to
   // exactly what we just fetched. This prevents stale :latest tags from
   // silently reusing a cached old image after NemoClaw upgrades (#1904).
-  const resolved = pullAndResolveBaseImageDigest({
+  const resolved = agent && !fromDockerfile ? null : pullAndResolveBaseImageDigest({
     requireOpenshellSandboxAbi: isLinuxDockerDriverGatewayEnabled(),
   });
   if (resolved?.digest) {
     console.log(`  Pinning base image to ${resolved.digest.slice(0, 19)}...`);
   } else if (resolved) {
     console.log(`  Using sandbox base image ${resolved.ref}`);
-  } else {
+  } else if (!(agent && !fromDockerfile)) {
     // Check if the image exists locally before falling back to unpinned :latest.
     // On a first-time install behind a firewall with no cached image, warn early
     // so the user knows the build will likely fail.
@@ -7930,28 +7931,21 @@ async function setupMessagingChannels(
 
 // ── Step 7: OpenClaw ─────────────────────────────────────────────
 
-async function setupOpenclaw(sandboxName: string, model: string, provider: string): Promise<void> {
-  step(7, 8, `Setting up ${agentProductName()} inside sandbox`);
-
-  const selectionConfig = getProviderSelectionConfig(provider, model);
-  if (selectionConfig) {
-    const sandboxConfig = {
-      ...selectionConfig,
-      onboardedAt: new Date().toISOString(),
-    };
-    const script = buildSandboxConfigSyncScript(sandboxConfig);
-    const scriptFile = writeSandboxConfigSyncFile(script);
-    try {
-      const scriptContent = fs.readFileSync(scriptFile, "utf-8");
-      run(openshellArgv(["sandbox", "connect", sandboxName]), {
+function syncNemoClawConfigInSandbox(sandboxName: string, provider: string, model: string): void {
+  runSandboxConfigSync(sandboxName, {
+    getSelectionConfig: () => getProviderSelectionConfig(provider, model),
+    runConnectScript: (name, scriptContent) => {
+      run(openshellArgv(["sandbox", "connect", name]), {
         stdio: ["pipe", "ignore", "inherit"],
         input: scriptContent,
       });
-    } finally {
-      cleanupTempDir(scriptFile, "nemoclaw-sync");
-    }
-  }
+    },
+  });
+}
 
+async function setupOpenclaw(sandboxName: string, model: string, provider: string): Promise<void> {
+  step(7, 8, `Setting up ${agentProductName()} inside sandbox`);
+  syncNemoClawConfigInSandbox(sandboxName, provider, model);
   console.log(`  ✓ ${agentProductName()} gateway launched inside sandbox`);
 }
 
@@ -9920,9 +9914,6 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
         runCaptureOpenshell,
         openshellShellCommand,
         openshellBinary: getOpenshellBinary(),
-        buildSandboxConfigSyncScript,
-        writeSandboxConfigSyncFile,
-        cleanupTempDir,
         startRecordedStep,
         skippedStepMessage,
       });
@@ -9932,6 +9923,10 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
       const resumeOpenclaw = resume && sandboxName && isOpenclawReady(sandboxName);
       if (resumeOpenclaw) {
         skippedStepMessage("openclaw", sandboxName);
+        // Rebuild leaves /sandbox/.nemoclaw/config.json as Dockerfile's
+        // zero-byte placeholder; re-sync to avoid loadOnboardConfig
+        // SyntaxError. Fixes #3999.
+        syncNemoClawConfigInSandbox(sandboxName, provider, model);
         onboardSession.markStepComplete(
           "openclaw",
           toSessionUpdates({ sandboxName, provider, model, hermesAuthMethod, hermesToolGateways }),
