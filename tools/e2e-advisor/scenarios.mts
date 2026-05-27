@@ -1,16 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-const require = createRequire(import.meta.url);
-const yaml: { load(input: string): unknown } = require("js-yaml");
-
 import { getChangedFiles } from "../advisors/git.mts";
 import { parseArgs, writeJson } from "../advisors/io.mts";
+import { listScenarios } from "../../test/e2e-scenario/scenarios/registry.ts";
 
 const SCENARIO_WORKFLOW = "e2e-scenarios.yaml";
 const SCENARIO_ALL_WORKFLOW = "e2e-scenarios-all.yaml";
@@ -50,23 +47,6 @@ export type ScenarioAdvisorResult = {
 type ScenarioEntry = {
   suites?: unknown;
   runner_requirements?: unknown;
-  dimensions?: {
-    platform?: unknown;
-    onboarding?: unknown;
-  };
-};
-
-type ScenariosFile = {
-  setup_scenarios?: Record<string, ScenarioEntry>;
-  test_plans?: Record<string, ScenarioEntry>;
-};
-
-type SuiteEntry = {
-  steps?: Array<{ script?: unknown }>;
-};
-
-type SuitesFile = {
-  suites?: Record<string, SuiteEntry>;
 };
 
 if (
@@ -133,24 +113,24 @@ export function analyzeScenarioRecommendations({
     } else if (file === ".github/workflows/e2e-scenarios.yaml") {
       allScenariosRequired = true;
       reasons.add("the reusable single-scenario workflow changed");
-    } else if (file === "test/e2e/nemoclaw_scenarios/scenarios.yaml") {
+    } else if (file === "test/e2e-scenario/nemoclaw_scenarios/scenarios.yaml") {
       allScenariosRequired = true;
       reasons.add("scenario catalog metadata changed");
-    } else if (file === "test/e2e/nemoclaw_scenarios/expected-states.yaml") {
+    } else if (file === "test/e2e-scenario/nemoclaw_scenarios/expected-states.yaml") {
       allScenariosRequired = true;
       reasons.add("expected-state metadata changed");
-    } else if (file === "test/e2e/validation_suites/suites.yaml") {
+    } else if (file === "test/e2e-scenario/validation_suites/suites.yaml") {
       allScenariosRequired = true;
       reasons.add("suite catalog metadata changed");
     } else if (
-      file.startsWith("test/e2e/runtime/") ||
-      file.startsWith("test/e2e/nemoclaw_scenarios/helpers/")
+      file.startsWith("test/e2e-scenario/runtime/") ||
+      file.startsWith("test/e2e-scenario/nemoclaw_scenarios/helpers/")
     ) {
       allScenariosRequired = true;
       reasons.add("shared scenario runner/runtime code changed");
     } else if (
-      file.startsWith("test/e2e/nemoclaw_scenarios/onboard/") ||
-      file.startsWith("test/e2e/nemoclaw_scenarios/install/")
+      file.startsWith("test/e2e-scenario/nemoclaw_scenarios/onboard/") ||
+      file.startsWith("test/e2e-scenario/nemoclaw_scenarios/install/")
     ) {
       directScenarioIds.add(DEFAULT_BASELINE_SCENARIO);
       reasons.add("scenario install/onboard helper code changed");
@@ -299,33 +279,102 @@ export function renderScenarioSummary(result: ScenarioAdvisorResult): string {
   return `${lines.join("\n")}\n`;
 }
 
-function loadScenarios(root: string): Record<string, ScenarioEntry> {
-  const filePath = path.join(
-    root,
-    "test/e2e/nemoclaw_scenarios/scenarios.yaml",
+function loadScenarios(_root: string): Record<string, ScenarioEntry> {
+  return Object.fromEntries(
+    listScenarios().map((scenario) => [
+      scenario.id,
+      {
+        suites: scenario.suiteIds ?? [],
+        runner_requirements: scenario.runnerRequirements ?? [],
+      },
+    ]),
   );
-  if (!fs.existsSync(filePath)) return {};
-  const doc = yaml.load(fs.readFileSync(filePath, "utf8")) as
-    | ScenariosFile
-    | undefined;
-  return { ...(doc?.test_plans ?? {}), ...(doc?.setup_scenarios ?? {}) };
 }
 
 function loadSuiteScriptMap(root: string): Record<string, string[]> {
-  const filePath = path.join(root, "test/e2e/validation_suites/suites.yaml");
+  const filePath = path.join(root, "test/e2e-scenario/validation_suites/suites.yaml");
   if (!fs.existsSync(filePath)) return {};
-  const doc = yaml.load(fs.readFileSync(filePath, "utf8")) as
-    | SuitesFile
-    | undefined;
-  const output: Record<string, string[]> = {};
-  for (const [suiteId, suite] of Object.entries(doc?.suites ?? {})) {
-    output[suiteId] = Array.isArray(suite.steps)
-      ? suite.steps
-          .map((step) => step.script)
-          .filter((script): script is string => typeof script === "string")
-      : [];
+  return parseSuiteScripts(fs.readFileSync(filePath, "utf8"));
+}
+
+function parseScenarioSection(
+  text: string,
+  sectionName: string,
+): Record<string, ScenarioEntry> {
+  const section = extractTopLevelSection(text, sectionName);
+  const scenarios: Record<string, ScenarioEntry> = {};
+  let currentId: string | undefined;
+  let inSuites = false;
+  let inRunnerRequirements = false;
+
+  for (const line of section.split(/\r?\n/)) {
+    const entryMatch = line.match(
+      /^  ([A-Za-z0-9_.-]+(?:__[A-Za-z0-9_.-]+)?):\s*$/,
+    );
+    if (entryMatch) {
+      currentId = entryMatch[1];
+      scenarios[currentId] = { suites: [], runner_requirements: [] };
+      inSuites = false;
+      inRunnerRequirements = false;
+      continue;
+    }
+    if (!currentId) continue;
+    if (/^    suites:\s*(?:\[\])?\s*$/.test(line)) {
+      inSuites = true;
+      inRunnerRequirements = false;
+      continue;
+    }
+    if (/^    runner_requirements:\s*$/.test(line)) {
+      inSuites = false;
+      inRunnerRequirements = true;
+      continue;
+    }
+    if (/^    [A-Za-z0-9_-]+:/.test(line)) {
+      inSuites = false;
+      inRunnerRequirements = false;
+      continue;
+    }
+    const listItem = line.match(/^    - ([A-Za-z0-9_.-]+)\s*$/);
+    if (listItem && inSuites) {
+      (scenarios[currentId].suites as string[]).push(listItem[1]);
+    } else if (listItem && inRunnerRequirements) {
+      (scenarios[currentId].runner_requirements as string[]).push(listItem[1]);
+    }
   }
-  return output;
+
+  return scenarios;
+}
+
+function parseSuiteScripts(text: string): Record<string, string[]> {
+  const section = extractTopLevelSection(text, "suites");
+  const suites: Record<string, string[]> = {};
+  let currentId: string | undefined;
+
+  for (const line of section.split(/\r?\n/)) {
+    const suiteMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*$/);
+    if (suiteMatch) {
+      currentId = suiteMatch[1];
+      suites[currentId] = [];
+      continue;
+    }
+    if (!currentId) continue;
+    const scriptMatch = line.match(/^      script:\s*([A-Za-z0-9_./-]+)\s*$/);
+    if (scriptMatch) suites[currentId].push(scriptMatch[1]);
+  }
+
+  return suites;
+}
+
+function extractTopLevelSection(text: string, sectionName: string): string {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((line) => line === `${sectionName}:`);
+  if (start === -1) return "";
+  const sectionLines: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    if (/^[A-Za-z0-9_-]+:/.test(line)) break;
+    sectionLines.push(line);
+  }
+  return sectionLines.join("\n");
 }
 
 function buildSuiteToScenarios(
@@ -364,9 +413,9 @@ function isScenarioRelevantFile(file: string): boolean {
   return (
     file === ".github/workflows/e2e-scenarios.yaml" ||
     file === ".github/workflows/e2e-scenarios-all.yaml" ||
-    file.startsWith("test/e2e/runtime/") ||
-    file.startsWith("test/e2e/nemoclaw_scenarios/") ||
-    file.startsWith("test/e2e/validation_suites/")
+    file.startsWith("test/e2e-scenario/runtime/") ||
+    file.startsWith("test/e2e-scenario/nemoclaw_scenarios/") ||
+    file.startsWith("test/e2e-scenario/validation_suites/")
   );
 }
 
@@ -376,11 +425,11 @@ function inferSuiteIdsFromPath(
   suiteScriptMap: Record<string, string[]>,
 ): string[] {
   if (
-    !file.startsWith("test/e2e/validation_suites/") ||
+    !file.startsWith("test/e2e-scenario/validation_suites/") ||
     file.endsWith("/suites.yaml")
   )
     return [];
-  const relative = file.slice("test/e2e/validation_suites/".length);
+  const relative = file.slice("test/e2e-scenario/validation_suites/".length);
   const segments = relative.split("/");
   const candidates = new Set<string>();
   for (let size = Math.min(segments.length, 3); size >= 1; size -= 1) {
@@ -464,9 +513,12 @@ function buildSingleScenarioRecommendation(
   reason: string,
   required = true,
 ): ScenarioRecommendation {
-  const suitePart = suiteFilter
-    ? ` --field suite_filter=${shellQuote(suiteFilter)}`
-    : "";
+  // The e2e-scenarios.yaml workflow_dispatch only exposes a single
+  // comma-separated `scenarios` input; it does not accept `scenario` or
+  // `suite_filter`. Emit a dispatch command that matches that contract so
+  // copy/paste from advisor comments actually runs. `suiteFilter` is kept on
+  // the recommendation object as analytical metadata explaining why the
+  // scenario was selected, but is no longer rendered into the command.
   return {
     id: suiteFilter ? `${scenario}:${suiteFilter}` : scenario,
     workflow: SCENARIO_WORKFLOW,
@@ -474,7 +526,7 @@ function buildSingleScenarioRecommendation(
     suiteFilter,
     required,
     reason,
-    dispatchCommand: `gh workflow run e2e-scenarios.yaml --ref <pr-head-ref> --field scenario=${shellQuote(scenario)}${suitePart}`,
+    dispatchCommand: `gh workflow run e2e-scenarios.yaml --ref <pr-head-ref> --field scenarios=${shellQuote(scenario)}`,
   };
 }
 
