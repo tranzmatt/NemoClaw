@@ -28,8 +28,13 @@ RUN npm ci && npm run build
 # Stage 2: Runtime image — pull cached base from GHCR
 # hadolint ignore=DL3006
 FROM ${BASE_IMAGE}
-ARG OPENCLAW_VERSION=2026.5.22
-ARG OPENCLAW_2026_5_22_INTEGRITY=sha512-m+zgBELGbCHjWB1IWF5WSWNPr480cMKOMff2OF72c8A0AMD4hC/9+qwYtzjYmGkETcffnB711JymlVsQnh2Tow==
+ARG OPENCLAW_VERSION=2026.5.27
+ARG OPENCLAW_2026_5_27_INTEGRITY=sha512-2N93zhdAo88KAbHt6T7KvYXf4s7XIkYXBgv1npYpn7e1Y9FvrtgtpsA38my9rtFW+70uXEojRPX5/OqnuDqJPw==
+
+# OpenClaw 2026.5.27 loads some generated source through jiti. Disable its
+# filesystem transform cache so source fragments that mention provider marker
+# names do not persist under /tmp/jiti inside the sandbox.
+ENV JITI_FS_CACHE=false
 
 # Harden: remove unnecessary build tools and network probes from base image (#830)
 # Protect runtime tools before autoremove — the GHCR base may predate the
@@ -87,8 +92,10 @@ ENV NPM_CONFIG_AUDIT=false \
 RUN npm ci --omit=dev
 COPY scripts/patch-openclaw-tool-catalog.js /usr/local/lib/nemoclaw/patch-openclaw-tool-catalog.js
 COPY scripts/patch-openclaw-chat-send.js /usr/local/lib/nemoclaw/patch-openclaw-chat-send.js
+COPY scripts/patch-openclaw-slack-deny-feedback.mts /usr/local/lib/nemoclaw/patch-openclaw-slack-deny-feedback.mts
 RUN chmod 755 /usr/local/lib/nemoclaw/patch-openclaw-tool-catalog.js \
-        /usr/local/lib/nemoclaw/patch-openclaw-chat-send.js
+        /usr/local/lib/nemoclaw/patch-openclaw-chat-send.js \
+        /usr/local/lib/nemoclaw/patch-openclaw-slack-deny-feedback.mts
 
 # Upgrade OpenClaw if the base image is stale.
 #
@@ -110,7 +117,7 @@ RUN set -eu; \
         echo "ERROR: OpenClaw build target ${OPENCLAW_VERSION} is below blueprint minimum ${MIN_VER}" >&2; exit 1; \
     fi; \
     EXPECTED_INTEGRITY=""; \
-    if [ "$OPENCLAW_VERSION" = "2026.5.22" ]; then EXPECTED_INTEGRITY="$OPENCLAW_2026_5_22_INTEGRITY"; fi; \
+    if [ "$OPENCLAW_VERSION" = "2026.5.27" ]; then EXPECTED_INTEGRITY="$OPENCLAW_2026_5_27_INTEGRITY"; fi; \
     if [ -n "$EXPECTED_INTEGRITY" ]; then \
         REGISTRY_INTEGRITY=$(npm view "openclaw@${OPENCLAW_VERSION}" dist.integrity); \
         if [ "$REGISTRY_INTEGRITY" != "$EXPECTED_INTEGRITY" ]; then \
@@ -193,6 +200,24 @@ RUN set -eu; \
 # sandbox. The generic SSRF helper and strict/direct DNS-pinned paths remain
 # unmodified, so metadata/link-local/private IP literals are unchanged.
 #
+# === Patch 4: route unconfigured strict SSRF fetches through the egress proxy ===
+# (NVIDIA/NemoClaw#4687). fetchWithSsrFGuard builds a per-request DNS-pinned
+# *direct* undici dispatcher for STRICT-mode fetches that pass no explicit
+# dispatcherPolicy — e.g. the @openclaw/googlechat inbound JWT signing-cert
+# fetch from www.googleapis.com/service_accounts/v1/metadata/x509/.... A direct
+# dispatcher ignores the global EnvHttpProxyAgent installed by
+# NODE_USE_ENV_PROXY=1, so the request never reaches the OpenShell L7 proxy and
+# fails in the proxy-only sandbox netns — rejecting every inbound Google Chat
+# webhook. OpenClaw already has a "managed proxy" branch that routes such
+# fetches through the env proxy (createHttp1EnvHttpProxyAgent) while still
+# resolving + SSRF-validating the target hostname, but it is gated on
+# isManagedProxyActive() (OPENCLAW_PROXY_ACTIVE=1), which NemoClaw does not set.
+# Inside an OpenShell sandbox the configured egress proxy IS the managed proxy,
+# so extend that activation to OPENSHELL_SANDBOX=1 for fetches that supply no
+# explicit dispatcherPolicy. Explicit-proxy and direct(mTLS) dispatcher policies
+# (Google auth proxy / client-cert paths) keep their existing behavior, and
+# resolvePinnedHostnameWithPolicy still blocks private/link-local targets.
+#
 # === Removal criteria ===
 # Patch 1: drop when OpenClaw deprecates withStrictGuardedFetchMode or
 #   when all media-fetch callsites unconditionally pass useEnvProxy.
@@ -202,6 +227,9 @@ RUN set -eu; \
 # Patch 2b: drop when OpenClaw ships a reviewed web_fetch trusted-proxy SSRF
 #   policy surface that can allow host.openshell.internal without allowing
 #   broader private/special-use hostnames.
+# Patch 4: drop when OpenClaw routes unconfigured strict fetches through the
+#   env proxy in proxy-only environments without OPENCLAW_PROXY_ACTIVE, or when
+#   NemoClaw sets OPENCLAW_PROXY_ACTIVE=1 in the sandbox runtime instead.
 #
 # SYNC WITH OPENCLAW: these patches classify the compiled OpenClaw dist at
 # build time. They apply the legacy patch when the old target exists, skip
@@ -287,7 +315,7 @@ RUN set -eu; \
         fi; \
     fi; \
     # --- Patch 2b: allow OpenShell host gateway only through web_fetch trusted env proxy --- \
-    # Reviewed against openclaw@2026.5.22 dist: fetchWithWebToolsNetworkGuard \
+    # Reviewed against openclaw@2026.5.27 dist: fetchWithWebToolsNetworkGuard \
     # passes useEnvProxy into withTrustedEnvProxyGuardedFetchMode(resolved), and \
     # the SSRF guard consumes policy.allowedHostnames to skip private-network \
     # checks for an exact normalized hostname. hostnameAllowlist only gates \
@@ -318,6 +346,40 @@ RUN set -eu; \
             echo "ERROR: Patch 2b target missing but web_fetch/trusted-proxy references remain:" >&2; \
             printf '%s\n' "$web_fetch_proxy_refs" | head -n 5 >&2; \
             patch_fail "Patch 2b cannot safely skip"; \
+        fi; \
+    fi; \
+    # --- Patch 4: route unconfigured strict fetches through the sandbox egress proxy (#4687) --- \
+    # Reviewed against openclaw@2026.5.27 dist fetch-guard: the STRICT-mode \
+    # managed-proxy gate is `mode === GUARDED_FETCH_MODE.STRICT && \
+    # isManagedProxyActive() && hasProxyEnvConfigured()`. Extend activation to \
+    # OPENSHELL_SANDBOX=1 only for fetches with no explicit dispatcherPolicy so \
+    # the per-request direct dispatcher reuses the env proxy (EnvHttpProxyAgent) \
+    # like the managed-proxy path already does; explicit-proxy / direct dispatcher \
+    # policies and out-of-sandbox behavior are unchanged. \
+    mp_files="$(grep -RIlF --include='*.js' 'const canUseManagedProxy = mode === GUARDED_FETCH_MODE.STRICT && isManagedProxyActive() && hasProxyEnvConfigured();' "$OC_DIST" || true)"; \
+    if [ -n "$mp_files" ]; then \
+        patched_managed_proxy=0; \
+        for f in $mp_files; do \
+            if grep -q 'nemoclaw: route unconfigured strict fetch' "$f"; then \
+                echo "INFO: Patch 4 already present in $f"; \
+            else \
+                sed -i -E 's#const canUseManagedProxy = mode === GUARDED_FETCH_MODE\.STRICT \&\& isManagedProxyActive\(\) \&\& hasProxyEnvConfigured\(\);#const canUseManagedProxy = mode === GUARDED_FETCH_MODE.STRICT \&\& (isManagedProxyActive() || (process.env.OPENSHELL_SANDBOX === "1" \&\& !params.dispatcherPolicy)) \&\& hasProxyEnvConfigured(); /* nemoclaw: route unconfigured strict fetch through sandbox egress proxy, see Dockerfile */#' "$f"; \
+                grep -Fq 'process.env.OPENSHELL_SANDBOX === "1" && !params.dispatcherPolicy' "$f" \
+                    || patch_fail "Patch 4 verification failed for $f"; \
+                patched_managed_proxy=1; \
+            fi; \
+        done; \
+        if [ "$patched_managed_proxy" = "1" ]; then \
+            echo "INFO: Patch 4 applied to OpenClaw ${OC_VERSION} managed-proxy strict-fetch activation"; \
+        fi; \
+    else \
+        managed_proxy_refs="$(grep -RIlE --include='*.js' 'canUseManagedProxy|isManagedProxyActive' "$OC_DIST" || true)"; \
+        if [ -z "$managed_proxy_refs" ]; then \
+            echo "INFO: OpenClaw ${OC_VERSION} has no managed-proxy strict-fetch gate; Patch 4 not needed"; \
+        else \
+            echo "ERROR: Patch 4 target missing but managed-proxy references remain:" >&2; \
+            printf '%s\n' "$managed_proxy_refs" | head -n 5 >&2; \
+            patch_fail "Patch 4 cannot safely skip"; \
         fi; \
     fi; \
     # --- Patch 3: follow symlinks in plugin-install path checks (#2203) --- \
@@ -379,7 +441,7 @@ RUN set -eu; \
 RUN node /usr/local/lib/nemoclaw/patch-openclaw-chat-send.js \
     /usr/local/lib/node_modules/openclaw/dist
 
-# Patch OpenClaw's pinned 2026.5.22 compiled selection runtime to expose a
+# Patch OpenClaw's pinned 2026.5.27 compiled selection runtime to expose a
 # compact searchable tool catalog to the model while preserving the full
 # effective tool set behind tool_call. NEMOCLAW_TOOL_CATALOG=0 disables this
 # wrapper if an emergency rollback is needed. The script fails closed if the
@@ -396,6 +458,8 @@ RUN mkdir -p /sandbox/.nemoclaw/blueprints/0.1.0 \
 
 # Copy startup script and shared sandbox initialisation library
 COPY scripts/lib/sandbox-init.sh /usr/local/lib/nemoclaw/sandbox-init.sh
+COPY scripts/lib/openclaw_device_approval_policy.py /usr/local/lib/nemoclaw/openclaw_device_approval_policy.py
+COPY scripts/lib/clean_runtime_shell_env_shim.py /usr/local/lib/nemoclaw/clean_runtime_shell_env_shim.py
 COPY scripts/nemoclaw-start.sh /usr/local/bin/nemoclaw-start
 # Copy NODE_OPTIONS preload modules to a Landlock-accessible path. OpenShell ≥0.0.36
 # blocks /opt/nemoclaw-blueprint/ from non-root users, but the entrypoint
@@ -411,6 +475,8 @@ RUN chmod 755 /usr/local/bin/nemoclaw-start /usr/local/bin/nemoclaw-codex-acp \
         /usr/local/lib/nemoclaw/generate-openclaw-config.mts \
         /usr/local/lib/nemoclaw/openclaw-build-messaging-plugins.py \
         /usr/local/lib/nemoclaw/seed-wechat-accounts.py \
+    && chmod 644 /usr/local/lib/nemoclaw/openclaw_device_approval_policy.py \
+        /usr/local/lib/nemoclaw/clean_runtime_shell_env_shim.py \
     && if [ -d /usr/local/lib/nemoclaw/preloads ]; then find /usr/local/lib/nemoclaw/preloads -type f -name '*.js' -exec chmod 644 {} +; fi \
     && chmod 755 /usr/local/share/nemoclaw \
         /usr/local/share/nemoclaw/openclaw-plugins \
@@ -505,6 +571,10 @@ ARG NEMOCLAW_PROXY_PORT=3128
 # The actual API key is injected at runtime via openshell:resolve:env, never
 # baked into the image.
 ARG NEMOCLAW_WEB_SEARCH_ENABLED=0
+ARG NEMOCLAW_OPENCLAW_OTEL=0
+ARG NEMOCLAW_OPENCLAW_OTEL_ENDPOINT=http://host.openshell.internal:4318
+ARG NEMOCLAW_OPENCLAW_OTEL_SERVICE_NAME=openclaw-gateway
+ARG NEMOCLAW_OPENCLAW_OTEL_SAMPLE_RATE=1.0
 
 # SECURITY: Promote build-args to env vars so the TypeScript script reads them
 # via process.env, never via string interpolation into executable source code.
@@ -533,7 +603,11 @@ ENV NEMOCLAW_MODEL=${NEMOCLAW_MODEL} \
     NEMOCLAW_DISABLE_DEVICE_AUTH=${NEMOCLAW_DISABLE_DEVICE_AUTH} \
     NEMOCLAW_PROXY_HOST=${NEMOCLAW_PROXY_HOST} \
     NEMOCLAW_PROXY_PORT=${NEMOCLAW_PROXY_PORT} \
-    NEMOCLAW_WEB_SEARCH_ENABLED=${NEMOCLAW_WEB_SEARCH_ENABLED}
+    NEMOCLAW_WEB_SEARCH_ENABLED=${NEMOCLAW_WEB_SEARCH_ENABLED} \
+    NEMOCLAW_OPENCLAW_OTEL=${NEMOCLAW_OPENCLAW_OTEL} \
+    NEMOCLAW_OPENCLAW_OTEL_ENDPOINT=${NEMOCLAW_OPENCLAW_OTEL_ENDPOINT} \
+    NEMOCLAW_OPENCLAW_OTEL_SERVICE_NAME=${NEMOCLAW_OPENCLAW_OTEL_SERVICE_NAME} \
+    NEMOCLAW_OPENCLAW_OTEL_SAMPLE_RATE=${NEMOCLAW_OPENCLAW_OTEL_SAMPLE_RATE}
 
 WORKDIR /sandbox
 USER sandbox
@@ -563,8 +637,25 @@ RUN NEMOCLAW_OPENCLAW_MANAGED_PROXY=0 node --experimental-strip-types /usr/local
 # hadolint ignore=DL3059,DL4006
 RUN python3 /usr/local/lib/nemoclaw/openclaw-build-messaging-plugins.py
 
-# Lock down npm: no further registry traffic in this image. Everything past
-# this point must resolve from local sources only.
+# Patch the OpenClaw Slack channel (@openclaw/slack) so a denied explicit
+# @-mention still blocks the command but sends one bounded sender-facing
+# feedback message instead of dropping silently (NemoClaw #4752). The script
+# classifies the installed Slack dist by content signature, fails the build if
+# a @openclaw/slack package is present but the deny path shape is unrecognized,
+# and is a no-op when the Slack channel is not enabled for this image.
+# Scoped to the sandbox-writable OpenClaw config dir: `openclaw plugins install`
+# stages external channel packages under $HOME/.openclaw/npm, and this step runs
+# as the sandbox user, so do not scan the root-owned global node_modules tree.
+# Removal criteria: drop when upstream OpenClaw notifies the sender on a denied
+# explicit Slack @-mention, or when NemoClaw no longer ships @openclaw/slack.
+# hadolint ignore=DL3059
+RUN node --experimental-strip-types /usr/local/lib/nemoclaw/patch-openclaw-slack-deny-feedback.mts \
+    /sandbox/.openclaw
+
+# Lock down npm for the next RUN: the local OpenClaw plugin install must
+# resolve from /opt/nemoclaw and the staged plugin-runtime-deps tree without
+# touching the registry. Reset to false after that RUN so the runtime image
+# does not propagate `only-if-cached` mode to in-sandbox `npx` / `npm install`.
 ENV NPM_CONFIG_OFFLINE=true \
     NPM_CONFIG_AUDIT=false \
     NPM_CONFIG_FUND=false
@@ -593,6 +684,10 @@ RUN openclaw plugins install /opt/nemoclaw \
             -name examples \
         \) -prune -exec rm -rf {} +; \
     fi
+
+# Release the offline lock so the runtime sandbox can install MCP servers,
+# skills, and ad-hoc packages via the OpenShell L7 proxy.
+ENV NPM_CONFIG_OFFLINE=false
 
 # SECURITY: Clear any gateway auth token that openclaw doctor/plugins may have
 # auto-generated. The real token is created at container startup by the
@@ -839,6 +934,38 @@ RUN if [ "$NEMOCLAW_DARWIN_VM_COMPAT" = "1" ]; then \
             find "$p" -type d -exec chmod a+rwx {} +; \
         done; \
         chmod a+rw /sandbox/.nemoclaw/config.json; \
+    fi
+
+# Temporary workaround for OpenTelemetry JS OTLP/HTTP proxy handling.
+# When diagnostics OTEL is enabled, patch the bundled exporter so Node's
+# NODE_USE_ENV_PROXY=1 handling can apply instead of forcing the default agent.
+# Remove once https://github.com/open-telemetry/opentelemetry-js/issues/6638
+# is fixed in @opentelemetry/otlp-exporter-base.
+# hadolint ignore=DL4006
+RUN set -eu; \
+    if [ "$NEMOCLAW_OPENCLAW_OTEL" = "1" ]; then \
+        target="$(find /sandbox/.openclaw \
+            -path '*/@opentelemetry/otlp-exporter-base/build/src/transport/http-transport-utils.js' \
+            -print -quit 2>/dev/null || true)"; \
+        if [ -z "$target" ]; then \
+            echo "ERROR: NEMOCLAW_OPENCLAW_OTEL=1 but otlp-exporter-base transport was not found" >&2; \
+            exit 1; \
+        fi; \
+        if grep -q 'NODE_USE_ENV_PROXY' "$target"; then \
+            echo "INFO: OpenTelemetry OTLP proxy patch already present in $target"; \
+        else \
+            owner="$(stat -c '%u:%g' "$target")"; \
+            mode="$(stat -c '%a' "$target")"; \
+            cp -p "$target" "$target.bak"; \
+            sed -i "0,/^[[:space:]]*agent,$/s//        agent: process.env.NODE_USE_ENV_PROXY === '1' ? undefined : agent,/" "$target"; \
+            grep -q 'NODE_USE_ENV_PROXY' "$target" || { \
+                echo "ERROR: failed to patch OpenTelemetry OTLP transport at $target" >&2; \
+                exit 1; \
+            }; \
+            chown "$owner" "$target"; \
+            chmod "$mode" "$target"; \
+            echo "INFO: patched OpenTelemetry OTLP proxy handling in $target"; \
+        fi; \
     fi
 
 # Health check: poll the gateway's /health endpoint so Docker (and Compose)

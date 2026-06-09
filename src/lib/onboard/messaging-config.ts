@@ -65,11 +65,6 @@ export function collectMessagingBuildConfig({
     if (activeChannelNames.has(ch.name) && ch.userIdEnvKey) {
       const resolved = resolveMessagingChannelConfigEnvValue(ch.userIdEnvKey, env);
       if (!resolved.value) continue;
-      if (resolved.sourceKey && resolved.sourceKey !== ch.userIdEnvKey) {
-        warn(
-          `  Warning: ${resolved.sourceKey} is treated as ${ch.userIdEnvKey} for ${ch.name} allowlisting; prefer ${ch.userIdEnvKey}.`,
-        );
-      }
       const ids = parseMessagingConfigList(resolved.value);
       if (ids.length > 0) messagingAllowedIds[ch.name] = ids;
     }
@@ -122,7 +117,9 @@ export function getStoredMessagingChannelConfig(
   return mergeMessagingChannelConfigs(registryConfig, sessionConfig);
 }
 
-export function persistMessagingChannelConfigToSession(config: MessagingChannelConfig | null): void {
+export function persistMessagingChannelConfigToSession(
+  config: MessagingChannelConfig | null,
+): void {
   onboardSession.updateSession((current: Session) => {
     current.messagingChannelConfig = config;
     return current;

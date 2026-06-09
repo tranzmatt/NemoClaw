@@ -6,8 +6,8 @@ import { describe, expect, it } from "vitest";
 import { createBuiltInChannelManifestRegistry } from "../channels";
 import { createBuiltInMessagingHookRegistry, MessagingHookRegistry } from "../hooks";
 import {
-  ChannelManifestRegistry,
   type ChannelManifest,
+  ChannelManifestRegistry,
   type SandboxMessagingPlan,
 } from "../manifest";
 import { ManifestCompiler } from "./manifest-compiler";
@@ -35,8 +35,14 @@ function compiler(): ManifestCompiler {
         env: {},
         getCredential: (key) => TEST_CREDENTIALS[key] ?? null,
         saveCredential: () => {},
-        prompt: async () => "unused",
+        prompt: async () => "",
         log: () => {},
+      },
+      slack: {
+        validateCredentials: {
+          log: () => {},
+          validateCredentials: () => ({ ok: true }),
+        },
       },
       telegram: {
         fetch: async () => ({
@@ -53,6 +59,7 @@ function compiler(): ManifestCompiler {
       wechat: {
         ilinkLogin: {
           env: {},
+          log: () => {},
           saveCredential: () => {},
           runLogin: async () => ({
             kind: "ok",
@@ -88,9 +95,7 @@ async function withEnv<T>(
   values: Readonly<Record<string, string | undefined>>,
   run: () => Promise<T>,
 ): Promise<T> {
-  const previous = Object.fromEntries(
-    Object.keys(values).map((key) => [key, process.env[key]]),
-  );
+  const previous = Object.fromEntries(Object.keys(values).map((key) => [key, process.env[key]]));
   try {
     for (const [key, value] of Object.entries(values)) {
       if (value === undefined) {
@@ -184,9 +189,7 @@ describe("ManifestCompiler", () => {
       "slack:json-fragment",
       "whatsapp:json-fragment",
     ]);
-    expect(JSON.stringify(plan.agentRender)).toContain(
-      "openshell:resolve:env:TELEGRAM_BOT_TOKEN",
-    );
+    expect(JSON.stringify(plan.agentRender)).toContain("openshell:resolve:env:TELEGRAM_BOT_TOKEN");
     expect(plan.buildSteps).toEqual([
       {
         channelId: "wechat",
@@ -234,13 +237,26 @@ describe("ManifestCompiler", () => {
   });
 
   it("compiles Hermes render and manifest-owned WeChat policy intent", async () => {
-    const plan = await compiler().compile({
-      sandboxName: "demo",
-      agent: "hermes",
-      workflow: "rebuild",
-      isInteractive: false,
-      configuredChannels: ALL_CHANNELS,
-    });
+    const plan = await withEnv(
+      {
+        WECHAT_ACCOUNT_ID: "test-wechat-account",
+      },
+      () =>
+        compiler().compile({
+          sandboxName: "demo",
+          agent: "hermes",
+          workflow: "rebuild",
+          isInteractive: false,
+          configuredChannels: ALL_CHANNELS,
+          credentialAvailability: {
+            TELEGRAM_BOT_TOKEN: true,
+            DISCORD_BOT_TOKEN: true,
+            WECHAT_BOT_TOKEN: true,
+            SLACK_BOT_TOKEN: true,
+            SLACK_APP_TOKEN: true,
+          },
+        }),
+    );
 
     expect(plan.networkPolicy.entries.find((entry) => entry.channelId === "wechat")).toEqual({
       channelId: "wechat",
@@ -265,7 +281,39 @@ describe("ManifestCompiler", () => {
       plan.channels
         .find((channel) => channel.channelId === "wechat")
         ?.inputs.find((input) => input.inputId === "accountId"),
-    ).not.toHaveProperty("value");
+    ).toMatchObject({
+      kind: "config",
+      value: "test-wechat-account",
+    });
+  });
+
+  it("does not activate a requested channel while any required manifest input is missing", async () => {
+    const plan = await withEnv(
+      {
+        WECHAT_ACCOUNT_ID: undefined,
+      },
+      () =>
+        compiler().compile({
+          sandboxName: "demo",
+          agent: "hermes",
+          workflow: "onboard",
+          isInteractive: false,
+          configuredChannels: ["wechat"],
+          credentialAvailability: {
+            WECHAT_BOT_TOKEN: true,
+          },
+        }),
+    );
+
+    expect(plan.channels[0]).toMatchObject({
+      channelId: "wechat",
+      active: false,
+      disabled: true,
+    });
+    expect(plan.disabledChannels).toEqual(["wechat"]);
+    expect(plan.networkPolicy.entries.map((entry) => entry.channelId)).toEqual(["wechat"]);
+    expect(plan.agentRender.map((render) => render.channelId)).toEqual(["wechat"]);
+    expect(plan.healthChecks.map((entry) => entry.channelId)).toEqual(["wechat"]);
   });
 
   it("runs enrollment hooks before returning the final channel input plan", async () => {
@@ -313,10 +361,7 @@ describe("ManifestCompiler", () => {
         },
       },
     ]);
-    const plan = await new ManifestCompiler(
-      createBuiltInChannelManifestRegistry(),
-      hooks,
-    ).compile({
+    const plan = await new ManifestCompiler(createBuiltInChannelManifestRegistry(), hooks).compile({
       sandboxName: "demo",
       agent: "openclaw",
       workflow: "onboard",
@@ -334,18 +379,13 @@ describe("ManifestCompiler", () => {
     expect(plan.disabledChannels).toEqual(["telegram"]);
     expect(plan.channels[0]?.hooks.map((hook) => hook.id)).toEqual([
       "telegram-token-paste",
-      "telegram-reachability",
+      "telegram-allowlist-aliases",
+      "telegram-config-prompt",
+      "telegram-get-me-reachability",
     ]);
-    expect(plan.credentialBindings.map((binding) => binding.channelId)).toEqual([
-      "telegram",
-    ]);
-    expect(plan.networkPolicy.entries.map((entry) => entry.channelId)).toEqual([
-      "telegram",
-    ]);
-    expect(plan.agentRender.map((render) => render.channelId)).toEqual([
-      "telegram",
-      "telegram",
-    ]);
+    expect(plan.credentialBindings.map((binding) => binding.channelId)).toEqual(["telegram"]);
+    expect(plan.networkPolicy.entries.map((entry) => entry.channelId)).toEqual(["telegram"]);
+    expect(plan.agentRender.map((render) => render.channelId)).toEqual(["telegram", "telegram"]);
     expect(plan.buildSteps).toEqual([]);
     expect(plan.stateUpdates.map((entry) => entry.channelId)).toEqual([
       "telegram",
@@ -356,37 +396,112 @@ describe("ManifestCompiler", () => {
     expect(plan.healthChecks.map((entry) => entry.channelId)).toEqual(["telegram"]);
   });
 
-  it("skips token-paste and QR enrollment hooks for non-interactive create plans", async () => {
+  it("runs non-interactive enrollment hooks to validate and feed reachability checks", async () => {
+    const hookCalls: string[] = [];
     const hooks = new MessagingHookRegistry([
       {
         id: "common.tokenPaste",
-        handler: () => {
-          throw new Error("token-paste hook should not run");
+        handler: (context) => {
+          hookCalls.push(`token-paste-input:${String(context.inputs?.botToken)}`);
+          const token = process.env.TELEGRAM_BOT_TOKEN ?? "missing";
+          return {
+            outputs: {
+              botToken: {
+                kind: "secret",
+                value: token,
+              },
+            },
+          };
         },
       },
       {
-        id: "telegram.getMeReachability",
+        id: "common.configPrompt",
         handler: () => ({}),
       },
-    ]);
-    const plan = await new ManifestCompiler(
-      createBuiltInChannelManifestRegistry(),
-      hooks,
-    ).compile({
-      sandboxName: "demo",
-      agent: "openclaw",
-      workflow: "onboard",
-      isInteractive: false,
-      configuredChannels: ["telegram"],
-      credentialAvailability: {
-        TELEGRAM_BOT_TOKEN: true,
+      {
+        id: "telegram.allowlistAliases",
+        handler: () => ({}),
       },
-    });
+      {
+        id: "telegram.getMeReachability",
+        handler: (context) => {
+          hookCalls.push(`reachability:${String(context.inputs?.botToken)}`);
+          return {};
+        },
+      },
+    ]);
+    const plan = await withEnv(
+      {
+        TELEGRAM_BOT_TOKEN: "123456:raw-telegram-token",
+      },
+      () =>
+        new ManifestCompiler(createBuiltInChannelManifestRegistry(), hooks).compile({
+          sandboxName: "demo",
+          agent: "openclaw",
+          workflow: "onboard",
+          isInteractive: false,
+          configuredChannels: ["telegram"],
+          credentialAvailability: {
+            TELEGRAM_BOT_TOKEN: true,
+          },
+        }),
+    );
 
     expect(plan.channels[0]?.inputs.find((input) => input.inputId === "botToken")).toMatchObject({
       kind: "secret",
       credentialAvailable: true,
     });
+    expect(hookCalls).toEqual([
+      "token-paste-input:undefined",
+      "reachability:123456:raw-telegram-token",
+    ]);
+    expect(JSON.stringify(plan)).not.toContain("123456:raw-telegram-token");
+  });
+
+  it("disables a channel when a reachability check opts to skip it", async () => {
+    const hooks = new MessagingHookRegistry([
+      {
+        id: "common.tokenPaste",
+        handler: () => ({
+          outputs: {
+            botToken: {
+              kind: "secret",
+              value: "123456:raw-telegram-token",
+            },
+          },
+        }),
+      },
+      {
+        id: "common.configPrompt",
+        handler: () => ({}),
+      },
+      {
+        id: "telegram.allowlistAliases",
+        handler: () => ({}),
+      },
+      {
+        id: "telegram.getMeReachability",
+        handler: () => {
+          throw new Error("telegram is unreachable");
+        },
+      },
+    ]);
+    const plan = await new ManifestCompiler(createBuiltInChannelManifestRegistry(), hooks).compile({
+      sandboxName: "demo",
+      agent: "openclaw",
+      workflow: "onboard",
+      isInteractive: false,
+      configuredChannels: ["telegram"],
+    });
+
+    expect(plan.channels[0]).toMatchObject({
+      channelId: "telegram",
+      active: false,
+      selected: true,
+      configured: false,
+      disabled: true,
+    });
+    expect(plan.disabledChannels).toEqual(["telegram"]);
   });
 
   it("reads input values from env keys before returning non-interactive plans", async () => {
@@ -404,11 +519,15 @@ describe("ManifestCompiler", () => {
           configuredChannels: ["telegram"],
         });
 
-        expect(plan.channels[0]?.inputs.find((input) => input.inputId === "botToken")).toMatchObject({
+        expect(
+          plan.channels[0]?.inputs.find((input) => input.inputId === "botToken"),
+        ).toMatchObject({
           kind: "secret",
           credentialAvailable: true,
         });
-        expect(plan.channels[0]?.inputs.find((input) => input.inputId === "allowedIds")).toMatchObject({
+        expect(
+          plan.channels[0]?.inputs.find((input) => input.inputId === "allowedIds"),
+        ).toMatchObject({
           kind: "config",
           value: "123456789",
         });
@@ -471,16 +590,9 @@ describe("ManifestCompiler", () => {
       disabled: true,
     });
     expect(plan.disabledChannels).toEqual(["telegram"]);
-    expect(plan.credentialBindings.map((binding) => binding.channelId)).toEqual([
-      "telegram",
-    ]);
-    expect(plan.networkPolicy.entries.map((entry) => entry.channelId)).toEqual([
-      "telegram",
-    ]);
-    expect(plan.agentRender.map((render) => render.channelId)).toEqual([
-      "telegram",
-      "telegram",
-    ]);
+    expect(plan.credentialBindings.map((binding) => binding.channelId)).toEqual(["telegram"]);
+    expect(plan.networkPolicy.entries.map((entry) => entry.channelId)).toEqual(["telegram"]);
+    expect(plan.agentRender.map((render) => render.channelId)).toEqual(["telegram", "telegram"]);
     expect(plan.buildSteps).toEqual([]);
     expect(plan.stateUpdates.map((entry) => entry.channelId)).toEqual([
       "telegram",
@@ -491,7 +603,9 @@ describe("ManifestCompiler", () => {
     expect(plan.healthChecks.map((entry) => entry.channelId)).toEqual(["telegram"]);
     expect(plan.channels[0]?.hooks.map((hook) => hook.id)).toEqual([
       "telegram-token-paste",
-      "telegram-reachability",
+      "telegram-allowlist-aliases",
+      "telegram-config-prompt",
+      "telegram-get-me-reachability",
     ]);
   });
 
@@ -628,10 +742,7 @@ describe("ManifestCompiler", () => {
         handler: "matrix.probeHost",
       }),
     );
-    expect(hookCalls).toEqual([
-      "enroll",
-      "reachability:!room:example.com",
-    ]);
+    expect(hookCalls).toEqual(["enroll", "reachability:!room:example.com"]);
     expect(JSON.stringify(plan)).not.toContain("raw-matrix-token");
   });
 });

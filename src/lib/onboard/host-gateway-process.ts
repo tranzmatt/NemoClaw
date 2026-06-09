@@ -61,7 +61,8 @@ const DOCKER_DRIVER_GATEWAY_MOUNT_PATH = "/opt/nemoclaw/openshell-gateway";
 // sees the cmdline string, not argv0; without an argv0 gate the compat mount
 // path could match unrelated commands. The compat parent is rediscovered via
 // the PID file written at launch time.
-const HOST_GATEWAY_PGREP_PATTERN = "^(/[^ ]*/)?openshell-gateway( |$)";
+/** Anchored pgrep pattern for direct host openshell-gateway processes. */
+export const HOST_GATEWAY_PGREP_PATTERN = "^(/[^ ]*/)?openshell-gateway( |$)";
 const DEFAULT_TERM_WAIT_MS = 1000;
 const DEFAULT_KILL_WAIT_MS = 1000;
 const DEFAULT_POLL_INTERVAL_MS = 50;
@@ -74,11 +75,7 @@ function toRunResult(result: ReturnType<typeof spawnSync>): RunResult {
   };
 }
 
-function defaultRun(
-  command: string,
-  args: string[],
-  options: SpawnSyncOptions = {},
-): RunResult {
+function defaultRun(command: string, args: string[], options: SpawnSyncOptions = {}): RunResult {
   return toRunResult(spawnSync(command, args, { encoding: "utf-8", ...options }));
 }
 
@@ -302,8 +299,7 @@ export function stopHostGatewayProcesses(
   // host. Otherwise an onboard drift could terminate an unrelated worktree's
   // gateway. Sweeping callers (uninstall, sandbox destroy of the last sandbox)
   // omit `pids` and so still get the pgrep fallback by default.
-  const useFallback =
-    options.usePgrepFallback ?? explicitPids.length === 0;
+  const useFallback = options.usePgrepFallback ?? explicitPids.length === 0;
   let pgrepRan = false;
   if (useFallback) {
     const sweep = pgrepHostGatewayPids(deps);

@@ -65,12 +65,7 @@ describe("openclaw-build-messaging-plugins.py", () => {
   it("pins selected external messaging plugins to OPENCLAW_VERSION", () => {
     const payload = parseDryRun({
       OPENCLAW_VERSION: "2026.5.22",
-      NEMOCLAW_MESSAGING_CHANNELS_B64: channelsB64([
-        "telegram",
-        "discord",
-        "slack",
-        "whatsapp",
-      ]),
+      NEMOCLAW_MESSAGING_CHANNELS_B64: channelsB64(["telegram", "discord", "slack", "whatsapp"]),
     });
 
     expect(payload.installSpecs).toEqual([
@@ -99,7 +94,7 @@ describe("openclaw-build-messaging-plugins.py", () => {
     });
   });
 
-  it("does not require OPENCLAW_VERSION when no external messaging plugin is selected", () => {
+  it("does not require OPENCLAW_VERSION when no external plugin is selected", () => {
     const payload = parseDryRun({
       NEMOCLAW_MESSAGING_CHANNELS_B64: channelsB64(["telegram"]),
     });
@@ -117,6 +112,25 @@ describe("openclaw-build-messaging-plugins.py", () => {
     });
 
     expect(payload.installSpecs).toEqual(["npm:@openclaw/whatsapp@2026.5.18"]);
+  });
+
+  it("pins the diagnostics OTEL plugin when OpenClaw OTEL is enabled", () => {
+    const payload = parseDryRun({
+      OPENCLAW_VERSION: "2026.5.22",
+      NEMOCLAW_OPENCLAW_OTEL: "1",
+    });
+
+    expect(payload.diagnosticsOtelEnabled).toBe(true);
+    expect(payload.installSpecs).toEqual(["npm:@openclaw/diagnostics-otel@2026.5.22"]);
+  });
+
+  it("requires OPENCLAW_VERSION when OpenClaw OTEL is enabled", () => {
+    const result = runDryRun({
+      NEMOCLAW_OPENCLAW_OTEL: "1",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("OPENCLAW_VERSION is required");
   });
 
   it("fails fast on malformed channel payloads", () => {
@@ -137,7 +151,7 @@ describe("openclaw-build-messaging-plugins.py", () => {
       fakeOpenclaw,
       [
         "#!/bin/sh",
-        "printf '%s|%s|%s|%s|%s|%s|%s\\n' \"$1\" \"$2\" \"$3\" \"$4\" \"${TELEGRAM_BOT_TOKEN:-}\" \"${DISCORD_BOT_TOKEN:-}\" \"${SLACK_BOT_TOKEN:-}\" >> \"$OPENCLAW_TRACE\"",
+        'printf \'%s|%s|%s|%s|%s|%s|%s\\n\' "$1" "$2" "$3" "$4" "${TELEGRAM_BOT_TOKEN:-}" "${DISCORD_BOT_TOKEN:-}" "${SLACK_BOT_TOKEN:-}" >> "$OPENCLAW_TRACE"',
         "exit 0",
         "",
       ].join("\n"),

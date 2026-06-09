@@ -19,7 +19,7 @@ function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
     gateway_command: "test-agent gateway run",
     healthProbe: { url: "http://127.0.0.1:19000/", port: 19000, timeout_seconds: 5 },
     forwardPort: 19000,
-    dashboard: { kind: "ui", label: "UI", path: "/" },
+    dashboard: { kind: "ui", label: "UI", path: "/", healthPath: "/health", auth: "url_token" },
     configPaths: {
       dir: "/tmp/agent",
       configFile: "/tmp/agent/config.yaml",
@@ -129,7 +129,9 @@ describe("buildRecoveryScript", () => {
     });
     expect(script).toContain(". /tmp/nemoclaw-proxy-env.sh");
     expect(script).toContain("/usr/local/bin/hermes");
-    expect(script).toContain('"$AGENT_BIN" dashboard --host 127.0.0.1 --port 19119 --skip-build --no-open');
+    expect(script).toContain(
+      '"$AGENT_BIN" dashboard --host 127.0.0.1 --port 19119 --skip-build --no-open',
+    );
     expect(script).not.toContain("--tui");
   });
 

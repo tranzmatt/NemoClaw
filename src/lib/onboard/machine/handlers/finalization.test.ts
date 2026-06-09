@@ -10,12 +10,17 @@ type Agent = { name: string } | null;
 type VerifyChain = { port: number };
 type VerificationResult = { ok: boolean };
 
-function createDeps(overrides: Partial<FinalizationStateOptions<Agent, VerifyChain, VerificationResult>["deps"]> = {}) {
+function createDeps(
+  overrides: Partial<FinalizationStateOptions<Agent, VerifyChain, VerificationResult>["deps"]> = {},
+) {
   const calls = {
     setDefaultSandbox: vi.fn(),
     ensureAgentDashboard: vi.fn(() => 18789),
-    postVerify: vi.fn(async () => createSession({ machine: { version: 1, state: "post_verify", stateEnteredAt: null, revision: 1 } })),
-    complete: vi.fn(async () => createSession({ status: "complete" })),
+    postVerify: vi.fn(async () =>
+      createSession({
+        machine: { version: 1, state: "post_verify", stateEnteredAt: null, revision: 1 },
+      }),
+    ),
     removeLegacy: vi.fn(),
     cleanupHost: vi.fn(),
     recoverProcesses: vi.fn(),
@@ -34,7 +39,6 @@ function createDeps(overrides: Partial<FinalizationStateOptions<Agent, VerifyCha
       ensureAgentDashboardForward: calls.ensureAgentDashboard,
       setDefaultSandbox: calls.setDefaultSandbox,
       recordPostVerifyStarted: calls.postVerify,
-      recordSessionComplete: calls.complete,
       toSessionUpdates: (updates: Record<string, unknown>) => updates as SessionUpdates,
       removeLegacyCredentialsFile: calls.removeLegacy,
       cleanupStaleHostFiles: calls.cleanupHost,
@@ -76,10 +80,10 @@ describe("handleFinalizationState", () => {
 
     const result = await handleFinalizationState(baseOptions(deps));
 
-    // Default is set at finalization (deferred from sandbox creation, #4614), before completion.
+    // Default is set at finalization (deferred from sandbox creation, #4614), before post-verify starts.
     expect(calls.setDefaultSandbox).toHaveBeenCalledWith("my-assistant");
     expect(calls.setDefaultSandbox.mock.invocationCallOrder[0]).toBeLessThan(
-      calls.complete.mock.invocationCallOrder[0],
+      calls.postVerify.mock.invocationCallOrder[0],
     );
     expect(calls.cleanupHost).toHaveBeenCalledOnce();
     expect(calls.recoverProcesses).toHaveBeenCalledWith("my-assistant", { quiet: true });
@@ -88,12 +92,16 @@ describe("handleFinalizationState", () => {
     expect(calls.log).toHaveBeenCalledWith("  ✓ verified");
     expect(calls.dashboard).toHaveBeenCalledWith("my-assistant", "model", "provider", null, null);
     expect(calls.postVerify).toHaveBeenCalledOnce();
-    expect(calls.complete).toHaveBeenCalledWith({
-      sandboxName: "my-assistant",
-      provider: "provider",
-      model: "model",
-      hermesAuthMethod: null,
-      hermesToolGateways: [],
+    expect(result.stateResult).toEqual({
+      type: "complete",
+      updates: {
+        sandboxName: "my-assistant",
+        provider: "provider",
+        model: "model",
+        hermesAuthMethod: null,
+        hermesToolGateways: [],
+      },
+      metadata: { state: "finalizing" },
     });
     expect(result.verificationDiagnostics).toEqual(["  ✓ verified"]);
   });
@@ -105,9 +113,8 @@ describe("handleFinalizationState", () => {
     await handleFinalizationState({ ...baseOptions(deps), agent });
 
     expect(calls.ensureAgentDashboard).toHaveBeenCalledWith("my-assistant", agent);
-    expect(calls.complete).toHaveBeenCalled();
     expect(calls.ensureAgentDashboard.mock.invocationCallOrder[0]).toBeLessThan(
-      calls.complete.mock.invocationCallOrder[0],
+      calls.dashboard.mock.invocationCallOrder[0],
     );
     expect(calls.dashboard).toHaveBeenCalledWith("my-assistant", "model", "provider", null, agent);
   });
@@ -122,7 +129,6 @@ describe("handleFinalizationState", () => {
     await expect(handleFinalizationState(baseOptions(deps))).rejects.toThrow("verification failed");
 
     expect(calls.postVerify).toHaveBeenCalledOnce();
-    expect(calls.complete).not.toHaveBeenCalled();
     expect(calls.dashboard).not.toHaveBeenCalled();
     // The sandbox reached finalization (policies confirmed), so it stays the default
     // even when post-policy verification flakes — only a pre-policy cancel rolls back.

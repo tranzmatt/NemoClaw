@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import type { Session, SessionUpdates } from "../../../state/onboard-session";
+import type { Session } from "../../../state/onboard-session";
+import { completeOnboardMachine, type OnboardStateCompleteResult } from "../result";
 
 export interface FinalizationStateOptions<Agent, VerifyChain, VerificationResult> {
   sandboxName: string;
@@ -23,8 +24,9 @@ export interface FinalizationStateOptions<Agent, VerifyChain, VerificationResult
      */
     setDefaultSandbox(sandboxName: string): void;
     recordPostVerifyStarted(): Promise<Session>;
-    recordSessionComplete(updates: SessionUpdates): Promise<Session>;
-    toSessionUpdates(updates: Record<string, unknown>): SessionUpdates;
+    toSessionUpdates(
+      updates: Record<string, unknown>,
+    ): NonNullable<OnboardStateCompleteResult["updates"]>;
     removeLegacyCredentialsFile(): void;
     cleanupStaleHostFiles(): void;
     checkAndRecoverSandboxProcesses(sandboxName: string, options: { quiet: boolean }): void;
@@ -52,7 +54,7 @@ export interface FinalizationStateOptions<Agent, VerifyChain, VerificationResult
 }
 
 export interface FinalizationStateResult {
-  session: Session;
+  stateResult: OnboardStateCompleteResult;
   unmigratedLegacyKeys: string[];
   verificationDiagnostics: string[];
 }
@@ -69,7 +71,11 @@ export async function handleFinalizationState<Agent, VerifyChain, VerificationRe
   migratedLegacyKeys,
   webSearchEnabled,
   deps,
-}: FinalizationStateOptions<Agent, VerifyChain, VerificationResult>): Promise<FinalizationStateResult> {
+}: FinalizationStateOptions<
+  Agent,
+  VerifyChain,
+  VerificationResult
+>): Promise<FinalizationStateResult> {
   // Reaching finalization means the policy-preset step was confirmed, so it is
   // now safe to register this sandbox as the default (#4614).
   deps.setDefaultSandbox(sandboxName);
@@ -112,9 +118,10 @@ export async function handleFinalizationState<Agent, VerifyChain, VerificationRe
 
   deps.printDashboard(sandboxName, model, provider, nimContainer, agent);
 
-  const session = await deps.recordSessionComplete(
+  const stateResult = completeOnboardMachine(
     deps.toSessionUpdates({ sandboxName, provider, model, hermesAuthMethod, hermesToolGateways }),
+    { state: "finalizing" },
   );
 
-  return { session, unmigratedLegacyKeys, verificationDiagnostics };
+  return { stateResult, unmigratedLegacyKeys, verificationDiagnostics };
 }

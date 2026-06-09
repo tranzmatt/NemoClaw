@@ -25,17 +25,21 @@ const baseSelection: ProviderSelectionResult = {
   nimContainer: null,
 };
 
-function createDeps(overrides: Partial<ProviderInferenceStateOptions<Gpu, Agent, Host>["deps"]> = {}) {
+function createDeps(
+  overrides: Partial<ProviderInferenceStateOptions<Gpu, Agent, Host>["deps"]> = {},
+) {
   const calls = {
     setupNim: vi.fn(async () => ({ ...baseSelection })),
     setupInference: vi.fn(async () => ({ ok: true as const })),
     startStep: vi.fn(async () => undefined),
     complete: vi.fn(async () => createSession()),
     skipped: vi.fn(),
-    recoverProvider: vi.fn(async (_provider: string | null | undefined, credentialEnv: string | null | undefined) => ({
-      forceInferenceSetup: false,
-      credentialEnv: credentialEnv ?? null,
-    })),
+    recoverProvider: vi.fn(
+      async (_provider: string | null | undefined, credentialEnv: string | null | undefined) => ({
+        forceInferenceSetup: false,
+        credentialEnv: credentialEnv ?? null,
+      }),
+    ),
     recordSkip: vi.fn(async () => createSession()),
     repairEvent: vi.fn(async () => createSession()),
     hydrate: vi.fn(),
@@ -140,7 +144,10 @@ describe("handleProviderInferenceState", () => {
 
     expect(calls.startStep).toHaveBeenNthCalledWith(1, "provider_selection");
     expect(calls.setupNim).toHaveBeenCalledWith({ type: "nvidia" }, null, null);
-    expect(calls.complete).toHaveBeenCalledWith("provider_selection", expect.objectContaining({ provider: "nvidia-prod" }));
+    expect(calls.complete).toHaveBeenCalledWith(
+      "provider_selection",
+      expect.objectContaining({ provider: "nvidia-prod" }),
+    );
     expect(calls.promptName).toHaveBeenCalledWith(null);
     expect(calls.log).toHaveBeenCalledWith("summary:nvidia-prod/nvidia/test/my-assistant");
     expect(calls.startStep).toHaveBeenNthCalledWith(2, "inference", {
@@ -164,6 +171,24 @@ describe("handleProviderInferenceState", () => {
       provider: "nvidia-prod",
       preferredInferenceApi: "openai-responses",
     });
+    expect(result.stateResult).toEqual({
+      type: "transition",
+      next: "sandbox",
+      transitionKind: "advance",
+      updates: undefined,
+      metadata: { state: "inference", provider: "nvidia-prod", model: "nvidia/test" },
+    });
+    expect(result.retryStateResults).toEqual([]);
+    expect(result.stateResults).toEqual([
+      {
+        type: "transition",
+        next: "inference",
+        transitionKind: "advance",
+        updates: undefined,
+        metadata: { state: "provider_selection", provider: "nvidia-prod", model: "nvidia/test" },
+      },
+      result.stateResult,
+    ]);
   });
 
   it("clears non-NVIDIA provider credentials when inference setup fails", async () => {
@@ -188,7 +213,9 @@ describe("handleProviderInferenceState", () => {
 
     await expect(handleProviderInferenceState(baseOptions(deps))).rejects.toThrow("exit 1");
 
-    expect(calls.error).toHaveBeenCalledWith("  Inference selection did not yield a provider/model.");
+    expect(calls.error).toHaveBeenCalledWith(
+      "  Inference selection did not yield a provider/model.",
+    );
     expect(calls.exit).toHaveBeenCalledWith(1);
     expect(calls.complete).not.toHaveBeenCalledWith("provider_selection", expect.anything());
     expect(calls.setupInference).not.toHaveBeenCalled();
@@ -205,7 +232,9 @@ describe("handleProviderInferenceState", () => {
     });
     const { deps, calls } = createDeps({ setupNim, startRecordedStep });
 
-    await expect(handleProviderInferenceState(baseOptions(deps))).rejects.toThrow("recording failed");
+    await expect(handleProviderInferenceState(baseOptions(deps))).rejects.toThrow(
+      "recording failed",
+    );
 
     expect(calls.deleteEnv).toHaveBeenCalledWith("COMPATIBLE_API_KEY");
     expect(calls.setupInference).not.toHaveBeenCalled();
@@ -412,6 +441,29 @@ describe("handleProviderInferenceState", () => {
     expect(setupInference).toHaveBeenCalledTimes(2);
     expect(result.model).toBe("good");
     expect(calls.startStep).toHaveBeenCalledWith("provider_selection");
+    expect(result.retryStateResults).toEqual([
+      {
+        type: "transition",
+        next: "provider_selection",
+        transitionKind: "retry",
+        updates: undefined,
+        metadata: {
+          state: "inference",
+          provider: "nvidia-prod",
+          model: "bad",
+          reason: "selection_retry",
+        },
+      },
+    ]);
+    expect(result.stateResult).toMatchObject({ next: "sandbox", transitionKind: "advance" });
+    expect(
+      result.stateResults.map((stateResult) => [stateResult.next, stateResult.transitionKind]),
+    ).toEqual([
+      ["inference", "advance"],
+      ["provider_selection", "retry"],
+      ["inference", "advance"],
+      ["sandbox", "advance"],
+    ]);
   });
 
   it("aborts before inference setup when the configuration summary is rejected", async () => {
