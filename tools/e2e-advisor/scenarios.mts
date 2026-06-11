@@ -29,22 +29,33 @@ import {
   type RunAdvisorResult,
   runReadOnlyAdvisor,
 } from "../advisors/session.mts";
+// Intentionally resolves relative to the trusted advisor checkout, not the
+// analyzed PR workdir. The workflow runs this script from trusted `main` while
+// `process.cwd()` points at inert PR data, so normalization must not execute
+// PR-local registry/runtime-support code. PRs that add or newly wire scenarios
+// should use the fan-out recommendation until the trusted checkout knows their
+// targeted IDs are live-supported.
+import { getScenario } from "../../test/e2e-scenario/scenarios/registry.ts";
+import { liveScenarioSupport } from "../../test/e2e-scenario/scenarios/runtime-support.ts";
 
 const root = process.cwd();
 const ADVISOR_PROVIDER = DEFAULT_ADVISOR_PROVIDER;
 const ADVISOR_MODEL = DEFAULT_ADVISOR_MODEL;
 const ADVISOR_CREDENTIAL_ENV = ["E2E", "ADVISOR", "API", "KEY"].join("_");
-const SCENARIO_WORKFLOW = "e2e-scenarios.yaml";
-const SCENARIO_ALL_WORKFLOW = "e2e-scenarios-all.yaml";
-const ALLOWED_WORKFLOWS = new Set<string>([SCENARIO_WORKFLOW, SCENARIO_ALL_WORKFLOW]);
+const SCENARIO_WORKFLOW = "e2e-vitest-scenarios.yaml";
+const SCENARIO_ALL_ID = "e2e-scenarios-all";
+const ALLOWED_WORKFLOWS = new Set<string>([SCENARIO_WORKFLOW]);
 // Scenario IDs are embedded into the dispatch command we hand to users; restrict
 // to a strict kebab-case allowlist so a hallucinated id can never inject shell
 // metacharacters or non-canonical tokens into the dispatch line.
 const SCENARIO_ID_PATTERN = /^[a-z0-9][a-z0-9-]*$/;
 
 export function canonicalDispatchCommand(workflow: string, id: string): string {
-  if (workflow === SCENARIO_ALL_WORKFLOW) {
-    return `gh workflow run ${SCENARIO_ALL_WORKFLOW} --ref <pr-head-ref>`;
+  if (workflow !== SCENARIO_WORKFLOW) {
+    throw new Error(`Unknown scenario workflow: ${workflow}`);
+  }
+  if (id === SCENARIO_ALL_ID) {
+    return `gh workflow run ${SCENARIO_WORKFLOW} --ref <pr-head-ref>`;
   }
   return `gh workflow run ${SCENARIO_WORKFLOW} --ref <pr-head-ref> --field scenarios=${id}`;
 }
@@ -198,7 +209,7 @@ function writeUnavailableArtifacts(
   writeJson(paths.finalResult, result);
   fs.writeFileSync(
     paths.summary,
-    `# E2E Scenario Advisor\n\n${failed ? "Failed" : "Skipped"}: ${reason}\n`,
+    `# Vitest E2E Scenario Advisor\n\n${failed ? "Failed" : "Skipped"}: ${reason}\n`,
   );
   if (failed) {
     console.error(`Scenario advisor analysis failed: ${reason}`);
@@ -211,32 +222,33 @@ function logProgress(message: string): void {
 
 export function buildSystemPrompt(schema: AdvisorSchema): string {
   return [
-    "You are the NemoClaw E2E Scenario advisor for CI.",
+    "You are the NemoClaw Vitest E2E scenario advisor for CI.",
     "",
-    "Your job is to recommend which **scenario E2E** jobs should run for a PR. Scenario E2E is the layered scenario suite under `test/e2e-scenario/`, dispatched via `.github/workflows/e2e-scenarios.yaml` (single-scenario) and `.github/workflows/e2e-scenarios-all.yaml` (fan-out).",
+    "Your job is to recommend which Vitest-backed E2E scenario dispatches should run for a PR. They are part of the single NemoClaw E2E system, dispatched via `.github/workflows/e2e-vitest-scenarios.yaml`.",
     "",
-    "You are a separate advisor from the general E2E recommendation advisor. Do not opine on legacy `test/e2e/` workflows or non-scenario E2E jobs; those are owned by the general advisor.",
+    "Limit recommendations to the Vitest scenario workflow. Broader direct legacy `test/e2e/` workflows are owned by the general E2E advisor until they migrate; do not describe them as a separate kind of E2E.",
     "",
     "Authoritative sources to inspect with your read-only tools:",
-    "- `.github/workflows/e2e-scenarios.yaml` — its `ROUTES` table is the ground truth for dispatchable scenario IDs and runner placement.",
-    "- `.github/workflows/e2e-scenarios-all.yaml` — fan-out workflow.",
-    "- `test/e2e-scenario/nemoclaw_scenarios/scenarios.yaml` — scenario metadata (`setup_scenarios`, `test_plans`, base/onboarding profiles).",
-    "- `test/e2e-scenario/nemoclaw_scenarios/expected-states.yaml` — expected-state contracts.",
-    "- `test/e2e-scenario/validation_suites/suites.yaml` — suite definitions and their scripts.",
-    "- `test/e2e-scenario/runtime/` — shared runner/runtime code (changes here usually require all-scenarios).",
+    "- `.github/workflows/e2e-vitest-scenarios.yaml` — canonical Vitest live scenario workflow.",
+    "- `test/e2e-scenario/scenarios/registry.ts` and `test/e2e-scenario/scenarios/scenarios/` — typed scenario IDs and metadata.",
+    "- `test/e2e-scenario/scenarios/runtime-support.ts` — which typed scenarios are wired for live Vitest execution.",
+    "- `test/e2e-scenario/live/registry-scenarios.test.ts` — live Vitest registry scenario entry point.",
+    "- `test/e2e-scenario/fixtures/` and `test/e2e-scenario/support-tests/` — shared Vitest fixtures, clients, and phase helpers.",
     "",
     "Decision policy:",
-    "- Required (all scenarios): changes to scenario runtime/runner code, scenario catalog metadata, expected-state metadata, suite catalog metadata, or the scenario workflows themselves. Recommend the `e2e-scenarios-all` fan-out.",
-    "- Required (targeted): suite-script or onboarding/install-helper changes that affect a specific subset. Recommend the smallest set of scenario IDs from the `ROUTES` table that exercises the changed surface.",
+    "- Required (all scenarios): changes to scenario registry, matrix emission, expected-state metadata, live support classification, shared fixtures, or the Vitest scenario workflow itself. Recommend the `e2e-scenarios-all` fan-out through `e2e-vitest-scenarios.yaml`.",
+    "- Required (targeted): fixture, live test, manifest, runtime-support, or scenario changes that affect a specific subset. Recommend the smallest set of live-supported typed scenario IDs that exercises the changed surface.",
     "- Optional: adjacent scenarios that exercise the same suite on a different platform/onboarding (e.g. macOS, WSL, GPU) but are not the primary target. Special-runner scenarios (`gpu-`, `macos-`, `wsl-`, `brev-`) should usually be optional unless they are the only path that exercises the change.",
-    "- None: docs-only, comment-only, tests-only outside `test/e2e-scenario/`, or changes that cannot affect scenario E2E behavior. Set `noScenarioE2eReason` and return empty `required`/`optional` arrays.",
+    "- None: docs-only, comment-only, tests-only outside `test/e2e-scenario/`, or changes that cannot affect Vitest scenario behavior. Set `noScenarioE2eReason` and return empty `required`/`optional` arrays.",
     "",
     "Hard rules:",
-    "- Only recommend scenario IDs that exist in the `ROUTES` table of `e2e-scenarios.yaml`. Do not invent IDs.",
-    "- The `e2e-scenarios.yaml` workflow accepts a single comma-separated `scenarios` input. Each `dispatchCommand` for a single-scenario recommendation MUST be exactly: `gh workflow run e2e-scenarios.yaml --ref <pr-head-ref> --field scenarios=<id>`.",
-    "- For the fan-out, use exactly: `gh workflow run e2e-scenarios-all.yaml --ref <pr-head-ref>` and set `id`/`workflow` to `e2e-scenarios-all`/`e2e-scenarios-all.yaml`.",
+    "- Only recommend live-supported typed scenario IDs that exist in the registry or the synthetic fan-out id `e2e-scenarios-all`. Do not invent IDs.",
+    "- The only allowed workflow is `e2e-vitest-scenarios.yaml`.",
+    "- Each `dispatchCommand` for a single-scenario recommendation MUST be exactly: `gh workflow run e2e-vitest-scenarios.yaml --ref <pr-head-ref> --field scenarios=<id>`.",
+    "- For the fan-out, use exactly: `gh workflow run e2e-vitest-scenarios.yaml --ref <pr-head-ref>` and set `id`/`workflow` to `e2e-scenarios-all`/`e2e-vitest-scenarios.yaml`.",
+    "- The normalizer validates targeted IDs against the trusted advisor checkout's registry/runtime-support modules, not PR-local TypeScript. If a PR adds or newly wires a scenario that is not live-supported on trusted `main` yet, recommend the `e2e-scenarios-all` fan-out rather than a targeted dispatch.",
     "- A `suiteFilter` may be set on a recommendation as analytical metadata explaining why the scenario was selected. It must NOT leak into the dispatch command.",
-    "- `relevantChangedFiles` must be the subset of `changedFiles` under `test/e2e-scenario/`, `.github/workflows/e2e-scenarios*.yaml`, or other directly scenario-relevant paths.",
+    "- `relevantChangedFiles` must be the subset of `changedFiles` under `test/e2e-scenario/`, `.github/workflows/e2e-vitest-scenarios.yaml`, or other directly scenario-relevant paths.",
     "",
     "Return JSON only matching this schema:",
     "```json",
@@ -256,7 +268,7 @@ export function buildPrompt({
   changedFiles: string[];
   diff: string;
 }): string {
-  return `Return a scenario E2E recommendation for this PR.
+  return `Return a Vitest E2E scenario recommendation for this PR.
 
 Set these fields exactly:
 - version: 1
@@ -291,7 +303,7 @@ export function normalizeScenarioAdvisorResult(
       ? reasonField.trim()
       : reasonField === null || reasonField === undefined
         ? required.length === 0 && optional.length === 0
-          ? "Advisor reported no scenario E2E impact."
+          ? "Advisor reported no Vitest E2E scenario impact."
           : null
         : null;
 
@@ -316,17 +328,18 @@ function sanitizeRecommendations(value: unknown, requiredFlag: boolean): Scenari
     const reason = stringOrUndefined(item.reason);
     const workflow = stringOrUndefined(item.workflow);
     if (!id || !reason || !workflow) continue;
-    // Allowlist: only the two scenario workflows may be dispatched, and only
-    // kebab-case ids are accepted. Reject everything else; we do not trust
-    // the model to author shell-safe dispatch commands.
+    // Allowlist: only the Vitest scenario workflow may be dispatched, and
+    // only kebab-case ids are accepted. Reject everything else; we do not
+    // trust the model to author shell-safe dispatch commands.
     if (!ALLOWED_WORKFLOWS.has(workflow)) continue;
     if (!SCENARIO_ID_PATTERN.test(id)) continue;
-    // Workflow/id pairing invariant: e2e-scenarios-all.yaml fan-out is the
-    // only valid pairing for the synthetic id "e2e-scenarios-all", and that
-    // id is meaningless on the single-scenario workflow. Reject mismatches
-    // rather than render a misleading dispatch line.
-    if (workflow === SCENARIO_ALL_WORKFLOW && id !== "e2e-scenarios-all") continue;
-    if (workflow === SCENARIO_WORKFLOW && id === "e2e-scenarios-all") continue;
+    const scenarioDefinition = id === SCENARIO_ALL_ID ? undefined : getScenario(id);
+    if (
+      id !== SCENARIO_ALL_ID &&
+      (!scenarioDefinition || !liveScenarioSupport(scenarioDefinition).supported)
+    ) {
+      continue;
+    }
     if (seen.has(id)) continue;
     seen.add(id);
     const scenario = stringOrUndefined(item.scenario);
@@ -361,13 +374,13 @@ function stringArrayWithinChanged(value: unknown, changedFiles: string[]): strin
 
 export function renderScenarioSummary(result: ScenarioAdvisorResult): string {
   const lines: string[] = [];
-  lines.push("# E2E Scenario Advisor");
+  lines.push("# Vitest E2E Scenario Advisor");
   lines.push("");
   lines.push(`Base: \`${result.baseRef}\`  `);
   lines.push(`Head: \`${result.headRef}\`  `);
   lines.push(`Confidence: **${result.confidence}**`);
   lines.push("");
-  lines.push("## Required scenario E2E");
+  lines.push("## Required Vitest E2E scenarios");
   if (result.required.length === 0) {
     lines.push(`- _None._ ${result.noScenarioE2eReason || ""}`.trim());
   } else {
@@ -377,7 +390,7 @@ export function renderScenarioSummary(result: ScenarioAdvisorResult): string {
     }
   }
   lines.push("");
-  lines.push("## Optional scenario E2E");
+  lines.push("## Optional Vitest E2E scenarios");
   if (result.optional.length === 0) {
     lines.push("- _None._");
   } else {
@@ -420,5 +433,5 @@ function unavailableResult(
 // Constants are exported so workflow tests can pin them without duplicating literals.
 export const SCENARIO_ADVISOR_WORKFLOWS = {
   single: SCENARIO_WORKFLOW,
-  all: SCENARIO_ALL_WORKFLOW,
+  all: SCENARIO_WORKFLOW,
 } as const;
