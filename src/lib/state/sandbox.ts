@@ -31,12 +31,13 @@ import { OPENSHELL_PROBE_TIMEOUT_MS } from "../adapters/openshell/timeouts.js";
 import type { AgentStateFile } from "../agent/defs.js";
 import { loadAgent } from "../agent/defs.js";
 import { isRecord, type UnknownRecord } from "../core/json-types.js";
+import { shellQuote } from "../runner.js";
+import { isSensitiveFile, sanitizeConfigFile } from "../security/credential-filter.js";
 import {
   buildOpenClawConfigRestoreInputFromSandbox,
   shouldMergeOpenClawConfigStateFile,
 } from "./openclaw-config-restore-input.js";
-import { shellQuote } from "../runner.js";
-import { isSensitiveFile, sanitizeConfigFile } from "../security/credential-filter.js";
+import type { CustomPolicyEntry } from "./registry.js";
 import * as registry from "./registry.js";
 import { runTarListing } from "./tar-listing.js";
 
@@ -69,6 +70,15 @@ export interface RebuildManifest {
   backupPath: string;
   blueprintDigest: string | null;
   policyPresets?: string[];
+  /**
+   * Custom policy presets applied via `--from-file`/`--from-dir`, captured with
+   * full content so they can be re-applied on restore without the source file.
+   * Like `policyPresets`, these live in the gateway policy engine and are
+   * otherwise lost on destroy/recreate. Always present on snapshots created since
+   * this field was added (possibly an empty array, so restore can reconcile a
+   * zero-custom snapshot); absent only on legacy manifests.
+   */
+  customPolicies?: CustomPolicyEntry[];
   instances?: InstanceBackup[];
   // Optional user-provided label for `snapshot restore <name>`.
   name?: string;
@@ -154,6 +164,19 @@ function isInstanceBackup(value: unknown): value is InstanceBackup {
   );
 }
 
+function isCustomPolicyEntryArray(value: unknown): value is CustomPolicyEntry[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (entry) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        typeof (entry as { name?: unknown }).name === "string" &&
+        typeof (entry as { content?: unknown }).content === "string",
+    )
+  );
+}
+
 function isRebuildManifest(value: unknown): value is RebuildManifest {
   if (!isRecord(value) || !isStateDirArray(value.stateDirs)) return false;
   return (
@@ -172,6 +195,7 @@ function isRebuildManifest(value: unknown): value is RebuildManifest {
       value.blueprintDigest === null ||
       typeof value.blueprintDigest === "string") &&
     (value.policyPresets === undefined || isStringArray(value.policyPresets)) &&
+    (value.customPolicies === undefined || isCustomPolicyEntryArray(value.customPolicies)) &&
     (value.instances === undefined ||
       (Array.isArray(value.instances) &&
         value.instances.every((entry) => isInstanceBackup(entry)))) &&
@@ -860,7 +884,7 @@ function backupStateFile(
   return "backed_up";
 }
 
-function buildStateFileRestoreCommand(
+export function buildStateFileRestoreCommand(
   dir: string,
   spec: StateFileSpec,
   refreshOpenClawConfigHash = false,
@@ -889,11 +913,34 @@ function buildStateFileRestoreCommand(
     '[ ! -L "$dst" ] || { echo "refusing symlinked state target: $dst" >&2; exit 11; }',
     'mkdir -p "$parent"',
     'tmp="$(mktemp "${parent}/.nemoclaw-restore.XXXXXX")"',
-    "trap 'rm -f \"$tmp\"' EXIT",
+    'trap \'rm -f "$tmp" "${anchor_tmp:-}"\' EXIT',
     'cat > "$tmp"',
     'chmod 640 "$tmp"',
-    'mv -f "$tmp" "$dst"',
   ];
+
+  if (refreshOpenClawConfigHash) {
+    // OpenClaw guards openclaw.json with a `.last-good` recovery anchor: on its
+    // config-integrity check it archives any live config that differs from
+    // `.last-good` as `openclaw.json.clobbered.*` and reverts to `.last-good`.
+    // The rebuild restore writes the merged user config directly, so without
+    // refreshing the anchor OpenClaw reverts the restored config back to the
+    // freshly generated baseline captured at first boot (issue #5202). Refresh
+    // the anchor from the staged temp BEFORE swapping the live file so the
+    // integrity watcher never observes a config that disagrees with it. Stage
+    // through a temp + atomic rename and fail closed (before the live swap) so
+    // a partial/failed anchor write never leaves a stale recovery target that
+    // would let OpenClaw revert the restored config.
+    steps.push(
+      'last_good="${dst}.last-good"',
+      '[ ! -L "$last_good" ] || { echo "refusing symlinked last-good target: $last_good" >&2; exit 13; }',
+      'anchor_tmp="$(mktemp "${parent}/.nemoclaw-lastgood.XXXXXX")" || { echo "failed to stage last-good anchor" >&2; exit 14; }',
+      'cat "$tmp" > "$anchor_tmp" || { echo "failed to write last-good anchor" >&2; exit 14; }',
+      'chmod 660 "$anchor_tmp" 2>/dev/null || true',
+      'mv -f "$anchor_tmp" "$last_good" || { echo "failed to install last-good anchor" >&2; exit 14; }',
+    );
+  }
+
+  steps.push('mv -f "$tmp" "$dst"');
 
   if (refreshOpenClawConfigHash) {
     steps.push(
@@ -1037,6 +1084,12 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
   // not on the sandbox filesystem, so they are lost on destroy/recreate.
   const policyPresets: string[] = sb?.policies && sb.policies.length > 0 ? [...sb.policies] : [];
   _log(`policyPresets from registry: [${policyPresets.join(",")}]`);
+  // Custom presets (--from-file/--from-dir) also live only in the gateway policy
+  // engine, so capture their full content for replay. Always record the field
+  // (even empty) so restore can tell a zero-custom snapshot (reconcile, remove
+  // any stale custom presets on the target) from a legacy snapshot (skip).
+  const customPolicies: CustomPolicyEntry[] = sb?.customPolicies ? [...sb.customPolicies] : [];
+  _log(`customPolicies from registry: [${customPolicies.map((c) => c.name).join(",")}]`);
 
   const manifest: RebuildManifest = {
     version: MANIFEST_VERSION,
@@ -1051,6 +1104,7 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     backupPath,
     blueprintDigest: computeBlueprintDigest(),
     policyPresets,
+    customPolicies,
     ...(providedName !== null ? { name: providedName } : {}),
   };
 
