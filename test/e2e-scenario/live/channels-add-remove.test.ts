@@ -171,7 +171,14 @@ function expectHostTelegramPlan(expected: "active" | "removed", context: string)
       : {};
   const networkEntries = planArray(networkPolicy, "entries");
   const networkPresets = stringArray(networkPolicy.presets);
-  const agentRender = planArray(plan, "agentRender");
+
+  expect(Object.hasOwn(plan, "agentRender"), "messaging.plan.agentRender should not persist").toBe(
+    false,
+  );
+  expect(
+    channels.some((entry) => Object.hasOwn(entry, "hooks")),
+    "messaging.plan.channels hooks should not persist",
+  ).toBe(false);
 
   if (expected === "active") {
     expect(
@@ -194,10 +201,6 @@ function expectHostTelegramPlan(expected: "active" | "removed", context: string)
       ),
       `telegram TELEGRAM_BOT_TOKEN credential binding missing ${context}`,
     ).toBe(true);
-    expect(
-      agentRender.some((entry) => entry.channelId === "telegram" && entry.agent === "openclaw"),
-      `telegram openclaw agent render entry missing ${context}`,
-    ).toBe(true);
     expect(disabledChannels, `telegram unexpectedly disabled ${context}`).not.toContain("telegram");
     return;
   }
@@ -217,10 +220,6 @@ function expectHostTelegramPlan(expected: "active" | "removed", context: string)
   expect(
     credentialBindings.some((entry) => entry.channelId === "telegram"),
     `telegram credential binding still present ${context}`,
-  ).toBe(false);
-  expect(
-    agentRender.some((entry) => entry.channelId === "telegram"),
-    `telegram agent render entry still present ${context}`,
   ).toBe(false);
 }
 
@@ -384,6 +383,7 @@ liveTest(
         "post-add rebuild reuses the gateway-stored inference credential when NVIDIA_INFERENCE_API_KEY is absent",
         "post-add rebuild applies the Telegram policy preset and renders openclaw.json channel state",
         "channels remove telegram removes provider, policy, registry plan, and rendered channel state after rebuild",
+        "post-remove rebuild does not use stale Telegram host env inputs that would stage a fresh channel add",
       ],
     });
 
@@ -498,7 +498,7 @@ liveTest(
     expectHostTelegramPlan("removed", "after channels remove");
 
     const rebuildRemove = await host.nemoclaw([SANDBOX_NAME, "rebuild", "--yes"], {
-      artifactName: "phase-5-rebuild-after-remove",
+      artifactName: "phase-5-rebuild-after-remove-with-stale-telegram-env",
       env: channelEnv({ NVIDIA_INFERENCE_API_KEY: apiKey }),
       redactionValues: secretsToRedact,
       timeoutMs: REBUILD_TIMEOUT_MS,

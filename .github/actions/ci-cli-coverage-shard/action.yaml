@@ -66,7 +66,21 @@ runs:
         node -e "require('node:fs').rmSync('dist', { recursive: true, force: true })"
         npm run build:cli
         npx tsx scripts/check-dist-sourcemaps.ts dist
+        coverage_include="dist/lib/**/*.js"
+        additional_projects=()
+        # Bootstrap the source-test migration without executing action code
+        # from the PR branch. PR #5904 removes this probe once `integration`
+        # is part of the trusted base configuration.
+        integration_probe_output=""
+        if integration_probe_output=$(npx vitest list --project integration --filesOnly 2>&1); then
+          additional_projects+=(--project integration)
+          coverage_include="src/**/*.ts"
+        elif ! grep -Fqx 'Error: No projects matched the filter "integration".' <<<"$integration_probe_output"; then
+          printf '%s\n' "$integration_probe_output" >&2
+          exit 1
+        fi
         npx vitest run --project cli \
+          "${additional_projects[@]}" \
           --shard="${CLI_SHARD}/${CLI_SHARD_COUNT}" \
           --reporter=github-actions \
           --reporter=blob \
@@ -75,7 +89,7 @@ runs:
           --coverage.reporter=json-summary \
           --coverage.reportsDirectory="coverage/cli/shard-${CLI_SHARD}" \
           --coverage.include="bin/**/*.js" \
-          --coverage.include="dist/lib/**/*.js" \
+          --coverage.include="$coverage_include" \
           --coverage.exclude="test/**/*.js" \
           --coverage.exclude="test/**/*.ts"
 
