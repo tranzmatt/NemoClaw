@@ -1,23 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect } from "vitest";
 import {
-  execSync,
-  execFileSync,
   type ExecFileSyncOptionsWithStringEncoding,
+  execFileSync,
+  execSync,
 } from "node:child_process";
 import {
   existsSync,
-  mkdtempSync,
-  writeFileSync,
-  unlinkSync,
-  readFileSync,
   lstatSync,
+  mkdtempSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveOpenshell } from "../dist/lib/adapters/openshell/resolve";
+import { describe, expect, it } from "vitest";
+import { resolveOpenshell } from "../src/lib/adapters/openshell/resolve";
 
 const NEMOCLAW_START_SCRIPT = join(import.meta.dirname, "../scripts/nemoclaw-start.sh");
 const RC_CLEAN_SCRIPT = join(import.meta.dirname, "../scripts/lib/clean_runtime_shell_env_shim.py");
@@ -39,6 +39,18 @@ function extractRuntimeShellEnvSnippet() {
   return `${src.slice(start, end).trimEnd()}\nwrite_runtime_shell_env`;
 }
 
+function extractOpenClawBootstrapEnvSnippet() {
+  const src = readFileSync(NEMOCLAW_START_SCRIPT, "utf-8");
+  const start = src.indexOf("# Normalize the sandbox-create bootstrap wrapper");
+  const end = src.indexOf("# Marker file the Docker HEALTHCHECK reads", start);
+  const extractionFailure =
+    "Failed to extract OpenClaw bootstrap environment normalization from " +
+    "scripts/nemoclaw-start.sh";
+  expect(start, extractionFailure).not.toBe(-1);
+  expect(end, extractionFailure).toBeGreaterThan(start);
+  return src.slice(start, end).trimEnd();
+}
+
 function extractRuntimeShellEnvShimSnippet() {
   const src = readFileSync(NEMOCLAW_START_SCRIPT, "utf-8");
   const start = src.indexOf("ensure_runtime_shell_env_shim() {");
@@ -53,6 +65,34 @@ function extractRuntimeShellEnvShimSnippet() {
 }
 
 describe("service environment", () => {
+  describe("OpenClaw EC2 metadata discovery", () => {
+    it("overrides ambient and sandbox-create wrapper false values before startup", () => {
+      const tmpFile = join(tmpdir(), `nemoclaw-imds-bootstrap-${process.pid}.sh`);
+      try {
+        const wrapper = [
+          "#!/usr/bin/env bash",
+          "set -euo pipefail",
+          "set -- env AWS_EC2_METADATA_DISABLED=false nemoclaw-start openclaw agent",
+          extractOpenClawBootstrapEnvSnippet(),
+          'printf "%s\\n" "$AWS_EC2_METADATA_DISABLED"',
+        ].join("\n");
+        writeFileSync(tmpFile, wrapper, { mode: 0o700 });
+
+        const out = execFileSync("bash", [tmpFile], {
+          encoding: "utf-8",
+          env: { ...process.env, AWS_EC2_METADATA_DISABLED: "false" },
+        });
+        expect(out.trim()).toBe("true");
+      } finally {
+        try {
+          unlinkSync(tmpFile);
+        } catch {
+          /* ignore */
+        }
+      }
+    });
+  });
+
   describe("start-services behavior", () => {
     const scriptPath = join(import.meta.dirname, "../scripts/start-services.sh");
 
@@ -176,7 +216,7 @@ describe("service environment", () => {
     });
   });
 
-  describe("GIT_SSL_CAINFO for proxy CA trust (issue #2270)", () => {
+  describe("GIT_SSL_CAINFO for proxy CA trust (#2270)", () => {
     const sandboxInitSource = `source ${JSON.stringify(join(import.meta.dirname, "../scripts/lib/sandbox-init.sh"))}`;
 
     it("entrypoint exports GIT_SSL_CAINFO when SSL_CERT_FILE points to a real file", () => {
@@ -380,7 +420,7 @@ describe("service environment", () => {
     });
   });
 
-  describe("XDG and tool cache redirects (issue #804)", () => {
+  describe("XDG and tool cache redirects (#804)", () => {
     it("entrypoint pre-creates redirected dirs and restricts GNUPGHOME permissions", () => {
       const scriptPath = join(import.meta.dirname, "../scripts/nemoclaw-start.sh");
       const src = readFileSync(scriptPath, "utf-8");
@@ -438,7 +478,7 @@ describe("service environment", () => {
     });
   });
 
-  describe("proxy environment variables (issue #626)", () => {
+  describe("proxy environment variables (#626)", () => {
     // The proxy persistence block calls emit_sandbox_sourced_file from the
     // shared library. Wrappers that execute the extracted block must source it.
     const sandboxInitSource = `source ${JSON.stringify(join(import.meta.dirname, "../scripts/lib/sandbox-init.sh"))}`;
@@ -577,6 +617,7 @@ describe("service environment", () => {
         expect(envFile).toContain("export NO_PROXY=");
         expect(envFile).not.toContain("inference.local");
         expect(envFile).toContain("10.200.0.1");
+        expect(envFile).toContain('export AWS_EC2_METADATA_DISABLED="true"');
         expect(envFile).toContain("export OPENCLAW_GATEWAY_TOKEN='test-token-123'");
         expect(envFile).toContain("nemoclaw-configure-guard begin");
         expect(envFile).toContain('command openclaw "$@"');
@@ -611,6 +652,18 @@ describe("service environment", () => {
           }).trim();
         }
         expect(perms).toBe("444");
+
+        const connectedValue = execFileSync(
+          "bash",
+          [
+            "--noprofile",
+            "--norc",
+            "-c",
+            `export AWS_EC2_METADATA_DISABLED=false; source ${JSON.stringify(join(fakeDataDir, "proxy-env.sh"))}; printf "%s" "$AWS_EC2_METADATA_DISABLED"`,
+          ],
+          { encoding: "utf-8" },
+        );
+        expect(connectedValue).toBe("true");
       } finally {
         try {
           unlinkSync(tmpFile);
@@ -974,11 +1027,15 @@ describe("service environment", () => {
       const fakeDataDir = join(tmpdir(), `nemoclaw-idempotent-test-${process.pid}`);
       execFileSync("mkdir", ["-p", fakeDataDir]);
       const tmpFile = join(tmpdir(), `nemoclaw-idempotent-write-test-${process.pid}.sh`);
+      const chownLog = join(fakeDataDir, "chown.log");
       try {
         const persistBlock = extractRuntimeShellEnvSnippet();
         const toolRedirects = extractToolRedirects();
         const wrapper = [
           "#!/usr/bin/env bash",
+          'id() { if [ "${1:-}" = "-u" ]; then printf "0\\n"; else command id "$@"; fi; }',
+          'chown() { printf "%s\\n" "$*" >> "$CHOWN_LOG"; }',
+          `export CHOWN_LOG=${JSON.stringify(chownLog)}`,
           sandboxInitSource,
           toolRedirects,
           'PROXY_HOST="10.200.0.1"',
@@ -1000,6 +1057,14 @@ describe("service environment", () => {
         // HTTP_PROXY line — no duplication from repeated runs.
         const httpProxyCount = (envFile.match(/export HTTP_PROXY=/g) || []).length;
         expect(httpProxyCount).toBe(1);
+        const metadataCount = (envFile.match(/export AWS_EC2_METADATA_DISABLED=/g) || []).length;
+        expect(metadataCount).toBe(1);
+        expect((lstatSync(join(fakeDataDir, "proxy-env.sh")).mode & 0o777).toString(8)).toBe("444");
+        const chownCalls = readFileSync(chownLog, "utf-8").trim().split("\n");
+        expect(chownCalls).toHaveLength(3);
+        expect(chownCalls.every((call) => /^root:root .*\/\.proxy-env\.sh\.tmp\./.test(call))).toBe(
+          true,
+        );
       } finally {
         try {
           unlinkSync(tmpFile);
@@ -1098,7 +1163,7 @@ describe("service environment", () => {
       }
     });
 
-    it("[simulation] sourcing proxy-env.sh overrides narrow NO_PROXY and no_proxy", () => {
+    it("overrides narrow NO_PROXY and no_proxy while sourcing proxy-env.sh in simulation", () => {
       const fakeDataDir = mkdtempSync(join(tmpdir(), "nemoclaw-bashi-test-"));
       try {
         const envContent = [
@@ -1138,7 +1203,7 @@ describe("service environment", () => {
       }
     });
 
-    it("regression #2109: proxy-env.sh includes NODE_OPTIONS --require when NODE_USE_ENV_PROXY=1", () => {
+    it("includes NODE_OPTIONS --require in proxy-env.sh when NODE_USE_ENV_PROXY=1 (#2109)", () => {
       const fakeDataDir = join(tmpdir(), `nemoclaw-http-fix-test-${process.pid}`);
       execFileSync("mkdir", ["-p", fakeDataDir]);
       const tmpFile = join(tmpdir(), `nemoclaw-http-fix-env-${process.pid}.sh`);
@@ -1182,7 +1247,7 @@ describe("service environment", () => {
       }
     });
 
-    it("regression #2109: proxy-env.sh does NOT include NODE_OPTIONS when NODE_USE_ENV_PROXY is unset", () => {
+    it("omits NODE_OPTIONS from proxy-env.sh when NODE_USE_ENV_PROXY is unset (#2109)", () => {
       const fakeDataDir = join(tmpdir(), `nemoclaw-http-noop-test-${process.pid}`);
       execFileSync("mkdir", ["-p", fakeDataDir]);
       const tmpFile = join(tmpdir(), `nemoclaw-http-noop-env-${process.pid}.sh`);

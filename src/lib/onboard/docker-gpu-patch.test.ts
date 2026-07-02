@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
-
+import { getSandboxFailurePhase, isSandboxReady } from "../state/gateway";
 import {
   buildDockerGpuCloneRunArgs,
   buildDockerGpuCloneRunOptions,
@@ -26,9 +26,8 @@ import {
   selectDockerGpuPatchMode,
   shouldApplyDockerGpuPatch,
   waitForOpenShellSupervisorReconnect,
-} from "../../../dist/lib/onboard/docker-gpu-patch";
-import { waitForCreatedSandboxReadyWithTrace } from "../../../dist/lib/onboard/sandbox-readiness-tracing";
-import { getSandboxFailurePhase, isSandboxReady } from "../../../dist/lib/state/gateway";
+} from "./docker-gpu-patch";
+import { waitForCreatedSandboxReadyWithTrace } from "./sandbox-readiness-tracing";
 
 function inspectFixture(): DockerContainerInspect {
   return {
@@ -78,11 +77,27 @@ function inspectFixture(): DockerContainerInspect {
 }
 
 describe("docker-gpu-patch", () => {
-  it("detects only the Linux Docker-driver GPU path and honors the opt-out", () => {
+  it("routes native CDI Linux directly unless the legacy patch is forced", () => {
     expect(
       shouldApplyDockerGpuPatch(
         { sandboxGpuEnabled: true },
         { env: {}, platform: "linux", dockerDriverGateway: true },
+      ),
+    ).toBe(false);
+    expect(
+      shouldApplyDockerGpuPatch(
+        { sandboxGpuEnabled: true },
+        {
+          env: { NEMOCLAW_DOCKER_GPU_PATCH: "auto" },
+          platform: "linux",
+          dockerDriverGateway: true,
+        },
+      ),
+    ).toBe(false);
+    expect(
+      shouldApplyDockerGpuPatch(
+        { sandboxGpuEnabled: true },
+        { env: { NEMOCLAW_DOCKER_GPU_PATCH: "1" }, platform: "linux", dockerDriverGateway: true },
       ),
     ).toBe(true);
     expect(
@@ -101,6 +116,21 @@ describe("docker-gpu-patch", () => {
       shouldApplyDockerGpuPatch(
         { sandboxGpuEnabled: false },
         { env: {}, platform: "linux", dockerDriverGateway: true },
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps Jetson on the compatibility patch by default while honoring its opt-out", () => {
+    expect(
+      shouldApplyDockerGpuPatch(
+        { sandboxGpuEnabled: true, hostGpuPlatform: "jetson" },
+        { env: {}, platform: "linux", dockerDriverGateway: true },
+      ),
+    ).toBe(true);
+    expect(
+      shouldApplyDockerGpuPatch(
+        { sandboxGpuEnabled: true, hostGpuPlatform: "jetson" },
+        { env: { NEMOCLAW_DOCKER_GPU_PATCH: "0" }, platform: "linux", dockerDriverGateway: true },
       ),
     ).toBe(false);
   });
@@ -148,33 +178,6 @@ describe("docker-gpu-patch", () => {
       ]),
     );
     expect(args).not.toEqual(expect.arrayContaining(["--env", "NVIDIA_VISIBLE_DEVICES=void"]));
-  });
-
-  it("replaces OpenShell's idle sandbox command when recreating a managed container", () => {
-    const sandboxCommand = [
-      "env",
-      "CHAT_UI_URL=http://127.0.0.1:8642",
-      "NEMOCLAW_DASHBOARD_PORT=8642",
-      "nemoclaw-start",
-    ];
-
-    const args = buildDockerGpuCloneRunArgs(inspectFixture(), buildDockerGpuMode("gpus"), {
-      openshellSandboxCommand: sandboxCommand,
-    });
-
-    expect(args).toEqual(
-      expect.arrayContaining([
-        "--env",
-        "OPENSHELL_SANDBOX_COMMAND=env CHAT_UI_URL=http://127.0.0.1:8642 NEMOCLAW_DASHBOARD_PORT=8642 nemoclaw-start",
-      ]),
-    );
-    expect(args).not.toEqual(
-      expect.arrayContaining(["--env", "OPENSHELL_SANDBOX_COMMAND=sleep infinity"]),
-    );
-    expect(args.slice(args.indexOf("openshell/sandbox:abc"))).toEqual([
-      "openshell/sandbox:abc",
-      ...sandboxCommand,
-    ]);
   });
 
   it("adds OpenShell's sandbox command env when the inspected container lacks one", () => {
@@ -591,7 +594,12 @@ describe("docker-gpu-patch", () => {
       if (args[0] === "info") return "";
       return "";
     });
-    const dockerRunDetached = vi.fn(() => ({ status: 0, stdout: "new-container-id\n" }));
+    const dockerRunDetached = vi.fn(
+      (_args: readonly string[], _opts?: Record<string, unknown>) => ({
+        status: 0,
+        stdout: "new-container-id\n",
+      }),
+    );
     const dockerRm = vi.fn((_name: string) => ({ status: 0 }));
     const runOpenshell = vi.fn(() => ({ status: 1, stderr: "phase: Provisioning" }));
 
@@ -626,15 +634,19 @@ describe("docker-gpu-patch", () => {
     expect(
       dockerRm.mock.calls.some((call) => String(call[0]).includes("nemoclaw-gpu-backup")),
     ).toBe(false);
-    expect(dockerRunDetached).toHaveBeenCalledWith(
+    const cloneArgs = dockerRunDetached.mock.calls[0]?.[0] ?? [];
+    expect(cloneArgs).toEqual(
       expect.arrayContaining([
         "--env",
         "OPENSHELL_SANDBOX_COMMAND=env CHAT_UI_URL=http://127.0.0.1:8642 nemoclaw-start",
         "openshell/sandbox:abc",
-        "env",
-        "CHAT_UI_URL=http://127.0.0.1:8642",
-        "nemoclaw-start",
       ]),
+    );
+    expect(cloneArgs.slice(cloneArgs.indexOf("openshell/sandbox:abc"))).toEqual([
+      "openshell/sandbox:abc",
+    ]);
+    expect(dockerRunDetached).toHaveBeenCalledWith(
+      cloneArgs,
       expect.objectContaining({ ignoreError: true }),
     );
   });
@@ -765,7 +777,7 @@ describe("docker-gpu-patch sandbox DNS fallback (#3579)", () => {
     );
   });
 
-  it("regression manifest: host.openshell.internal + google.com + gateway.discord.gg + integrate.api.nvidia.com (#3579 manager spec)", () => {
+  it("includes every hostname from the manager-provided regression manifest (#3579)", () => {
     // The four hostnames called out in #3579's manager-provided spec:
     //   host.openshell.internal      → resolved via --add-host (mount namespace)
     //   google.com                   → public DNS via embedded Docker resolver

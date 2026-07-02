@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
 
 import {
-  readYaml,
   type CompositeAction,
+  readYaml,
   type WorkflowJob,
   type WorkflowStep,
 } from "./helpers/e2e-workflow-contract";
@@ -83,6 +86,42 @@ function requiredStepIndex(action: CompositeAction, stepName: string): number {
   return stepIndex;
 }
 
+function uploadsCompiledCliArtifact(
+  action: CompositeAction,
+  shard: number,
+  shardCount: number,
+): boolean {
+  const validationRun = requiredStep(action, "Validate shard inputs").run ?? "";
+  const outputDirectory = mkdtempSync(join(tmpdir(), "nemoclaw-cli-shard-output-"));
+  const outputPath = join(outputDirectory, "github-output");
+  try {
+    // Execute the repository-owned action body so producer selection stays a behavioral contract.
+    const result = spawnSync("bash", ["-c", validationRun], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        CLI_SHARD: String(shard),
+        CLI_SHARD_COUNT: String(shardCount),
+        GITHUB_OUTPUT: outputPath,
+      },
+    });
+    expect(
+      result.status,
+      `Shard validation failed for ${shard}/${shardCount}: ${result.stderr}`,
+    ).toBe(0);
+    const output = readFileSync(outputPath, "utf8").match(
+      /^upload_build_artifact=(true|false)$/mu,
+    )?.[1];
+    expect(
+      output,
+      `Shard validation omitted its artifact output for ${shard}/${shardCount}`,
+    ).toBeDefined();
+    return output === "true";
+  } finally {
+    rmSync(outputDirectory, { force: true, recursive: true });
+  }
+}
+
 function requiredWorkflowStep(job: WorkflowJob, stepName: string): WorkflowStep {
   const step = job.steps?.find((candidate) => candidate.name === stepName);
   if (!step) {
@@ -151,6 +190,9 @@ describe("pull request and main workflow contracts", () => {
       ".github/actions/ci-installer-integration/action.yaml",
     ),
   };
+  const resolveHermesBaseAction = readYaml<CompositeAction>(
+    ".github/actions/resolve-hermes-base-image/action.yaml",
+  );
 
   it("routes only code-changing PRs through the code-check path", () => {
     const filterStep = prWorkflow.jobs.changes.steps?.find((step) => step.id === "filter");
@@ -416,6 +458,7 @@ describe("pull request and main workflow contracts", () => {
     expect(buildRuns.join("\n")).toContain("cd nemoclaw && npm install --ignore-scripts");
     expect(buildRuns).toContain("cd nemoclaw && npm run build");
     expect(buildRuns).toContain("npm run build:cli");
+    expect(buildRuns).toContain("npx vitest run --project package-contract");
     expect(buildRuns).toContain("npm run typecheck:cli");
     expect(buildRuns).toContain("cd nemoclaw && npx tsc --noEmit --incremental");
     expect(buildRuns).toContain("npx tsc -p jsconfig.json");
@@ -424,7 +467,9 @@ describe("pull request and main workflow contracts", () => {
     expect(cliShardRuns).toContain("cd nemoclaw && npm run build");
     expect(cliShardRuns).toContain("npm run build:cli");
     expect(cliShardRuns).toContain("npx tsx scripts/check-dist-sourcemaps.ts dist");
-    expect(cliShardRuns).toContain("npx vitest run --project cli");
+    expect(cliShardRuns).toContain("npx vitest run --project cli --project integration");
+    expect(cliShardRuns).toContain('--coverage.include="src/**/*.ts"');
+    expect(cliShardRuns).not.toContain('--coverage.include="dist/lib/**/*.js"');
     expect(cliShardRuns).toContain('--shard="${CLI_SHARD}/${CLI_SHARD_COUNT}"');
     expect(cliShardRuns).toContain("--reporter=github-actions");
     expect(cliShardRuns).toContain("--reporter=blob");
@@ -435,7 +480,8 @@ describe("pull request and main workflow contracts", () => {
     expect(cliShardRuns).not.toContain("${{ inputs.shard");
     expect(cliShardRuns).not.toContain("scripts/check-coverage-ratchet.ts");
 
-    expect(cliMergeRuns).toContain("npm run build:cli");
+    expect(cliMergeRuns).not.toContain("npm run build:cli");
+    expect(cliMergeRuns).toContain("test -s dist/nemoclaw.js");
     expect(cliMergeRuns).toContain("npx tsx scripts/check-dist-sourcemaps.ts dist");
     expect(cliMergeRuns).toContain('blob=".vitest-reports/blob-${shard}-${CLI_SHARD_COUNT}.json"');
     expect(cliMergeRuns).toContain(
@@ -446,6 +492,8 @@ describe("pull request and main workflow contracts", () => {
     expect(cliMergeRuns).toContain("--reporter=json");
     expect(cliMergeRuns).toContain("--outputFile.json=coverage/cli/vitest-results.json");
     expect(cliMergeRuns).toContain("--coverage.reportsDirectory=coverage/cli");
+    expect(cliMergeRuns).toContain('--coverage.include="src/**/*.ts"');
+    expect(cliMergeRuns).not.toContain('--coverage.include="dist/lib/**/*.js"');
     expect(cliMergeRuns).toContain(
       'scripts/check-coverage-ratchet.ts coverage/cli/coverage-summary.json ci/coverage-threshold-cli.json "CLI coverage"',
     );
@@ -460,24 +508,6 @@ describe("pull request and main workflow contracts", () => {
     expect(installerRuns).toContain("npm run build:cli");
     expect(installerRuns).toContain("cd nemoclaw && npm run build");
     expect(installerRuns).toContain("CI=true npx vitest run --project installer-integration");
-  });
-
-  it("keeps the temporary CLI source-coverage switch aligned across shard and merge", () => {
-    const shardRun = requiredStep(sharedActions.cliCoverageShard, "Run CLI coverage shard").run;
-    const mergeRun = requiredStep(sharedActions.cliCoverageMerge, "Merge CLI coverage").run;
-
-    for (const run of [shardRun, mergeRun]) {
-      expect(run).toContain('coverage_include="dist/lib/**/*.js"');
-      expect(run).toContain("npx vitest list --project integration --filesOnly");
-      expect(run).toContain('Error: No projects matched the filter "integration".');
-      expect(run).toContain("printf '%s\\n' \"$integration_probe_output\" >&2");
-      expect(run).toContain('coverage_include="src/**/*.ts"');
-      expect(run).toContain('--coverage.include="$coverage_include"');
-    }
-
-    expect(shardRun).toContain("additional_projects=()");
-    expect(shardRun).toContain("additional_projects+=(--project integration)");
-    expect(shardRun).toContain('"${additional_projects[@]}"');
   });
 
   it("keeps PR coverage for non-opt-in Vitest projects after removing the self-hosted full run", () => {
@@ -496,12 +526,15 @@ describe("pull request and main workflow contracts", () => {
     );
     expect(vitestConfig).toContain('name: "installer-integration"');
 
-    // E2E fixture/support tests remain part of the sharded CLI project:
-    // they live under test/e2e-scenario, while the CLI project only excludes
-    // the legacy test/e2e tree and installer-integration tests.
-    expect(cliShardRuns).toContain("npx vitest run --project cli");
-    expect(vitestConfig).toContain('name: "e2e-vitest-support"');
-    expect(vitestConfig).toContain('include: ["test/**/*.test.{js,ts}", "src/**/*.test.ts"]');
+    // Source and integration coverage are sharded together, while support,
+    // installer, package, and live projects remain disjoint explicit lanes.
+    expect(cliShardRuns).toContain("npx vitest run --project cli --project integration");
+    expect(vitestConfig).toContain('name: "cli"');
+    expect(vitestConfig).toContain('include: ["src/**/*.test.ts"]');
+    expect(vitestConfig).toContain('name: "integration"');
+    expect(vitestConfig).toContain('include: ["test/**/*.test.{js,ts}"]');
+    expect(vitestConfig).toContain('name: "e2e-support"');
+    expect(vitestConfig).toContain('name: "package-contract"');
     expect(vitestConfig).toContain('"test/e2e/**"');
     expect(vitestConfig).toContain('"test/install-express-prompt.test.ts"');
     expect(vitestConfig).toContain('"test/install-preflight.test.ts"');
@@ -589,9 +622,17 @@ describe("pull request and main workflow contracts", () => {
     expect(sharedActions.cliCoverageShard.inputs?.["shard-count"]?.default).toBe(cliShardCount);
     expect(sharedActions.cliCoverageMerge.inputs?.["shard-count"]?.default).toBe(cliShardCount);
 
+    const compiledCliUploadStep = requiredStep(
+      sharedActions.cliCoverageShard,
+      "Upload compiled CLI artifact",
+    );
     const shardUploadStep = requiredStep(
       sharedActions.cliCoverageShard,
       "Upload CLI shard blob report",
+    );
+    const compiledCliDownloadStep = requiredStep(
+      sharedActions.cliCoverageMerge,
+      "Download compiled CLI artifact",
     );
     const downloadStep = requiredStep(
       sharedActions.cliCoverageMerge,
@@ -601,6 +642,25 @@ describe("pull request and main workflow contracts", () => {
       sharedActions.cliCoverageMerge,
       "Verify CLI shard blob reports",
     ).run;
+
+    expect(compiledCliUploadStep.if).toBe(
+      "${{ steps.validate-shard-inputs.outputs.upload_build_artifact == 'true' && success() }}",
+    );
+    expect(compiledCliUploadStep.uses).toContain("actions/upload-artifact@");
+    expect(compiledCliUploadStep.with).toEqual({
+      name: "cli-build-output",
+      path: "dist",
+      "if-no-files-found": "error",
+      "retention-days": 1,
+    });
+    expect(
+      requiredStepIndex(sharedActions.cliCoverageShard, "Build CLI for coverage shard"),
+    ).toBeLessThan(
+      requiredStepIndex(sharedActions.cliCoverageShard, "Upload compiled CLI artifact"),
+    );
+    expect(
+      requiredStepIndex(sharedActions.cliCoverageShard, "Upload compiled CLI artifact"),
+    ).toBeLessThan(requiredStepIndex(sharedActions.cliCoverageShard, "Run CLI coverage shard"));
 
     expect(shardUploadStep.if).toBe(
       "${{ always() && steps.validate-shard-inputs.outcome == 'success' }}",
@@ -613,6 +673,22 @@ describe("pull request and main workflow contracts", () => {
     expect(shardUploadStep.with?.["if-no-files-found"]).toBe("error");
     expect(shardUploadStep.with?.["retention-days"]).toBe(1);
 
+    expect(compiledCliDownloadStep.uses).toContain("actions/download-artifact@");
+    expect(compiledCliDownloadStep.with).toEqual({
+      name: "cli-build-output",
+      path: "dist",
+    });
+    expect(
+      requiredStepIndex(sharedActions.cliCoverageMerge, "Download compiled CLI artifact"),
+    ).toBeLessThan(
+      requiredStepIndex(sharedActions.cliCoverageMerge, "Verify compiled CLI artifact"),
+    );
+    expect(
+      requiredStepIndex(sharedActions.cliCoverageMerge, "Verify compiled CLI artifact"),
+    ).toBeLessThan(
+      requiredStepIndex(sharedActions.cliCoverageMerge, "Download CLI shard blob reports"),
+    );
+
     expect(downloadStep.uses).toContain("actions/download-artifact@");
     expect(downloadStep.with?.pattern).toBe("cli-blob-report-*");
     expect(downloadStep.with?.path).toBe(".vitest-reports");
@@ -624,6 +700,17 @@ describe("pull request and main workflow contracts", () => {
     expect(stepRuns(sharedActions.cliCoverageMerge).join("\n")).toContain(
       'scripts/check-coverage-ratchet.ts coverage/cli/coverage-summary.json ci/coverage-threshold-cli.json "CLI coverage"',
     );
+  });
+
+  it("selects an available shard to publish the compiled CLI artifact", () => {
+    for (const shardCount of [1, 2, 3, 5]) {
+      const expectedProducer = Math.min(4, shardCount);
+      const producers = Array.from({ length: shardCount }, (_, index) => index + 1).filter(
+        (shard) => uploadsCompiledCliArtifact(sharedActions.cliCoverageShard, shard, shardCount),
+      );
+
+      expect(producers, `${shardCount} total shards`).toEqual([expectedProducer]);
+    }
   });
 
   it("keeps final aggregate checks for PR and main workflows", () => {
@@ -679,6 +766,16 @@ describe("pull request and main workflow contracts", () => {
       expect(mainChecksRun).toContain(`require_success "${jobName}"`);
     }
     expect(mainWorkflow.jobs["sandbox-images-and-e2e"].needs).toBe("checks");
+  });
+
+  it("exports immutable GHCR digests from the Hermes base resolver", () => {
+    const runs = stepRuns(resolveHermesBaseAction).join("\n");
+
+    expect(runs).toContain("docker image inspect");
+    expect(runs).toContain("${image}@sha256:");
+    expect(runs).toContain("layout_ok");
+    expect(runs).toContain("HERMES_BASE_IMAGE=${digest_ref}");
+    expect(runs).toContain("HERMES_BASE_IMAGE=nemoclaw-hermes-base-local");
   });
 
   it("does not run npm lifecycle scripts during CI dependency installs", () => {

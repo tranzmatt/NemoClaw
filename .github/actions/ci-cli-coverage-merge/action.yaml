@@ -41,11 +41,16 @@ runs:
       shell: bash
       run: npm install --ignore-scripts
 
-    - name: Build CLI TypeScript modules
+    - name: Download compiled CLI artifact
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: cli-build-output
+        path: dist
+
+    - name: Verify compiled CLI artifact
       shell: bash
       run: |
-        node -e "require('node:fs').rmSync('dist', { recursive: true, force: true })"
-        npm run build:cli
+        test -s dist/nemoclaw.js
         npx tsx scripts/check-dist-sourcemaps.ts dist
 
     - name: Download CLI shard blob reports
@@ -78,16 +83,6 @@ runs:
     - name: Merge CLI coverage
       shell: bash
       run: |
-        coverage_include="dist/lib/**/*.js"
-        # Keep the merge denominator aligned with the shard command during
-        # the PR #5904 transition. That PR removes this probe after landing.
-        integration_probe_output=""
-        if integration_probe_output=$(npx vitest list --project integration --filesOnly 2>&1); then
-          coverage_include="src/**/*.ts"
-        elif ! grep -Fqx 'Error: No projects matched the filter "integration".' <<<"$integration_probe_output"; then
-          printf '%s\n' "$integration_probe_output" >&2
-          exit 1
-        fi
         npx vitest --mergeReports .vitest-reports \
           --reporter=json \
           --outputFile.json=coverage/cli/vitest-results.json \
@@ -97,7 +92,7 @@ runs:
           --coverage.reporter=cobertura \
           --coverage.reportsDirectory=coverage/cli \
           --coverage.include="bin/**/*.js" \
-          --coverage.include="$coverage_include" \
+          --coverage.include="src/**/*.ts" \
           --coverage.exclude="test/**/*.js" \
           --coverage.exclude="test/**/*.ts"
         npx tsx scripts/check-coverage-ratchet.ts coverage/cli/coverage-summary.json ci/coverage-threshold-cli.json "CLI coverage"

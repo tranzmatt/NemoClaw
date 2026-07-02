@@ -6,7 +6,7 @@
 # Layers PR-specific code (plugin, config, startup script) on top of the
 # pre-built Hermes base image. Mirrors the OpenClaw Dockerfile structure.
 
-ARG BASE_IMAGE=ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@sha256:60333c1982ad855d55887b4488e867eb343f3930a30aa8e0268e5397fc6f2926
+ARG BASE_IMAGE=ghcr.io/nvidia/nemoclaw/hermes-sandbox-base@sha256:8dad3b989a9ed1e601743310b97be21be5f59f89f7913a47d04f3ec3c40b8ce6
 
 # hadolint ignore=DL3006
 FROM ${BASE_IMAGE}
@@ -107,21 +107,35 @@ COPY nemoclaw-blueprint/ /opt/nemoclaw-blueprint/
 RUN chmod -R a+rX /opt/nemoclaw-blueprint/
 
 # Copy startup script and the secret-boundary validator. The validator is the
-# single source of truth shared between start.sh (cold start) and the host-side
-# gateway recovery script (src/lib/agent/runtime.ts) so `sandbox recover` enforces
-# the same boundary as the initial entrypoint.
+# single source of truth used by start.sh at cold start and by its root-owned
+# PID 1 lifecycle handler, so `recover` enforces the same boundary as startup.
 COPY scripts/lib/sandbox-init.sh /usr/local/lib/nemoclaw/sandbox-init.sh
+COPY scripts/lib/gateway-supervisor.sh /usr/local/lib/nemoclaw/gateway-supervisor.sh
 COPY scripts/lib/sandbox-rlimits.sh /usr/local/lib/nemoclaw/sandbox-rlimits.sh
 COPY agents/hermes/start.sh /usr/local/bin/nemoclaw-start
+COPY scripts/gateway-control.sh /usr/local/bin/nemoclaw-gateway-control
+COPY scripts/managed-gateway-control.py /usr/local/lib/nemoclaw/managed-gateway-control.py
 COPY agents/hermes/validate-env-secret-boundary.py /usr/local/lib/nemoclaw/validate-hermes-env-secret-boundary.py
 COPY agents/hermes/seed-dashboard-config.py /usr/local/lib/nemoclaw/seed-hermes-dashboard-config.py
 COPY agents/hermes/runtime-config-guard.py /usr/local/lib/nemoclaw/hermes-runtime-config-guard.py
+COPY scripts/state-dir-guard.py /usr/local/lib/nemoclaw/state-dir-guard.py
+COPY nemoclaw-blueprint/scripts/*.js /usr/local/lib/nemoclaw/preloads/
 # Dockerfile.base is the source of truth for rlimit hooks. This Hermes replay
 # only repairs stale bases predating the v0.0.69 base layer, which may lack the
 # profile hook, bashrc hook, or root-owned helper mode. Remove it once the
 # minimum supported Hermes sandbox base tag guarantees those artifacts and
 # test/sandbox-rlimit-hooks.test.ts covers that base.
 RUN chmod 755 /usr/local/bin/nemoclaw-start /usr/local/lib/nemoclaw/sandbox-init.sh /usr/local/lib/nemoclaw/validate-hermes-env-secret-boundary.py /usr/local/lib/nemoclaw/seed-hermes-dashboard-config.py /usr/local/lib/nemoclaw/hermes-runtime-config-guard.py \
+    && chown root:root /usr/local/bin/nemoclaw-gateway-control /usr/local/lib/nemoclaw/gateway-supervisor.sh /usr/local/lib/nemoclaw/state-dir-guard.py /usr/local/lib/nemoclaw/managed-gateway-control.py \
+    && chmod 700 /usr/local/bin/nemoclaw-gateway-control \
+    && chmod 500 /usr/local/lib/nemoclaw/state-dir-guard.py /usr/local/lib/nemoclaw/managed-gateway-control.py \
+    && chmod 444 /usr/local/lib/nemoclaw/gateway-supervisor.sh \
+    && if [ -d /usr/local/lib/nemoclaw/preloads ]; then \
+        chown -R 0:0 /usr/local/lib/nemoclaw/preloads \
+        && find /usr/local/lib/nemoclaw/preloads -type f -exec chmod 444 {} + \
+        && find /usr/local/lib/nemoclaw/preloads -type d -exec chmod 755 {} + \
+        ; \
+    fi \
     && chmod 444 /usr/local/lib/nemoclaw/sandbox-rlimits.sh \
     && mkdir -p /etc/profile.d \
     && printf '%s\n' \
@@ -141,6 +155,26 @@ RUN chmod 755 /usr/local/bin/nemoclaw-start /usr/local/lib/nemoclaw/sandbox-init
     && mv /etc/bash.bashrc.new /etc/bash.bashrc \
     && chmod 444 /etc/bash.bashrc
 
+# Build-time assertion: fail immediately if the validator was not installed or
+# made executable. Catches COPY path drift or a silent chmod failure.
+RUN test -x /usr/local/lib/nemoclaw/validate-hermes-env-secret-boundary.py \
+    || { echo "ERROR: validate-hermes-env-secret-boundary.py missing or not executable" >&2; exit 1; }
+
+# Cryptographic integrity gate for the two security-critical Python entrypoints
+# — the wrapper that enforces the runtime env secret boundary and the validator
+# it delegates to. Any content change to either file MUST be accompanied by an
+# updated hash below; otherwise the build fails. This blocks silent supply-
+# chain tampering of the build context (an attacker rewriting the file has to
+# also rewrite the Dockerfile-committed hash, which reviewers gate). Regenerate
+# with `sha256sum agents/hermes/{hermes-wrapper.py,validate-env-secret-boundary.py}`.
+ARG NEMOCLAW_HERMES_WRAPPER_SHA256=03e0afbe00e352d0dfcf14b99ea1821f9fd29f87dad49ce19add2ec96d1941cc
+ARG NEMOCLAW_HERMES_VALIDATOR_SHA256=970d7ff03bc409ff1d5ca46bfdbd2a42ac28a32a810ccc147a508301bff38496
+# hadolint ignore=DL4006
+RUN printf '%s  %s\n' \
+        "$NEMOCLAW_HERMES_VALIDATOR_SHA256" /usr/local/lib/nemoclaw/validate-hermes-env-secret-boundary.py \
+    | sha256sum -c - \
+    || { echo "ERROR: validate-hermes-env-secret-boundary.py hash mismatch (update NEMOCLAW_HERMES_VALIDATOR_SHA256)" >&2; exit 1; }
+
 # Wrap the hermes CLI so the runtime env secret boundary is enforced for
 # `hermes gateway` no matter how it is invoked. The entrypoint guard alone left
 # a direct `docker exec ... hermes gateway run` able to start the gateway with
@@ -148,9 +182,20 @@ RUN chmod 755 /usr/local/bin/nemoclaw-start /usr/local/lib/nemoclaw/sandbox-init
 # wrapper in its place; the wrapper reuses the same validator and execs the real
 # binary for every non-gateway subcommand. Re-assert --version through the
 # wrapper so a broken relocation fails the build.
-COPY agents/hermes/hermes-wrapper.sh /usr/local/lib/nemoclaw/hermes-wrapper.sh
+#
+# The wrapper's shebang pins `/usr/bin/python3 -I` (isolated mode); fail the
+# build if that absolute path is missing or non-executable so a base-image
+# upgrade that drops it cannot ship a wrapper that ENOEXECs at runtime.
+COPY agents/hermes/hermes-wrapper.py /usr/local/lib/nemoclaw/hermes-wrapper.py
+RUN test -x /usr/bin/python3 \
+    || { echo "ERROR: /usr/bin/python3 missing or not executable; hermes-wrapper shebang would ENOEXEC" >&2; exit 1; }
+# hadolint ignore=DL4006
+RUN printf '%s  %s\n' \
+        "$NEMOCLAW_HERMES_WRAPPER_SHA256" /usr/local/lib/nemoclaw/hermes-wrapper.py \
+    | sha256sum -c - \
+    || { echo "ERROR: hermes-wrapper.py hash mismatch (update NEMOCLAW_HERMES_WRAPPER_SHA256)" >&2; exit 1; }
 RUN mv /usr/local/bin/hermes /usr/local/bin/hermes.real \
-    && install -m 0755 /usr/local/lib/nemoclaw/hermes-wrapper.sh /usr/local/bin/hermes \
+    && install -m 0755 /usr/local/lib/nemoclaw/hermes-wrapper.py /usr/local/bin/hermes \
     && chmod 755 /usr/local/bin/hermes.real \
     && /usr/local/bin/hermes --version
 
@@ -251,24 +296,34 @@ ENV HERMES_ENVIRONMENT_HINT="You are running inside an NVIDIA OpenShell sandbox,
 USER root
 
 # Flatten stale published base images that still contain the old .hermes-data
-# symlink bridge. OpenShell starts the sandbox as the sandbox user, so runtime
-# migration cannot rely on root privileges inside the pod.
+# symlink bridge. The base resolver owns published-image provenance and exports
+# immutable digests; this final-image boundary owns layout validation so local,
+# rebuilt, and caller-selected bases remain supported. Retired OpenClaw state
+# must never enter a Hermes final image. OpenShell starts the sandbox as the
+# sandbox user, so the .hermes-data migration cannot rely on root privileges
+# inside the pod.
 # hadolint ignore=DL4006
 RUN set -eu; \
     config_dir=/sandbox/.hermes; \
     data_dir=/sandbox/.hermes-data; \
+    openclaw_dir=/sandbox/.openclaw; \
+    if [ -e "$openclaw_dir" ] || [ -L "$openclaw_dir" ]; then \
+        echo "ERROR: Hermes base image contains retired OpenClaw state: $openclaw_dir" >&2; \
+        exit 1; \
+    fi; \
     mkdir -p "$config_dir"; \
     if [ -L "$data_dir" ]; then \
         echo "ERROR: refusing legacy layout cleanup because $data_dir is a symlink" >&2; \
         exit 1; \
     fi; \
     if [ -d "$data_dir" ]; then \
+        legacy_link="$(find "$data_dir" -type l -print -quit)"; \
+        if [ -n "$legacy_link" ]; then \
+            echo "ERROR: refusing legacy layout cleanup because $legacy_link is a symlink" >&2; \
+            exit 1; \
+        fi; \
         for entry in "$data_dir"/*; do \
             [ -e "$entry" ] || [ -L "$entry" ] || continue; \
-            if [ -L "$entry" ]; then \
-                echo "ERROR: refusing legacy layout cleanup because $entry is a symlink" >&2; \
-                exit 1; \
-            fi; \
             name="$(basename "$entry")"; \
             target="$config_dir/$name"; \
             if [ -L "$target" ]; then \
@@ -419,7 +474,7 @@ RUN mkdir -p /etc/nemoclaw \
 # Backward-compatible marker for host-side shields logic on older sandboxes.
 RUN sha256sum /sandbox/.hermes/config.yaml /sandbox/.hermes/.env \
     > /sandbox/.hermes/.config-hash \
-    && chmod 600 /sandbox/.hermes/.config-hash \
+    && chmod 640 /sandbox/.hermes/.config-hash \
     && chown sandbox:sandbox /sandbox/.hermes/.config-hash
 
 # OpenShell's macOS VM backend currently remaps extracted rootfs ownership to

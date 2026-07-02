@@ -9,6 +9,8 @@ const {
   envInt,
   LOCAL_INFERENCE_TIMEOUT_SECS,
 }: typeof import("./onboard/env") = require("./onboard/env");
+type ProviderSelectionResult =
+  import("./onboard/machine/handlers/provider-inference").ProviderSelectionResult;
 const {
   agentProductName,
   cliDisplayName,
@@ -24,13 +26,13 @@ const {
 const {
   applyCloudFallbackSelection,
   clearNimContainerBeforeRetry,
+  createNvidiaFeaturedModelSession,
   createRemoteModelValidator,
   requireProviderChoice,
 }: typeof import("./onboard/setup-nim-selection") = require("./onboard/setup-nim-selection");
-const {
-  createSetupNimOllamaHandlers,
-}: typeof import("./onboard/setup-nim-ollama") = require("./onboard/setup-nim-ollama");
+const setupNimOllama: typeof import("./onboard/setup-nim-ollama") = require("./onboard/setup-nim-ollama");
 const inferenceInputCapability = require("./onboard/inference-input-capability");
+const reasoningMode: typeof import("./onboard/reasoning-mode") = require("./onboard/reasoning-mode");
 const { cleanupTempDir }: typeof import("./onboard/temp-files") = require("./onboard/temp-files");
 const {
   abortNonInteractive,
@@ -1047,6 +1049,7 @@ const { validateSelectedRemoteModel } = createRemoteModelValidator({
   shouldRequireResponsesToolCalling,
   shouldSkipResponsesProbe,
   getProbeAuthMode,
+  configureCompatibleEndpointReasoning: reasoningMode.configureCompatibleEndpointReasoning,
 });
 
 const { promptCloudModel, promptRemoteModel, promptInputModel } = modelPrompts;
@@ -1068,7 +1071,7 @@ const {
   handleWindowsHostOllamaSelection,
   handleRunningOllamaSelection,
   handleInstallOllamaSelection,
-} = createSetupNimOllamaHandlers({
+} = setupNimOllama.createSetupNimOllamaHandlers({
   OLLAMA_PORT,
   OLLAMA_PROXY_PORT,
   process,
@@ -1967,10 +1970,10 @@ async function startGatewayWithOptions(
   if (isLinuxDockerDriverGatewayEnabled()) {
     return startDockerDriverGateway({
       exitOnFailure,
-      skipSandboxBridgeReachability:
-        gpuPassthrough &&
-        process.env.NEMOCLAW_DOCKER_GPU_PATCH !== "0" &&
-        dockerGpuPatch.getDockerGpuPatchNetworkMode(process.env) === "host",
+      skipSandboxBridgeReachability: dockerGpuLocalInference.shouldSkipGpuBridgeProbe(
+        gpuPassthrough,
+        _gpu?.platform,
+      ),
     });
   }
 
@@ -2148,9 +2151,7 @@ async function startDockerDriverGateway({
   skipSandboxBridgeReachability?: boolean;
 } = {}): Promise<void> {
   const gatewayBin = resolveOpenShellGatewayBinary();
-  const openshellVersionOutput = runCaptureOpenshell(["--version"], {
-    ignoreError: true,
-  });
+  const openshellVersionOutput = runCaptureOpenshell(["--version"], { ignoreError: true });
   const gatewayEnv = getDockerDriverGatewayEnv(openshellVersionOutput);
   const stateDir = getDockerDriverGatewayStateDir();
   const runtimeIdentity = gatewayBin
@@ -2160,6 +2161,7 @@ async function startDockerDriverGateway({
         stateDir,
         sandboxBin: resolveOpenShellSandboxBinary(),
         compatContainerName: gatewayBinding.resolveGatewayCompatContainerName(GATEWAY_PORT),
+        ensureLocalTlsBundle: true,
       })
     : null;
   const gatewayLaunch = runtimeIdentity?.launch ?? null;
@@ -2935,7 +2937,6 @@ async function createSandbox(
   // can be deregistered — if inline cleanup fails, we leave the handler
   // armed so the temp dir is still removed on process exit.
   process.on("exit", cleanupBuildCtx);
-
   const defaultPolicyPath = path.join(
     ROOT,
     "nemoclaw-blueprint",
@@ -2960,6 +2961,7 @@ async function createSandbox(
     messagingTokenDefs,
     reusableMessagingChannels,
     reusableMessagingProviders,
+    extraProviders: registry.listExtraProviders(),
     hermesToolGateways,
     sandboxGpuConfig: effectiveSandboxGpuConfig,
     dockerDriverGateway: isLinuxDockerDriverGatewayEnabled(),
@@ -3366,7 +3368,6 @@ async function selectAndValidateOllamaModel(
 
 type SetupNimSelectionState =
   import("./onboard/setup-nim-selection").SetupNimSelectionState<HermesAuthMethod>;
-
 type SetupNimSelectionResult = "selected" | "retry-selection";
 
 type RemoteProviderSelectionArgs = {
@@ -3773,14 +3774,12 @@ async function handleRemoteProviderSelection(
     } else {
       await ensureApiKey();
     }
-    const _envModel = (process.env.NEMOCLAW_MODEL || "").trim();
-    state.model =
-      requestedModel ||
-      (recoveredFromSandbox && recoveredModel) ||
-      (isNonInteractive()
-        ? DEFAULT_CLOUD_MODEL
-        : await promptCloudModel({ defaultModelId: _envModel || undefined })) ||
-      DEFAULT_CLOUD_MODEL;
+    state.model = await state.nvidiaFeaturedModels!.select(
+      requestedModel,
+      recoveredFromSandbox ? recoveredModel : null,
+      isNonInteractive(),
+      process.env.NEMOCLAW_MODEL,
+    );
     if (isBackToSelection(state.model)) {
       console.log("  Returning to provider selection.");
       console.log("");
@@ -3926,18 +3925,7 @@ async function setupNim(
   sandboxName: string | null = null,
   agent: AgentDefinition | null = null,
   recoverProvider = true,
-): Promise<{
-  model: string | null;
-  provider: string;
-  endpointUrl: string | null;
-  credentialEnv: string | null;
-  hermesAuthMethod: HermesAuthMethod | null;
-  hermesToolGateways: string[];
-  preferredInferenceApi: string | null;
-  nimContainer: string | null;
-  allowToolsIncompatible: boolean;
-  skipHostInferenceSmoke: boolean;
-}> {
+): Promise<ProviderSelectionResult> {
   step(3, 8, "Configuring inference provider");
 
   let model: string | typeof BACK_TO_SELECTION | null = null;
@@ -3948,8 +3936,10 @@ async function setupNim(
   let hermesAuthMethod: HermesAuthMethod | null = null;
   let hermesToolGateways: string[] = [];
   let preferredInferenceApi: string | null = null;
+  let compatibleEndpointReasoning: string | null = null;
   let allowToolsIncompatible = false;
   let skipHostInferenceSmoke = false;
+  const nvidiaFeaturedModels = createNvidiaFeaturedModelSession();
 
   const providerHostState = detectInferenceProviderHostState({
     gpu,
@@ -4080,8 +4070,10 @@ async function setupNim(
           hermesAuthMethod,
           hermesToolGateways,
           preferredInferenceApi,
+          compatibleEndpointReasoning,
           nimContainer,
           allowToolsIncompatible,
+          nvidiaFeaturedModels,
         };
         const result = await handleRemoteProviderSelection(
           { selected, requestedModel, recoveredFromSandbox, recoveredModel, sandboxName },
@@ -4097,6 +4089,7 @@ async function setupNim(
           preferredInferenceApi,
           allowToolsIncompatible,
         } = state);
+        compatibleEndpointReasoning = state.compatibleEndpointReasoning ?? null;
         skipHostInferenceSmoke = state.skipHostInferenceSmoke === true;
         if (result === "retry-selection") continue selectionLoop;
         break;
@@ -4296,6 +4289,8 @@ async function setupNim(
     }
   }
 
+  if (provider !== "compatible-endpoint")
+    compatibleEndpointReasoning = reasoningMode.clearCompatibleEndpointReasoning();
   const selectedModel = isBackToSelection(model) ? null : model;
   await inferenceInputCapability.maybePromptForInferenceInputCapability(selectedModel, {
     isNonInteractive,
@@ -4309,6 +4304,7 @@ async function setupNim(
     hermesAuthMethod,
     hermesToolGateways,
     preferredInferenceApi,
+    compatibleEndpointReasoning,
     nimContainer,
     allowToolsIncompatible,
     skipHostInferenceSmoke,
@@ -4575,8 +4571,8 @@ async function setupPoliciesWithSelection(
       waitForSandboxReady,
       syncPresetSelection,
       selectPolicyTier,
-      setPolicyTier: (sandbox, tierName) =>
-        registry.updateSandbox(sandbox, { policyTier: tierName }),
+      setPolicyTier: (s, t) => registry.updateSandbox(s, { policyTier: t }),
+      getRecordedPolicyTier: (s) => registry.getSandbox(s)?.policyTier ?? null,
       selectTierPresetsAndAccess,
       parsePolicyPresetEnv,
       env: process.env,
@@ -4888,6 +4884,7 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
       hermesAuthMethod: normalizeHermesAuthMethod(session?.hermesAuthMethod),
       hermesToolGateways: normalizeHermesToolGatewaySelections(session?.hermesToolGateways),
       preferredInferenceApi: session?.preferredInferenceApi || null,
+      compatibleEndpointReasoning: session?.compatibleEndpointReasoning || null,
       nimContainer: session?.nimContainer || null,
       webSearchConfig: session?.webSearchConfig || null,
       webSearchSupported: false,
@@ -5028,6 +5025,8 @@ async function onboard(opts: OnboardOptions = {}): Promise<void> {
           recordStateSkipped,
           recordRepairEvent,
           hydrateCredentialEnv,
+          configureCompatibleEndpointReasoning: reasoningMode.configureCompatibleEndpointReasoning,
+          clearCompatibleEndpointReasoning: reasoningMode.clearCompatibleEndpointReasoning,
           repairLocalInferenceSystemdOverrideOrExit,
           isNonInteractive,
           getOpenshellBinary,

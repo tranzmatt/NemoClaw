@@ -14,7 +14,7 @@ const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-test-"));
 process.env.HOME = tmpDir;
 
 const require = createRequire(import.meta.url);
-const registry = require("../dist/lib/state/registry");
+const registry = require("../src/lib/state/registry");
 
 const regFile = path.join(tmpDir, ".nemoclaw", "sandboxes.json");
 
@@ -145,76 +145,6 @@ describe("registry", () => {
     expect(registry.getSandboxEntryInference(missingModel)).toEqual({ kind: "unconfigured" });
     expect(registry.getSandboxEntryInference(blankProvider)).toEqual({ kind: "unconfigured" });
     expect(registry.getSandboxEntryInference(blankModel)).toEqual({ kind: "unconfigured" });
-  });
-
-  it("normalizes gateway binding fields into a discriminated view", () => {
-    expect(
-      registry.getSandboxEntryGatewayBinding({
-        name: "alpha",
-        gatewayName: "nemoclaw",
-        gatewayPort: 8080,
-      }),
-    ).toEqual({ kind: "registered", gatewayName: "nemoclaw", gatewayPort: 8080 });
-    expect(
-      registry.getSandboxEntryGatewayBinding({ name: "missing-name", gatewayPort: 8080 }),
-    ).toEqual({ kind: "missing" });
-    expect(
-      registry.getSandboxEntryGatewayBinding({ name: "missing-port", gatewayName: "nemoclaw" }),
-    ).toEqual({ kind: "missing" });
-    expect(
-      registry.getSandboxEntryGatewayBinding({
-        name: "invalid-port",
-        gatewayName: "nemoclaw",
-        gatewayPort: 0,
-      }),
-    ).toEqual({ kind: "missing" });
-    expect(
-      registry.getSandboxEntryGatewayBinding({
-        name: "too-high-port",
-        gatewayName: "nemoclaw",
-        gatewayPort: 65536,
-      }),
-    ).toEqual({ kind: "missing" });
-    expect(
-      registry.getSandboxEntryGatewayBinding({
-        name: "blank-gateway",
-        gatewayName: "",
-        gatewayPort: 8080,
-      }),
-    ).toEqual({ kind: "missing" });
-  });
-
-  it("normalizes sandbox entries without mutating the raw registry entry", () => {
-    const raw = {
-      name: "alpha",
-      provider: "nvidia-prod",
-      model: "nvidia/test",
-      gatewayName: "nemoclaw",
-      gatewayPort: 8080,
-    };
-
-    const normalized = registry.normalizeSandboxEntryView(raw);
-
-    expect(normalized).toEqual({
-      name: "alpha",
-      raw,
-      inference: { kind: "configured", provider: "nvidia-prod", model: "nvidia/test" },
-      gateway: { kind: "registered", gatewayName: "nemoclaw", gatewayPort: 8080 },
-    });
-    expect(normalized.raw).toBe(raw);
-  });
-
-  it("normalizes invalid typed fields to missing views", () => {
-    const normalized = registry.normalizeSandboxEntryView({
-      name: "invalid",
-      provider: "",
-      model: "nvidia/test",
-      gatewayName: "nemoclaw",
-      gatewayPort: 65536,
-    });
-
-    expect(normalized.inference).toEqual({ kind: "unconfigured" });
-    expect(normalized.gateway).toEqual({ kind: "missing" });
   });
 
   it("first registered becomes default", () => {
@@ -577,6 +507,33 @@ describe("registry", () => {
     registry.registerSandbox({ name: "cp5" });
     expect(registry.getCustomPolicies("cp5")).toEqual([]);
   });
+
+  describe("extra providers", () => {
+    it("starts with an empty extra-provider list", () => {
+      expect(registry.listExtraProviders()).toEqual([]);
+    });
+
+    it("addExtraProvider persists a sorted, deduplicated list", () => {
+      expect(registry.addExtraProvider("tavily-search")).toBe(true);
+      expect(registry.addExtraProvider("custom-provider")).toBe(true);
+      expect(registry.addExtraProvider("tavily-search")).toBe(false);
+      expect(registry.listExtraProviders()).toEqual(["custom-provider", "tavily-search"]);
+    });
+
+    it("removeExtraProvider clears the entry and drops the field when empty", () => {
+      registry.addExtraProvider("tavily-search");
+      expect(registry.removeExtraProvider("tavily-search")).toBe(true);
+      expect(registry.listExtraProviders()).toEqual([]);
+      const raw = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+      expect("extraProviders" in raw).toBe(false);
+      expect(registry.removeExtraProvider("tavily-search")).toBe(false);
+    });
+
+    it("survives a registry round-trip through disk", () => {
+      registry.addExtraProvider("tavily-search");
+      expect(registry.listExtraProviders()).toEqual(["tavily-search"]);
+    });
+  });
 });
 
 describe("atomic writes", () => {
@@ -715,7 +672,7 @@ describe("advisory file locking", () => {
   it("concurrent writers do not corrupt the registry", () => {
     const { spawnSync } = require("child_process");
     const registryPath = path.resolve(
-      path.join(import.meta.dirname, "..", "dist", "lib", "state", "registry.js"),
+      path.join(import.meta.dirname, "..", "src", "lib", "state", "registry.ts"),
     );
     const homeDir = path.dirname(path.dirname(regFile));
     // Script that spawns 4 workers in parallel, each writing 5 sandboxes

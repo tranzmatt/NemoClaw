@@ -1,18 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { createRequire } from "node:module";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { createRequire } from "node:module";
-
-import {
-  buildCreatedSandboxRegistryEntry,
-  registerCreatedSandbox,
-  selection,
-} from "../../../dist/lib/onboard/sandbox-registration";
-
 const requireDist = createRequire(import.meta.url);
-const onboardSession = requireDist("../../../dist/lib/state/onboard-session.js");
+const onboardSession = requireDist("../state/onboard-session.js");
+const { buildCreatedSandboxRegistryEntry, registerCreatedSandbox, selection } = requireDist(
+  "./sandbox-registration.ts",
+) as typeof import("./sandbox-registration");
 
 const runtimeFields = {
   gpuEnabled: true,
@@ -79,6 +75,8 @@ describe("buildCreatedSandboxRegistryEntry", () => {
       openshellVersion: "0.1.2",
     });
     expect(entry.agent).toBeNull();
+    expect(entry.agentVersion).toBeTruthy();
+    expect(entry.nemoclawVersion).toBeTruthy();
     expect(entry.messaging).toBe(plannedMessagingState);
     const rawEntry = entry as unknown as Record<string, unknown>;
     expect(rawEntry.messagingChannels).toBeUndefined();
@@ -119,6 +117,8 @@ describe("buildCreatedSandboxRegistryEntry", () => {
     expect(entry.credentialEnv).toBeNull();
     expect(entry.preferredInferenceApi).toBeNull();
     expect(entry.nimContainer).toBeNull();
+    expect(entry.agentVersion).toBeNull();
+    expect(entry.nemoclawVersion).toBeNull();
     const rawEntry = entry as unknown as Record<string, unknown>;
     expect(rawEntry.messagingChannels).toBeUndefined();
     expect(rawEntry.messagingChannelConfig).toBeUndefined();
