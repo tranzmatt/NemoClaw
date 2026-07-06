@@ -13,7 +13,6 @@ import {
   OPENSHELL_OPERATION_TIMEOUT_MS,
   OPENSHELL_PROBE_TIMEOUT_MS,
 } from "../../adapters/openshell/timeouts";
-import type { AgentDefinition } from "../../agent/defs";
 import * as agentRuntime from "../../agent/runtime";
 import { CLI_NAME } from "../../cli/branding";
 import { D, G, R, YW } from "../../cli/terminal-style";
@@ -32,8 +31,10 @@ import { isWsl } from "../../platform";
 import { ROOT } from "../../runner";
 import * as sandboxVersion from "../../sandbox/version";
 import {
+  isSandboxReady,
   isTerminalSandboxPhase,
   parseSandboxPhase,
+  parseSandboxStatus,
   TERMINAL_SANDBOX_PHASES,
 } from "../../state/gateway";
 import type { SandboxEntry } from "../../state/registry";
@@ -50,6 +51,10 @@ import {
   CONNECT_AUTO_PAIR_MAX_APPROVALS,
   CONNECT_AUTO_PAIR_TIMEOUT_MS,
 } from "./connect-autopair-budget";
+import {
+  buildSandboxInferenceRouteProbeArgs,
+  type InferenceRouteProbeAgent,
+} from "./connect-inference-route-probe";
 import { preflightVllmModelEnvOrExit } from "./connect-vllm-preflight";
 import { isDockerRuntimeDown, printDockerRuntimeDownGuidance } from "./gateway-failure-classifier";
 import { ensureLiveSandboxOrExit, printGatewayLifecycleHint } from "./gateway-state";
@@ -93,8 +98,6 @@ type InferenceRouteProbeOptions = {
   attempts?: number;
   delayMs?: number;
 };
-
-type InferenceRouteProbeAgent = Pick<AgentDefinition, "name"> | null;
 
 export type SandboxInferenceRouteRepairResult = {
   healthy: boolean;
@@ -383,40 +386,6 @@ function failIfGatewayBlocksConnectReadiness(sandboxName: string): void {
       lifecycle.status || lifecycle.gatewayInfo || "",
     );
   }
-}
-
-const INFERENCE_ROUTE_PROBE_SCRIPT = [
-  "OUT=/tmp/nemoclaw-inference-route-probe.out",
-  "HTTP_CODE=$(curl -sk -o \"$OUT\" -w '%{http_code}' --connect-timeout 3 --max-time 8 https://inference.local/v1/models 2>/dev/null) || HTTP_CODE=000",
-  'case "$HTTP_CODE" in 000|5*) printf \'BROKEN %s \' "$HTTP_CODE"; head -c 160 "$OUT" 2>/dev/null || true ;; *) printf \'OK %s\' "$HTTP_CODE" ;; esac',
-].join("; ");
-
-const PROXY_ENV_KEYS = [
-  "HTTP_PROXY",
-  "HTTPS_PROXY",
-  "http_proxy",
-  "https_proxy",
-  "NO_PROXY",
-  "no_proxy",
-] as const;
-
-export function buildSandboxInferenceRouteProbeArgs(
-  sandboxName: string,
-  agent: InferenceRouteProbeAgent,
-): string[] {
-  const command =
-    agent?.name === "langchain-deepagents-code"
-      ? [
-          "env",
-          ...PROXY_ENV_KEYS.flatMap((key) => ["-u", key]),
-          "HOME=/sandbox",
-          "bash",
-          "-lc",
-          INFERENCE_ROUTE_PROBE_SCRIPT,
-        ]
-      : ["sh", "-c", INFERENCE_ROUTE_PROBE_SCRIPT];
-
-  return ["sandbox", "exec", "--name", sandboxName, "--", ...command];
 }
 
 function probeSandboxInferenceRoute(
@@ -937,7 +906,6 @@ export async function connectSandbox(
   // express-vLLM model preflight for them (it only steers the install path
   // and would otherwise hard-exit a recovery on a stale NEMOCLAW_VLLM_MODEL).
   if (!probeOnly) preflightVllmModelEnvOrExit();
-  const { isSandboxReady, parseSandboxStatus } = require("../../onboard");
   const live = await ensureLiveSandboxOrExit(sandboxName, { allowNonReadyPhase: true });
 
   // Fast-fail on a Docker daemon outage before the probe-only health check and

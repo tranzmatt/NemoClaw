@@ -27,6 +27,7 @@ describe("connectSandbox flow", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     if (originalStdoutIsTty === undefined) {
       Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: undefined });
     } else {
@@ -292,6 +293,10 @@ describe("connectSandbox flow", () => {
         "NO_PROXY",
         "-u",
         "no_proxy",
+        "-u",
+        "ALL_PROXY",
+        "-u",
+        "all_proxy",
         "HOME=/sandbox",
         "bash",
         "-lc",
