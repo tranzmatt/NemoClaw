@@ -72,6 +72,7 @@ describe("handleSandboxState tool disclosure", () => {
     await handleSandboxState({
       ...baseOptions(deps, session),
       resume: true,
+      endpointSource: "inference-set",
       sandboxName: "saved",
     });
 
@@ -101,12 +102,13 @@ describe("handleSandboxState tool disclosure", () => {
     await handleSandboxState({
       ...baseOptions(deps, session),
       resume: true,
+      endpointSource: "inference-set",
       sandboxName: "saved",
     });
 
     expect(calls.removeSandbox).not.toHaveBeenCalled();
     expect(calls.createSandbox).toHaveBeenCalledWith(
-      expect.anything(),
+      { type: "nvidia" },
       "model",
       "provider",
       "openai-completions",
@@ -120,7 +122,15 @@ describe("handleSandboxState tool disclosure", () => {
       null,
       [],
       null,
-      { recreate: true, toolDisclosure: requestedMode, observabilityEnabled: false },
+      {
+        resolved: expect.any(Object),
+        recreate: true,
+        toolDisclosure: requestedMode,
+        observabilityEnabled: false,
+        endpointSource: "inference-set",
+        extraProviders: [],
+        reuseRegisteredCredentials: true,
+      },
     );
   });
 

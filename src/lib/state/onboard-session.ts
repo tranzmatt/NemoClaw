@@ -7,41 +7,58 @@
  * step-level progress tracking and file-based locking.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
 import { isErrnoException } from "../core/errno";
-import type { JsonObject, JsonValue } from "../core/json-types";
+import { isObjectRecord, type JsonObject, type JsonValue } from "../core/json-types";
+import { GATEWAY_PORT } from "../core/ports";
+import {
+  parseServingProfileProvenance,
+  type ServingProfileProvenance,
+} from "../inference/serving/profile-provenance";
 import { normalizeWebSearchConfig, type WebSearchConfig } from "../inference/web-search";
 import type { SandboxMessagingPlan } from "../messaging/manifest";
 import { compactSandboxMessagingPlanForPersistence } from "../messaging/persistence";
 import { parseSandboxMessagingPlan } from "../messaging/plan-validation";
+import { NAME_MAX_LENGTH, NAME_VALID_PATTERN } from "../name-validation";
+import { describeGatewayOwner, type GatewayOwnerDescription } from "../onboard/gateway-ownership";
 import {
   createOnboardMachineEvent,
   emitOnboardMachineEvent,
   machineStateFromOnboardSessionStep,
 } from "../onboard/machine/events";
-import { isOnboardMachineState } from "../onboard/machine/transitions";
-import type { OnboardMachineState } from "../onboard/machine/types";
+import {
+  assertValidOnboardMachineTransition,
+  isOnboardMachineState,
+  isTerminalOnboardMachineState,
+} from "../onboard/machine/transitions";
+import type { OnboardMachineState, OnboardNonTerminalMachineState } from "../onboard/machine/types";
+import { normalizeReasoningEffort, type ReasoningEffort } from "../onboard/reasoning-mode";
+import {
+  assertStationExpressInstallerResumeMatches,
+  bindStationExpressProviderSelection,
+  isValidStationExpressReceiptGeneration,
+  parseStationExpressResumeIntent,
+  reconcileStationExpressInstallerResumeRetirement,
+  type StationExpressResumeIntent,
+} from "../onboard/station-express-resume";
 import { redactSensitiveText, redactUrl } from "../security/redact";
+import { inspectCheckpoint, serializeCheckpoint } from "./onboard-checkpoint";
+import type { OnboardCheckpoint } from "./onboard-checkpoint-types";
 import {
   assignSafeToolDisclosureUpdate,
   normalizeSessionToolDisclosure,
   preserveInvalidSessionToolDisclosure,
   type ToolDisclosure,
 } from "./onboard-session-tool-disclosure";
-import {
-  LEGACY_MACHINE_STEP_MUTATION_OPTIONS,
-  RECORD_ONLY_STEP_MUTATION_OPTIONS,
-  type StepMutationOptions,
-  shouldUpdateMachine,
-} from "./onboard-step-mutation";
 import { nextMachineStateAfterCompletedStep } from "./onboard-step-state";
+import { nemoclawStateRoot } from "./state-root";
 
 export const SESSION_VERSION = 1;
 export const MACHINE_SNAPSHOT_VERSION = 1;
-export const SESSION_DIR = path.join(process.env.HOME || "/tmp", ".nemoclaw");
+export const SESSION_DIR = nemoclawStateRoot(process.env.HOME || "/tmp", GATEWAY_PORT);
 export const SESSION_FILE = path.join(SESSION_DIR, "onboard-session.json");
 export const LOCK_FILE = path.join(SESSION_DIR, "onboard.lock");
 
@@ -75,6 +92,7 @@ export interface SessionFailure {
   step: string | null;
   message: string | null;
   recordedAt: string;
+  interrupted?: boolean;
 }
 
 export interface SessionMetadata {
@@ -82,11 +100,54 @@ export interface SessionMetadata {
   fromDockerfile: string | null;
 }
 
+export type SessionRecoveryReceiptReason =
+  | "failed_terminal_snapshot"
+  | "reopened_complete_snapshot";
+
+/**
+ * Durable, secret-free receipt for a terminal snapshot recovery.
+ *
+ * The receipt remains attached until the next machine snapshot replaces it.
+ * If the process stops after the repaired snapshot is saved but before the
+ * next transition, the next resume retries the same observer-dispatch ID.
+ */
+export interface SessionRecoveryReceipt {
+  id: string;
+  reason: SessionRecoveryReceiptReason;
+  entry: OnboardNonTerminalMachineState;
+  appliedAt: string;
+  revision: number;
+}
+
+export function createSessionRecoveryReceiptId(
+  sessionId: string,
+  revision: number,
+  reason: SessionRecoveryReceiptReason,
+  entry: OnboardNonTerminalMachineState,
+): string {
+  return createHash("sha256")
+    .update(JSON.stringify([sessionId, revision, reason, entry]))
+    .digest("hex");
+}
+
 export interface OnboardMachineSnapshot {
   version: typeof MACHINE_SNAPSHOT_VERSION;
   state: OnboardMachineState;
   stateEnteredAt: string | null;
   revision: number;
+  recoveryReceipt?: SessionRecoveryReceipt;
+}
+
+export interface SandboxPromptProgress {
+  sandboxName: boolean;
+  webSearch: boolean;
+  messaging: boolean;
+  resourceProfile: boolean;
+}
+
+export interface SessionResourceProfile {
+  cpu: string;
+  memory: string;
 }
 
 export interface Session {
@@ -104,15 +165,26 @@ export interface Session {
   sandboxName: string | null;
   provider: string | null;
   model: string | null;
+  /** Exact secret-free serving recipe identity selected before runtime side effects. */
+  servingProfileProvenance: ServingProfileProvenance | null;
+  /** Secret-free installer choices needed to retry an interrupted DGX Station Express run. */
+  stationExpressIntent: StationExpressResumeIntent | null;
+  /** Receipt generation durably awaiting exact-match retirement after Station completion. */
+  stationExpressReceiptRetirement: string | null;
   endpointUrl: string | null;
   credentialEnv: string | null;
   hermesAuthMethod: HermesAuthMethod | null;
   preferredInferenceApi: string | null;
   compatibleEndpointReasoning: string | null;
+  compatibleEndpointReasoningEffort: ReasoningEffort | null;
   nimContainer: string | null;
   routerPid: number | null;
   routerCredentialHash: string | null;
   webSearchConfig: WebSearchConfig | null;
+  /** Completed secret-free choices that can be reused by an interrupted sandbox setup. */
+  sandboxPromptProgress: SandboxPromptProgress;
+  /** The selected sandbox resource values; null is an explicit OpenShell-default choice. */
+  resourceProfile: SessionResourceProfile | null;
   /** Selected preference, retained even when a model-specific safeguard downgrades it. */
   toolDisclosure: ToolDisclosure;
   /** Enables credential-free OTLP trace export to NemoClaw's fixed local collector boundary. */
@@ -122,6 +194,8 @@ export interface Session {
   hermesToolGateways: string[] | null;
   policyPresets: string[] | null;
   messagingPlan: SandboxMessagingPlan | null;
+  /** Non-secret names of credential providers registered before sandbox setup completed. */
+  stagedCredentialProviders: string[];
   // SHA-256 hex digest of every legacy credential value successfully
   // written to the OpenShell gateway during this onboard session, keyed by
   // env-name. Persisted across process restarts so a `--resume` run that
@@ -139,6 +213,7 @@ export interface Session {
   wechatConfig: WechatConfig | null;
   metadata: SessionMetadata;
   machine: OnboardMachineSnapshot;
+  checkpoint: OnboardCheckpoint | null;
   steps: Record<string, StepState>;
 }
 
@@ -180,11 +255,13 @@ export interface SessionUpdates {
   sandboxName?: string | null;
   provider?: string | null;
   model?: string | null;
+  servingProfileProvenance?: ServingProfileProvenance | null;
   endpointUrl?: string | null;
   credentialEnv?: string | null;
   hermesAuthMethod?: HermesAuthMethod | null;
   preferredInferenceApi?: string | null;
   compatibleEndpointReasoning?: string | null;
+  compatibleEndpointReasoningEffort?: ReasoningEffort | null;
   nimContainer?: string | null;
   routerPid?: number;
   routerCredentialHash?: string;
@@ -199,6 +276,8 @@ export interface SessionUpdates {
   telegramConfig?: TelegramConfig | null;
   wechatConfig?: WechatConfig | null;
   metadata?: { gatewayName?: string; fromDockerfile?: string | null };
+  /** Ephemeral vLLM checkpoint proof consumed by Station provider binding; never persisted. */
+  stationExpressModelIdentity?: string;
 }
 
 export interface DebugSessionSummary {
@@ -212,11 +291,13 @@ export interface DebugSessionSummary {
   sandboxName: string | null;
   provider: string | null;
   model: string | null;
+  servingProfileProvenance: ServingProfileProvenance | null;
   endpointUrl: string | null;
   credentialEnv: string | null;
   hermesAuthMethod: HermesAuthMethod | null;
   preferredInferenceApi: string | null;
   compatibleEndpointReasoning: string | null;
+  compatibleEndpointReasoningEffort: ReasoningEffort | null;
   nimContainer: string | null;
   toolDisclosure: ToolDisclosure;
   observabilityEnabled: boolean;
@@ -227,6 +308,7 @@ export interface DebugSessionSummary {
   lastStepStarted: string | null;
   lastCompletedStep: string | null;
   failure: SessionFailure | null;
+  gatewayAuthority: GatewayOwnerDescription | null;
   machine: OnboardMachineSnapshot;
   steps: Record<string, StepState>;
 }
@@ -255,7 +337,7 @@ function defaultSteps(): Record<string, StepState> {
 }
 
 export function isObject(value: unknown): value is UnknownRecord {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  return isObjectRecord(value);
 }
 
 function readString(value: SessionJsonValue | undefined): string | null {
@@ -272,6 +354,15 @@ function readPositiveInteger(value: SessionJsonValue | undefined): number | null
 
 function readNonNegativeInteger(value: SessionJsonValue | undefined): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function readCanonicalIsoTimestamp(value: SessionJsonValue | undefined): string | null {
+  if (typeof value !== "string") return null;
+  try {
+    return new Date(value).toISOString() === value ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 function readStringArray(value: SessionJsonValue | undefined): string[] | null {
@@ -300,6 +391,63 @@ function readStepStatus(value: SessionJsonValue | undefined): StepStatus | null 
 function parseWebSearchConfig(value: SessionJsonValue | undefined): WebSearchConfig | null {
   if (!isObject(value) || value.fetchEnabled !== true) return null;
   return normalizeWebSearchConfig(value as Partial<WebSearchConfig>);
+}
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function isValidCheckpointedSandboxName(value: unknown): boolean {
+  return (
+    typeof value === "string" && value.length <= NAME_MAX_LENGTH && NAME_VALID_PATTERN.test(value)
+  );
+}
+
+function isValidNullableWebSearchChoice(value: unknown): boolean {
+  return value === null || parseWebSearchConfig(value as SessionJsonValue | undefined) !== null;
+}
+
+function isValidNullableMessagingChoice(value: unknown, sandboxName: unknown): boolean {
+  return (
+    value === null ||
+    (typeof sandboxName === "string" && parseSandboxMessagingPlan(value, { sandboxName }) !== null)
+  );
+}
+
+function isValidNullableResourceChoice(value: unknown): boolean {
+  return value === null || parseSessionResourceProfile(value) !== null;
+}
+
+function parseSandboxPromptProgress(
+  value: unknown,
+  choices: Record<string, unknown>,
+): SandboxPromptProgress {
+  const progress = isObject(value) ? value : {};
+  return {
+    sandboxName:
+      progress.sandboxName === true &&
+      hasOwn(choices, "sandboxName") &&
+      isValidCheckpointedSandboxName(choices.sandboxName),
+    webSearch:
+      progress.webSearch === true &&
+      hasOwn(choices, "webSearchConfig") &&
+      isValidNullableWebSearchChoice(choices.webSearchConfig),
+    messaging:
+      progress.messaging === true &&
+      hasOwn(choices, "messagingPlan") &&
+      isValidNullableMessagingChoice(choices.messagingPlan, choices.sandboxName),
+    resourceProfile:
+      progress.resourceProfile === true &&
+      hasOwn(choices, "resourceProfile") &&
+      isValidNullableResourceChoice(choices.resourceProfile),
+  };
+}
+
+function parseSessionResourceProfile(value: unknown): SessionResourceProfile | null {
+  if (!isObject(value)) return null;
+  const cpu = readString(value.cpu);
+  const memory = readString(value.memory);
+  return cpu !== null && memory !== null ? { cpu, memory } : null;
 }
 
 function parseTelegramConfig(value: unknown): TelegramConfig | null {
@@ -341,15 +489,63 @@ function parseStepState(value: SessionJsonValue | undefined): StepState | null {
   };
 }
 
-function parseMachineSnapshot(value: SessionJsonValue | undefined): OnboardMachineSnapshot | null {
+function parseSessionRecoveryReceipt(
+  value: SessionJsonValue | undefined,
+  snapshotState: OnboardMachineState,
+  snapshotStateEnteredAt: string | null,
+  snapshotRevision: number,
+  sessionId: string,
+): SessionRecoveryReceipt | null {
+  if (!isObject(value)) return null;
+  const id = readString(value.id);
+  const reason = readString(value.reason);
+  const entry = readString(value.entry);
+  const appliedAt = readCanonicalIsoTimestamp(value.appliedAt);
+  const revision = readNonNegativeInteger(value.revision);
+  if (!id || !/^[a-f0-9]{64}$/.test(id)) return null;
+  if (reason !== "failed_terminal_snapshot" && reason !== "reopened_complete_snapshot") {
+    return null;
+  }
+  if (!entry || !isOnboardMachineState(entry) || isTerminalOnboardMachineState(entry)) return null;
+  if (
+    entry !== snapshotState ||
+    !appliedAt ||
+    appliedAt !== snapshotStateEnteredAt ||
+    revision !== snapshotRevision ||
+    id !== createSessionRecoveryReceiptId(sessionId, revision, reason, entry)
+  ) {
+    return null;
+  }
+  return { id, reason, entry, appliedAt, revision };
+}
+
+function parseMachineSnapshot(
+  value: SessionJsonValue | undefined,
+  sessionId: string,
+): OnboardMachineSnapshot | null {
   if (!isObject(value) || value.version !== MACHINE_SNAPSHOT_VERSION) return null;
   if (!isOnboardMachineState(value.state)) return null;
+  const stateEnteredAt = readString(value.stateEnteredAt);
+  const revision = readNonNegativeInteger(value.revision) ?? 0;
+  const recoveryReceipt = parseSessionRecoveryReceipt(
+    value.recoveryReceipt,
+    value.state,
+    stateEnteredAt,
+    revision,
+    sessionId,
+  );
   return {
     version: MACHINE_SNAPSHOT_VERSION,
     state: value.state,
-    stateEnteredAt: readString(value.stateEnteredAt),
-    revision: readNonNegativeInteger(value.revision) ?? 0,
+    stateEnteredAt,
+    revision,
+    ...(recoveryReceipt ? { recoveryReceipt } : {}),
   };
+}
+
+function parseStoredCheckpoint(value: unknown): OnboardCheckpoint | null {
+  const inspected = inspectCheckpoint(value);
+  return inspected.status === "loaded" ? inspected.checkpoint : null;
 }
 
 function parseLockInfo(value: SessionJsonValue | undefined): LockInfo | null {
@@ -366,7 +562,12 @@ export { redactSensitiveText, redactUrl };
 
 export function sanitizeFailure(
   input:
-    | { step?: SessionJsonValue; message?: SessionJsonValue; recordedAt?: SessionJsonValue }
+    | {
+        step?: SessionJsonValue;
+        message?: SessionJsonValue;
+        recordedAt?: SessionJsonValue;
+        interrupted?: SessionJsonValue;
+      }
     | null
     | undefined,
 ): SessionFailure | null {
@@ -374,7 +575,8 @@ export function sanitizeFailure(
   const step = readString(input.step);
   const message = redactSensitiveText(input.message);
   const recordedAt = readString(input.recordedAt) ?? new Date().toISOString();
-  return step || message ? { step, message, recordedAt } : null;
+  const interrupted = input.interrupted === true;
+  return step || message ? { step, message, recordedAt, interrupted } : null;
 }
 
 // ── Session CRUD ─────────────────────────────────────────────────
@@ -447,13 +649,14 @@ function transitionMachineSnapshot(
 export function createSession(overrides: Partial<Session> = {}): Session {
   const now = new Date().toISOString();
   const startedAt = overrides.startedAt ?? now;
+  const sessionId = overrides.sessionId ?? `${Date.now()}-${randomUUID()}`;
   const steps = {
     ...defaultSteps(),
     ...(overrides.steps ?? {}),
   };
   const session: Session = {
     version: SESSION_VERSION,
-    sessionId: overrides.sessionId ?? `${Date.now()}-${randomUUID()}`,
+    sessionId,
     resumable: true,
     status: "in_progress",
     mode: overrides.mode ?? "interactive",
@@ -466,21 +669,37 @@ export function createSession(overrides: Partial<Session> = {}): Session {
     sandboxName: overrides.sandboxName ?? null,
     provider: overrides.provider ?? null,
     model: overrides.model ?? null,
+    servingProfileProvenance: parseServingProfileProvenance(overrides.servingProfileProvenance),
+    stationExpressIntent: parseStationExpressResumeIntent(overrides.stationExpressIntent),
+    stationExpressReceiptRetirement: isValidStationExpressReceiptGeneration(
+      overrides.stationExpressReceiptRetirement,
+    )
+      ? overrides.stationExpressReceiptRetirement
+      : null,
     endpointUrl: overrides.endpointUrl ?? null,
     credentialEnv: overrides.credentialEnv ?? null,
     hermesAuthMethod: overrides.hermesAuthMethod ?? null,
     preferredInferenceApi: overrides.preferredInferenceApi ?? null,
     compatibleEndpointReasoning: overrides.compatibleEndpointReasoning ?? null,
+    compatibleEndpointReasoningEffort: normalizeReasoningEffort(
+      overrides.compatibleEndpointReasoningEffort,
+    ),
     nimContainer: overrides.nimContainer ?? null,
     routerPid: readPositiveInteger(overrides.routerPid),
     routerCredentialHash: overrides.routerCredentialHash ?? null,
     webSearchConfig: normalizeWebSearchConfig(overrides.webSearchConfig),
+    sandboxPromptProgress: parseSandboxPromptProgress(
+      overrides.sandboxPromptProgress,
+      overrides as Record<string, unknown>,
+    ),
+    resourceProfile: parseSessionResourceProfile(overrides.resourceProfile),
     toolDisclosure: normalizeSessionToolDisclosure(overrides.toolDisclosure),
     observabilityEnabled: overrides.observabilityEnabled === true,
     observabilityRequestedExplicitly: overrides.observabilityRequestedExplicitly === true,
     hermesToolGateways: readStringArray(overrides.hermesToolGateways),
     policyPresets: readStringArray(overrides.policyPresets),
     messagingPlan: parseSandboxMessagingPlan(overrides.messagingPlan),
+    stagedCredentialProviders: readStringArray(overrides.stagedCredentialProviders) ?? [],
     migratedLegacyValueHashes: overrides.migratedLegacyValueHashes
       ? readStringRecord(overrides.migratedLegacyValueHashes)
       : null,
@@ -492,8 +711,9 @@ export function createSession(overrides: Partial<Session> = {}): Session {
       fromDockerfile: overrides.metadata?.fromDockerfile ?? null,
     },
     machine:
-      parseMachineSnapshot(overrides.machine as SessionJsonValue | undefined) ??
+      parseMachineSnapshot(overrides.machine as SessionJsonValue | undefined, sessionId) ??
       createMachineSnapshot("init", startedAt),
+    checkpoint: parseStoredCheckpoint(overrides.checkpoint),
     steps,
   };
   preserveInvalidSessionToolDisclosure(overrides, session);
@@ -502,6 +722,43 @@ export function createSession(overrides: Partial<Session> = {}): Session {
 
 export function normalizeSession(data: Session | SessionJsonValue | undefined): Session | null {
   if (!isObject(data) || data.version !== SESSION_VERSION) return null;
+  const servingProfileProvenance = parseServingProfileProvenance(data.servingProfileProvenance);
+  if (
+    hasOwn(data, "servingProfileProvenance") &&
+    data.servingProfileProvenance !== null &&
+    !servingProfileProvenance
+  ) {
+    return null;
+  }
+  const compatibleEndpointReasoningEffort = normalizeReasoningEffort(
+    data.compatibleEndpointReasoningEffort,
+  );
+  if (
+    hasOwn(data, "compatibleEndpointReasoningEffort") &&
+    data.compatibleEndpointReasoningEffort !== null &&
+    !compatibleEndpointReasoningEffort
+  ) {
+    return null;
+  }
+  const stationExpressIntent = parseStationExpressResumeIntent(data.stationExpressIntent);
+  if (
+    hasOwn(data, "stationExpressIntent") &&
+    data.stationExpressIntent !== null &&
+    !stationExpressIntent
+  )
+    return null;
+  const stationExpressReceiptRetirement = isValidStationExpressReceiptGeneration(
+    data.stationExpressReceiptRetirement,
+  )
+    ? data.stationExpressReceiptRetirement
+    : null;
+  if (
+    hasOwn(data, "stationExpressReceiptRetirement") &&
+    data.stationExpressReceiptRetirement !== null &&
+    !stationExpressReceiptRetirement
+  ) {
+    return null;
+  }
 
   const normalized = createSession({
     sessionId: readString(data.sessionId) ?? undefined,
@@ -512,21 +769,28 @@ export function normalizeSession(data: Session | SessionJsonValue | undefined): 
     sandboxName: readString(data.sandboxName),
     provider: readString(data.provider),
     model: readString(data.model),
+    servingProfileProvenance,
+    stationExpressIntent,
+    stationExpressReceiptRetirement,
     endpointUrl: typeof data.endpointUrl === "string" ? redactUrl(data.endpointUrl) : null,
     credentialEnv: readString(data.credentialEnv),
     hermesAuthMethod: readHermesAuthMethod(data.hermesAuthMethod),
     preferredInferenceApi: readString(data.preferredInferenceApi),
     compatibleEndpointReasoning: readString(data.compatibleEndpointReasoning),
+    compatibleEndpointReasoningEffort,
     nimContainer: readString(data.nimContainer),
     routerPid: readPositiveInteger(data.routerPid),
     routerCredentialHash: readString(data.routerCredentialHash),
     webSearchConfig: parseWebSearchConfig(data.webSearchConfig),
+    sandboxPromptProgress: parseSandboxPromptProgress(data.sandboxPromptProgress, data),
+    resourceProfile: parseSessionResourceProfile(data.resourceProfile),
     toolDisclosure: normalizeSessionToolDisclosure(data.toolDisclosure),
     observabilityEnabled: data.observabilityEnabled === true,
     observabilityRequestedExplicitly: data.observabilityRequestedExplicitly === true,
     hermesToolGateways: readStringArray(data.hermesToolGateways),
     policyPresets: readStringArray(data.policyPresets),
     messagingPlan: parseSandboxMessagingPlan(data.messagingPlan),
+    stagedCredentialProviders: readStringArray(data.stagedCredentialProviders) ?? [],
     migratedLegacyValueHashes: readStringRecord(data.migratedLegacyValueHashes),
     gpuPassthrough: data.gpuPassthrough === true,
     telegramConfig: parseTelegramConfig(data.telegramConfig),
@@ -535,9 +799,26 @@ export function normalizeSession(data: Session | SessionJsonValue | undefined): 
     lastCompletedStep: readString(data.lastCompletedStep),
     failure: sanitizeFailure(isObject(data.failure) ? data.failure : null),
     metadata: parseSessionMetadata(data.metadata),
+    checkpoint: data.checkpoint as unknown as OnboardCheckpoint | null,
   });
   normalized.resumable = data.resumable !== false;
   normalized.status = readString(data.status) ?? normalized.status;
+  if (
+    normalized.stationExpressIntent &&
+    (data.resumable !== true ||
+      normalized.mode !== "non-interactive" ||
+      (data.status !== "in_progress" && data.status !== "failed"))
+  ) {
+    return null;
+  }
+  if (
+    normalized.stationExpressReceiptRetirement &&
+    (normalized.status !== "complete" ||
+      normalized.resumable !== false ||
+      normalized.stationExpressIntent !== null)
+  ) {
+    return null;
+  }
 
   if (isObject(data.steps)) {
     for (const [name, step] of Object.entries(data.steps)) {
@@ -548,7 +829,26 @@ export function normalizeSession(data: Session | SessionJsonValue | undefined): 
     }
   }
 
-  normalized.machine = parseMachineSnapshot(data.machine) ?? inferMachineSnapshot(normalized);
+  if (normalized.stationExpressIntent) {
+    const intent = normalized.stationExpressIntent;
+    const providerComplete = normalized.steps.provider_selection?.status === "complete";
+    const providerBound = Boolean(
+      intent.kind !== "spark" && intent.servedModel && intent.checkpointModel,
+    );
+    if (
+      providerComplete !== providerBound ||
+      (providerComplete &&
+        (intent.kind === "spark" ||
+          normalized.provider !== "vllm-local" ||
+          normalized.model !== intent.servedModel)) ||
+      (!providerComplete && (normalized.provider !== null || normalized.model !== null))
+    ) {
+      return null;
+    }
+  }
+
+  normalized.machine =
+    parseMachineSnapshot(data.machine, normalized.sessionId) ?? inferMachineSnapshot(normalized);
   preserveInvalidSessionToolDisclosure(data, normalized);
 
   return normalized;
@@ -572,6 +872,7 @@ function serializeSessionForDisk(session: Session): Record<string, unknown> {
     messagingPlan: session.messagingPlan
       ? compactSandboxMessagingPlanForPersistence(session.messagingPlan)
       : session.messagingPlan,
+    checkpoint: session.checkpoint ? serializeCheckpoint(session.checkpoint) : null,
   };
 }
 
@@ -993,6 +1294,14 @@ export function filterSafeUpdates(updates: SessionUpdates): Partial<Session> {
   assignNullableString(safe, "sandboxName", updates.sandboxName);
   assignNullableString(safe, "provider", updates.provider);
   assignNullableString(safe, "model", updates.model);
+  if (updates.servingProfileProvenance === null) {
+    safe.servingProfileProvenance = null;
+  } else {
+    const servingProfileProvenance = parseServingProfileProvenance(
+      updates.servingProfileProvenance,
+    );
+    if (servingProfileProvenance) safe.servingProfileProvenance = servingProfileProvenance;
+  }
   assignNullableString(safe, "endpointUrl", updates.endpointUrl, redactUrl);
   assignNullableString(safe, "credentialEnv", updates.credentialEnv);
   if (updates.hermesAuthMethod === "oauth" || updates.hermesAuthMethod === "api_key") {
@@ -1002,6 +1311,16 @@ export function filterSafeUpdates(updates: SessionUpdates): Partial<Session> {
   }
   assignNullableString(safe, "preferredInferenceApi", updates.preferredInferenceApi);
   assignNullableString(safe, "compatibleEndpointReasoning", updates.compatibleEndpointReasoning);
+  if (updates.compatibleEndpointReasoningEffort === null) {
+    safe.compatibleEndpointReasoningEffort = null;
+  } else {
+    const compatibleEndpointReasoningEffort = normalizeReasoningEffort(
+      updates.compatibleEndpointReasoningEffort,
+    );
+    if (compatibleEndpointReasoningEffort) {
+      safe.compatibleEndpointReasoningEffort = compatibleEndpointReasoningEffort;
+    }
+  }
   assignNullableString(safe, "nimContainer", updates.nimContainer);
   if (
     typeof updates.routerPid === "number" &&
@@ -1084,11 +1403,7 @@ export function updateSession(mutator: (session: Session) => Session | void): Se
   return saveSession(next);
 }
 
-function markStepStartedWithOptions(
-  stepName: string,
-  options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
-): Session {
-  let shouldEmit = false;
+export function markStepStarted(stepName: string): Session {
   const updatedSession = updateSession((session) => {
     const step = session.steps[stepName];
     if (!step) return session;
@@ -1100,30 +1415,30 @@ function markStepStartedWithOptions(
     session.lastStepStarted = stepName;
     session.failure = null;
     session.status = "in_progress";
-    const state = machineStateFromOnboardSessionStep(stepName);
-    shouldEmit = Boolean(state && shouldUpdateMachine(options));
-    if (state && shouldEmit) transitionMachineSnapshot(session, state, now);
     return session;
   });
-  if (shouldEmit) {
-    emitOnboardMachineEvent(
-      createOnboardMachineEvent({ type: "state.entered", session: updatedSession, step: stepName }),
-    );
-  }
   return updatedSession;
 }
 
-function markStepCompleteWithOptions(
-  stepName: string,
-  updates: SessionUpdates = {},
-  options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
-): Session {
+export function markStepComplete(stepName: string, updates: SessionUpdates = {}): Session {
   const safeUpdates = filterSafeUpdates(updates);
-  const hasUpdates = Object.keys(safeUpdates).length > 0;
-  let shouldEmit = false;
-  const updatedSession = updateSession((session) => {
+  return updateSession((session) => {
     const step = session.steps[stepName];
     if (!step) return session;
+    // Spark managed-vLLM Express intents (#7231) carry no receipt/served state
+    // and exist only to re-arm the install on resume, so clear them once
+    // provider selection completes instead of binding a Station selection.
+    const sparkExpressComplete =
+      stepName === "provider_selection" && session.stationExpressIntent?.kind === "spark";
+    const stationExpressIntent =
+      stepName === "provider_selection" && session.stationExpressIntent && !sparkExpressComplete
+        ? bindStationExpressProviderSelection(
+            session.stationExpressIntent,
+            safeUpdates.provider,
+            safeUpdates.model,
+            updates.stationExpressModelIdentity,
+          )
+        : null;
     const now = new Date().toISOString();
     step.status = "complete";
     step.completedAt = now;
@@ -1131,62 +1446,14 @@ function markStepCompleteWithOptions(
     session.lastCompletedStep = stepName;
     session.failure = null;
     Object.assign(session, safeUpdates);
-    const nextState = nextMachineStateAfterCompletedStep(stepName, session);
-    shouldEmit = Boolean(nextState && shouldUpdateMachine(options));
-    if (nextState && shouldEmit) transitionMachineSnapshot(session, nextState, now);
+    if (stationExpressIntent) session.stationExpressIntent = stationExpressIntent;
+    else if (sparkExpressComplete) session.stationExpressIntent = null;
     return session;
   });
-  if (hasUpdates) {
-    emitOnboardMachineEvent(
-      createOnboardMachineEvent({
-        type: "context.updated",
-        session: updatedSession,
-        step: stepName,
-        metadata: { fields: Object.keys(safeUpdates) },
-      }),
-    );
-  }
-  if (shouldEmit) {
-    emitOnboardMachineEvent(
-      createOnboardMachineEvent({
-        type: "state.completed",
-        session: updatedSession,
-        step: stepName,
-      }),
-    );
-  }
-  return updatedSession;
-}
-
-export function markStepStarted(
-  stepName: string,
-  options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
-): Session {
-  return markStepStartedWithOptions(stepName, options);
-}
-
-export function markStepStartedRecordOnly(stepName: string): Session {
-  return markStepStartedWithOptions(stepName, RECORD_ONLY_STEP_MUTATION_OPTIONS);
-}
-
-export function markStepComplete(
-  stepName: string,
-  updates: SessionUpdates = {},
-  options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
-): Session {
-  return markStepCompleteWithOptions(stepName, updates, options);
-}
-
-export function markStepCompleteRecordOnly(
-  stepName: string,
-  updates: SessionUpdates = {},
-): Session {
-  return markStepCompleteWithOptions(stepName, updates, RECORD_ONLY_STEP_MUTATION_OPTIONS);
 }
 
 export function markStepSkipped(stepName: string): Session {
-  let shouldEmit = false;
-  const updatedSession = updateSession((session) => {
+  return updateSession((session) => {
     const step = session.steps[stepName];
     if (!step) return session;
     if (step.status === "complete" || step.status === "failed" || step.status === "skipped")
@@ -1195,39 +1462,65 @@ export function markStepSkipped(stepName: string): Session {
     step.startedAt = null;
     step.completedAt = null;
     step.error = null;
-    shouldEmit = true;
     return session;
   });
-  if (shouldEmit) {
-    emitOnboardMachineEvent(
-      createOnboardMachineEvent({ type: "state.skipped", session: updatedSession, step: stepName }),
-    );
-  }
-  return updatedSession;
 }
 
-function markStepFailedWithOptions(
-  stepName: string,
-  message: string | null = null,
-  options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
-): Session {
-  let shouldEmit = false;
-  const updatedSession = updateSession((session) => {
+export function markStepFailed(stepName: string, message: string | null = null): Session {
+  return updateSession((session) => {
     const step = session.steps[stepName];
     if (!step) return session;
-    const now = new Date().toISOString();
     step.status = "failed";
     step.completedAt = null;
     step.error = redactSensitiveText(message);
-    shouldEmit = shouldUpdateMachine(options);
-    if (shouldEmit) {
-      session.failure = sanitizeFailure({ step: stepName, message, recordedAt: now });
-      session.status = "failed";
-      transitionMachineSnapshot(session, "failed", now);
-    }
     return session;
   });
-  if (shouldEmit) {
+}
+
+/**
+ * Single synchronous terminal-failure owner for process-exit / backstop paths.
+ *
+ * Records exactly one failed transition and one terminal event pair for an
+ * interrupted step, replacing the legacy step-mutation escape hatch on the
+ * process-exit path. It is idempotent by construction: if the durable machine
+ * is already terminal (an in-band failure or a prior backstop already recorded
+ * the terminal event pair) it no-ops rather than recording a second failure, so the
+ * failed transition is validated and never doubled. Performs no
+ * sandbox/provider/policy effects.
+ */
+export function finalizeIncompleteOnboardStep(
+  stepName: string,
+  message: string | null = null,
+  interrupted = false,
+): Session | null {
+  const existing = loadSession();
+  if (!existing) return null;
+  if (isTerminalOnboardMachineState(existing.machine.state)) return existing;
+
+  let emitted = false;
+  const updatedSession = updateSession((session) => {
+    const step = session.steps[stepName];
+    if (!step) return session;
+    if (isTerminalOnboardMachineState(session.machine.state)) return session;
+    const now = new Date().toISOString();
+    // Guard the terminality invariant: only a legal <non-terminal> -> failed
+    // transition may be recorded here.
+    assertValidOnboardMachineTransition(session.machine.state, "failed");
+    step.status = "failed";
+    step.completedAt = null;
+    step.error = redactSensitiveText(message);
+    session.failure = sanitizeFailure({
+      step: stepName,
+      message,
+      recordedAt: now,
+      interrupted,
+    });
+    session.status = "failed";
+    transitionMachineSnapshot(session, "failed", now);
+    emitted = true;
+    return session;
+  });
+  if (emitted) {
     emitOnboardMachineEvent(
       createOnboardMachineEvent({
         type: "state.failed",
@@ -1249,32 +1542,41 @@ function markStepFailedWithOptions(
   return updatedSession;
 }
 
-export function markStepFailed(
-  stepName: string,
-  message: string | null = null,
-  options: StepMutationOptions = RECORD_ONLY_STEP_MUTATION_OPTIONS,
+export interface CompleteSessionOptions {
+  emitEvents?: boolean;
+}
+
+export function completeSession(
+  updates: SessionUpdates = {},
+  options: CompleteSessionOptions = {},
 ): Session {
-  return markStepFailedWithOptions(stepName, message, options);
-}
-
-export function markStepFailedRecordOnly(stepName: string, message: string | null = null): Session {
-  return markStepFailedWithOptions(stepName, message, RECORD_ONLY_STEP_MUTATION_OPTIONS);
-}
-
-export function completeSession(updates: SessionUpdates = {}): Session {
   const safeUpdates = filterSafeUpdates(updates);
   let wasComplete = false;
-  const updatedSession = updateSession((session) => {
+  let receiptGeneration: string | null = null;
+  let updatedSession = updateSession((session) => {
+    const intentReceiptGeneration =
+      session.stationExpressIntent?.kind === "spark"
+        ? null
+        : (session.stationExpressIntent?.receiptGeneration ?? null);
+    receiptGeneration = session.stationExpressReceiptRetirement ?? intentReceiptGeneration;
+    if (intentReceiptGeneration) {
+      assertStationExpressInstallerResumeMatches(intentReceiptGeneration);
+    }
     const now = new Date().toISOString();
     wasComplete = session.status === "complete";
     Object.assign(session, safeUpdates);
     session.status = "complete";
     session.resumable = false;
+    session.stationExpressIntent = null;
+    session.stationExpressReceiptRetirement = receiptGeneration;
     session.failure = null;
     transitionMachineSnapshot(session, "complete", now);
     return session;
   });
-  if (Object.keys(safeUpdates).length > 0) {
+  if (receiptGeneration) {
+    updatedSession = reconcileStationExpressReceiptRetirement(receiptGeneration);
+  }
+  if (options.emitEvents !== false && Object.keys(safeUpdates).length > 0) {
     emitOnboardMachineEvent(
       createOnboardMachineEvent({
         type: "context.updated",
@@ -1284,7 +1586,7 @@ export function completeSession(updates: SessionUpdates = {}): Session {
       }),
     );
   }
-  if (!wasComplete) {
+  if (options.emitEvents !== false && !wasComplete) {
     emitOnboardMachineEvent(
       createOnboardMachineEvent({
         type: "onboard.completed",
@@ -1296,10 +1598,56 @@ export function completeSession(updates: SessionUpdates = {}): Session {
   return updatedSession;
 }
 
+function assertStationExpressReceiptRetirementSession(
+  session: Session | null,
+  expectedGeneration: string,
+): asserts session is Session {
+  if (
+    !session ||
+    session.stationExpressReceiptRetirement !== expectedGeneration ||
+    session.status !== "complete" ||
+    session.resumable !== false ||
+    session.stationExpressIntent !== null
+  ) {
+    throw new Error("DGX Station Express receipt retirement state does not match this attempt.");
+  }
+}
+
+export function reconcileStationExpressReceiptRetirement(expectedGeneration: string): Session {
+  if (!isValidStationExpressReceiptGeneration(expectedGeneration)) {
+    throw new Error("DGX Station Express receipt generation is invalid.");
+  }
+  const ownsOnboardLock = heldLockFd === null;
+  if (ownsOnboardLock) {
+    const lock = acquireOnboardLock("nemoclaw onboard (Station receipt retirement recovery)");
+    if (!lock.acquired) {
+      throw new Error(
+        "Cannot reconcile DGX Station Express receipt retirement while another onboarding run is in progress.",
+      );
+    }
+  }
+  try {
+    assertStationExpressReceiptRetirementSession(loadSession(), expectedGeneration);
+    return reconcileStationExpressInstallerResumeRetirement(expectedGeneration, () =>
+      updateSession((session) => {
+        assertStationExpressReceiptRetirementSession(session, expectedGeneration);
+        session.stationExpressReceiptRetirement = null;
+        return session;
+      }),
+    );
+  } finally {
+    if (ownsOnboardLock) releaseOnboardLock();
+  }
+}
+
 export function summarizeForDebug(
   session: Session | null = loadSession(),
 ): DebugSessionSummary | null {
   if (!session) return null;
+  const gatewayAuthority =
+    session.checkpoint?.gatewayAuthority.kind === "selected"
+      ? describeGatewayOwner(session.checkpoint.gatewayAuthority.value)
+      : null;
   return {
     version: session.version,
     sessionId: session.sessionId,
@@ -1311,11 +1659,13 @@ export function summarizeForDebug(
     sandboxName: session.sandboxName,
     provider: session.provider,
     model: session.model,
+    servingProfileProvenance: session.servingProfileProvenance,
     endpointUrl: redactUrl(session.endpointUrl),
     credentialEnv: session.credentialEnv,
     hermesAuthMethod: session.hermesAuthMethod,
     preferredInferenceApi: session.preferredInferenceApi,
     compatibleEndpointReasoning: session.compatibleEndpointReasoning,
+    compatibleEndpointReasoningEffort: session.compatibleEndpointReasoningEffort,
     nimContainer: session.nimContainer,
     toolDisclosure: session.toolDisclosure,
     observabilityEnabled: session.observabilityEnabled,
@@ -1326,6 +1676,7 @@ export function summarizeForDebug(
     lastStepStarted: session.lastStepStarted,
     lastCompletedStep: session.lastCompletedStep,
     failure: sanitizeFailure(session.failure),
+    gatewayAuthority,
     machine: session.machine,
     steps: Object.fromEntries(
       Object.entries(session.steps).map(([name, step]) => [

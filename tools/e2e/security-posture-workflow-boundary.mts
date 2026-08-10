@@ -59,9 +59,6 @@ export function validateSecurityPostureWorkflow(workflow: WorkflowRecord): strin
   if (job.needs !== "generate-matrix") {
     errors.push(`${JOB_NAME} must depend on generate-matrix`);
   }
-  if (job["runs-on"] !== "ubuntu-latest") {
-    errors.push(`${JOB_NAME} must run on ubuntu-latest`);
-  }
   if (job["timeout-minutes"] !== 75) {
     errors.push(`${JOB_NAME} must retain its 75 minute two-agent budget`);
   }
@@ -76,12 +73,12 @@ export function validateSecurityPostureWorkflow(workflow: WorkflowRecord): strin
   const expectedMatrix = [
     {
       agent: "openclaw",
-      sandbox_name: "e2e-openclaw-security-posture",
+      sandbox_name: "e2e-oc-security",
       test_file: "test/e2e/live/full-e2e.test.ts",
     },
     {
       agent: "hermes",
-      sandbox_name: "e2e-hermes-security-posture",
+      sandbox_name: "e2e-hm-security",
       test_file: "test/e2e/live/hermes-e2e.test.ts",
     },
   ];
@@ -98,6 +95,7 @@ export function validateSecurityPostureWorkflow(workflow: WorkflowRecord): strin
     NEMOCLAW_AGENT: "${{ matrix.agent }}",
     NEMOCLAW_CLI_BIN: "${{ github.workspace }}/bin/nemoclaw.js",
     NEMOCLAW_E2E_EXPECT_NON_ROOT_HOST: "1",
+    NEMOCLAW_E2E_EXPECT_OPENSHELL_SPLIT_PROCESS: "1",
     NEMOCLAW_E2E_SECURITY_POSTURE: "1",
     NEMOCLAW_E2E_USE_HOSTED_INFERENCE: "1",
     NEMOCLAW_NON_INTERACTIVE: "1",
@@ -109,6 +107,9 @@ export function validateSecurityPostureWorkflow(workflow: WorkflowRecord): strin
   };
   for (const [name, value] of Object.entries(expectedEnv)) {
     if (jobEnv[name] !== value) errors.push(`${JOB_NAME} must set ${name}=${value}`);
+  }
+  if (Object.hasOwn(jobEnv, "NEMOCLAW_E2E_EXPECT_NON_ROOT_ENTRYPOINT")) {
+    errors.push(`${JOB_NAME} must not set retired NEMOCLAW_E2E_EXPECT_NON_ROOT_ENTRYPOINT`);
   }
   if (Object.hasOwn(jobEnv, "NVIDIA_INFERENCE_API_KEY")) {
     errors.push(`${JOB_NAME} must not expose the inference key at job scope`);
@@ -149,8 +150,8 @@ export function validateSecurityPostureWorkflow(workflow: WorkflowRecord): strin
       errors.push(`${JOB_NAME} exposes the inference key outside the live test step`);
     }
   }
-  requireRunContains(errors, run, "npx vitest run --project e2e-live");
-  requireRunContains(errors, run, '"${{ matrix.test_file }}"');
+  requireRunContains(errors, run, "tools/e2e/live-vitest-invocation.mts run");
+  requireRunContains(errors, run, '--test-path "${{ matrix.test_file }}"');
 
   return errors;
 }

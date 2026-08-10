@@ -6,6 +6,10 @@ import * as webSearch from "../inference/web-search";
 import { listMessagingCredentialMetadata } from "../messaging/channels";
 import { type ChannelDef, getChannelTokenKeys } from "../sandbox/channels";
 import * as braveProviderProfile from "./brave-provider-profile";
+import {
+  bridgeProviderNamesForChannel,
+  collectMessagingBridgeTokenDefs,
+} from "./messaging-bridge-provider";
 
 export type NamedMessagingChannel = { name: string } & ChannelDef;
 
@@ -19,6 +23,7 @@ export interface MessagingTokenDef {
 export interface CreateSandboxMessagingPrepInput {
   sandboxName: string;
   agentName?: string | null;
+  requireExactProviderBinding?: boolean;
   channels: readonly NamedMessagingChannel[];
   enabledChannels: readonly string[] | null;
   disabledChannels: readonly string[];
@@ -36,6 +41,7 @@ export interface CreateSandboxMessagingPrepInput {
   ): string[];
   getMessagingChannelForEnvKey(envKey: string): string | null;
   providerExistsInGateway(name: string): boolean;
+  providerMatchesGatewayCredential(name: string, type: string, credentialEnv: string): boolean;
 }
 
 export interface CreateSandboxMessagingPrepResult {
@@ -51,6 +57,9 @@ export interface CreateSandboxMessagingPrepResult {
 export function prepareCreateSandboxMessaging(
   input: CreateSandboxMessagingPrepInput,
 ): CreateSandboxMessagingPrepResult {
+  const requiresExactOpenClawProviderBinding =
+    input.requireExactProviderBinding === true &&
+    (!input.agentName || input.agentName.trim().toLowerCase() === "openclaw");
   const enabledEnvKeys =
     input.enabledChannels != null
       ? new Set(
@@ -79,12 +88,29 @@ export function prepareCreateSandboxMessaging(
   const webSearchEnabled = braveProviderProfile.shouldEnableWebSearch(input.webSearchConfig);
   const webSearchProvider = webSearch.webSearchProviderForConfig(input.webSearchConfig);
   const webSearchCredentialEnv = webSearch.webSearchEnvFor(webSearchProvider);
+  const webSearchProviderType =
+    webSearchProvider === "tavily" && input.agentName?.trim().toLowerCase() === "hermes"
+      ? braveProviderProfile.HERMES_TAVILY_PROVIDER_PROFILE_ID
+      : webSearchProvider;
+  const webSearchProviderName = `${input.sandboxName}-${webSearchProvider}-search`;
   const webSearchApiKey = webSearchEnabled
     ? input.getCredential(webSearchCredentialEnv) ||
-      input.normalizeCredentialValue(input.env[webSearchCredentialEnv])
+      input.normalizeCredentialValue(input.env[webSearchCredentialEnv]) ||
+      null
     : null;
+  const reusableWebSearchProvider =
+    requiresExactOpenClawProviderBinding &&
+    webSearchEnabled &&
+    !webSearchApiKey &&
+    input.providerMatchesGatewayCredential(
+      webSearchProviderName,
+      webSearchProviderType,
+      webSearchCredentialEnv,
+    );
   const missingWebSearchCredentialEnv =
-    webSearchEnabled && !webSearchApiKey ? webSearchCredentialEnv : null;
+    webSearchEnabled && !webSearchApiKey && !reusableWebSearchProvider
+      ? webSearchCredentialEnv
+      : null;
   if (missingWebSearchCredentialEnv) {
     return {
       disabledChannelNames,
@@ -98,24 +124,39 @@ export function prepareCreateSandboxMessaging(
   }
 
   if (webSearchEnabled) {
-    const providerType =
-      webSearchProvider === "tavily" && input.agentName?.trim().toLowerCase() === "hermes"
-        ? braveProviderProfile.HERMES_TAVILY_PROVIDER_PROFILE_ID
-        : webSearchProvider;
     messagingTokenDefs.push({
-      name: `${input.sandboxName}-${webSearchProvider}-search`,
+      name: webSearchProviderName,
       envKey: webSearchCredentialEnv,
       token: webSearchApiKey,
-      providerType,
+      providerType: webSearchProviderType,
     });
   }
+
+  // Messaging bridge providers: any channel that mints its outbound token
+  // gateway-side (declared by a co-located provider-profile YAML) registers a
+  // refresh-minted provider so the gateway mints the token (secret stays
+  // gateway-side) and the L7 proxy injects it. The credential value is a sentinel
+  // (minted by refresh, configured post-create in onboard's
+  // upsertMessagingProviders wrapper). Today only Google Chat uses this.
+  messagingTokenDefs.push(
+    ...collectMessagingBridgeTokenDefs({
+      sandboxName: input.sandboxName,
+      getCredential: input.getCredential,
+      env: input.env,
+      normalizeCredentialValue: input.normalizeCredentialValue,
+      enabledChannels: input.enabledChannels,
+      disabledChannelNames,
+    }),
+  );
 
   const extraPlaceholderKeys = input.registerExtraPlaceholderProviders(
     input.sandboxName,
     messagingTokenDefs,
   );
   const hasMessagingTokens = messagingTokenDefs.some(({ token }) => !!token);
-  const reusableMessagingProviders: string[] = [];
+  const reusableMessagingProviders: string[] = reusableWebSearchProvider
+    ? [webSearchProviderName]
+    : [];
   const reusableMessagingChannels: string[] = [];
 
   if (input.enabledChannels != null) {
@@ -123,10 +164,31 @@ export function prepareCreateSandboxMessaging(
       if (token) continue;
       const channel = input.getMessagingChannelForEnvKey(envKey);
       if (!channel || !input.enabledChannels.includes(channel)) continue;
-      if (!input.providerExistsInGateway(name)) continue;
+      const providerReusable = requiresExactOpenClawProviderBinding
+        ? input.providerMatchesGatewayCredential(name, "generic", envKey)
+        : input.providerExistsInGateway(name);
+      if (!providerReusable) continue;
       reusableMessagingProviders.push(name);
       if (!reusableMessagingChannels.includes(channel)) {
         reusableMessagingChannels.push(channel);
+      }
+    }
+  }
+
+  // Bridge channels have no token def at all when their env-only secret is
+  // gone (fresh process), so the envKey loop above misses them. The gateway
+  // still holds the refresh material — reuse the provider by name instead.
+  if (input.enabledChannels != null) {
+    for (const channel of input.enabledChannels) {
+      if (disabledChannelNames.has(channel)) continue;
+      for (const name of bridgeProviderNamesForChannel(input.sandboxName, channel)) {
+        if (messagingTokenDefs.some((def) => def.name === name && def.token)) continue;
+        if (reusableMessagingProviders.includes(name)) continue;
+        if (!input.providerExistsInGateway(name)) continue;
+        reusableMessagingProviders.push(name);
+        if (!reusableMessagingChannels.includes(channel)) {
+          reusableMessagingChannels.push(channel);
+        }
       }
     }
   }

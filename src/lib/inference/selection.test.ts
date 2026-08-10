@@ -2,9 +2,33 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
-import { normalizeInferenceSelection } from "./selection";
+import { getEffectiveReasoningEffort, normalizeInferenceSelection } from "./selection";
 
 describe("normalizeInferenceSelection", () => {
+  it("persists recognized endpoint provenance only with a recorded endpoint", () => {
+    expect(
+      normalizeInferenceSelection({
+        endpointUrl: "https://inference.example/v1",
+        endpointSource: "onboard",
+      }).endpointSource,
+    ).toBe("onboard");
+    expect(
+      normalizeInferenceSelection({
+        endpointUrl: "https://inference.example/v1",
+        endpointSource: "inference-set",
+      }).endpointSource,
+    ).toBe("inference-set");
+    expect(
+      normalizeInferenceSelection({
+        endpointUrl: "https://inference.example/v1",
+        endpointSource: "forged",
+      } as never).endpointSource,
+    ).toBeNull();
+    expect(
+      normalizeInferenceSelection({ endpointUrl: null, endpointSource: "onboard" }).endpointSource,
+    ).toBeNull();
+  });
+
   it("persists canonical compatible-endpoint reasoning values", () => {
     expect(
       normalizeInferenceSelection({
@@ -35,6 +59,29 @@ describe("normalizeInferenceSelection", () => {
         provider: "nvidia-prod",
         compatibleEndpointReasoning: "true",
       }).compatibleEndpointReasoning,
+    ).toBeNull();
+  });
+
+  it.each([
+    ["high", "high"],
+    [null, "endpoint-default"],
+  ] as const)("describes the effective OpenAI Completions effort (%s) (#7659)", (stored, expected) => {
+    expect(
+      getEffectiveReasoningEffort({
+        provider: "compatible-endpoint",
+        preferredInferenceApi: "openai-completions",
+        compatibleEndpointReasoningEffort: stored,
+      }),
+    ).toBe(expected);
+  });
+
+  it("does not report reasoning effort for routes where it does not apply", () => {
+    expect(
+      getEffectiveReasoningEffort({
+        provider: "compatible-endpoint",
+        preferredInferenceApi: "openai-responses",
+        compatibleEndpointReasoningEffort: "high",
+      }),
     ).toBeNull();
   });
 });

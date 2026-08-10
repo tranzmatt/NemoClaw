@@ -19,7 +19,7 @@ const FULL_SHA_ACTION = /@[0-9a-f]{40}$/iu;
 type CloudflaredUpdateWorkflow = {
   on?: {
     schedule?: Array<{ cron?: string }>;
-    workflow_dispatch?: Record<string, never>;
+    workflow_dispatch?: unknown;
   };
   permissions?: Record<string, string>;
   jobs?: Record<
@@ -40,7 +40,7 @@ function pinValues(source: string, name: string): string[] {
 function writePinFixture(file: string, version: string, sha256: string): void {
   fs.writeFileSync(
     file,
-    ["one", "two", "three"]
+    ["one", "two", "three", "four", "five"]
       .map(
         (job) =>
           `  ${job}:\n    env:\n      CLOUDFLARED_VERSION: "${version}"\n      CLOUDFLARED_DEB_SHA256: "${sha256}"`,
@@ -49,7 +49,10 @@ function writePinFixture(file: string, version: string, sha256: string): void {
   );
 }
 
-function runFixtureCheck(options: { pinnedVersion: string; latestVersion: string }) {
+function runFixtureCheck(
+  options: { pinnedVersion: string; latestVersion: string },
+  command?: string,
+) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cloudflared-update-"));
   const workflowPath = path.join(tempDir, "e2e.yaml");
   const releasePath = path.join(tempDir, "release.json");
@@ -97,7 +100,8 @@ esac
     { mode: 0o755 },
   );
 
-  const result = spawnSync("bash", [CHECK_SCRIPT], {
+  const commandArguments = command ? ["-e", "-o", "pipefail", "-c", command] : [CHECK_SCRIPT];
+  const result = spawnSync("bash", commandArguments, {
     cwd: ROOT,
     encoding: "utf8",
     env: {
@@ -123,28 +127,15 @@ describe("cloudflared update-check workflow contract", () => {
     ".github/workflows/cloudflared-update-check.yaml",
   );
   const e2e = fs.readFileSync(E2E_WORKFLOW, "utf8");
+  const configuredCheckCommand =
+    workflow.jobs?.["check-cloudflared"]?.steps?.find((step) => typeof step.run === "string")
+      ?.run ?? "";
 
-  it("runs weekly and manually with read-only permissions and a credential-free checkout", () => {
-    expect(workflow.on?.schedule).toEqual([{ cron: "23 13 * * 1" }]);
-    expect(workflow.on?.workflow_dispatch).toEqual({});
-    expect(workflow.permissions).toEqual({ contents: "read" });
-
-    const job = workflow.jobs?.["check-cloudflared"];
-    const checkout = job?.steps?.find((step) => step.uses?.startsWith("actions/checkout@"));
-    const check = job?.steps?.find(
-      (step) => step.name === "Compare reviewed pin with the latest upstream release",
-    );
-    expect(job?.permissions).toBeUndefined();
-    expect(checkout?.uses).toMatch(FULL_SHA_ACTION);
-    expect(checkout?.with?.["persist-credentials"]).toBe(false);
-    expect(check?.run).toBe("bash scripts/checks/check-cloudflared-update.sh");
-  });
-
-  it("extracts exactly three identical reviewed version and SHA256 pins", () => {
+  it("extracts exactly five identical reviewed version and SHA256 pins", () => {
     const versions = pinValues(e2e, "CLOUDFLARED_VERSION");
     const hashes = pinValues(e2e, "CLOUDFLARED_DEB_SHA256");
-    expect(versions).toHaveLength(3);
-    expect(hashes).toHaveLength(3);
+    expect(versions).toHaveLength(5);
+    expect(hashes).toHaveLength(5);
     expect(new Set(versions).size).toBe(1);
     expect(new Set(hashes).size).toBe(1);
     expect(versions[0]).toMatch(/^[0-9]{4}\.[0-9]{1,2}\.[0-9]+$/u);
@@ -165,7 +156,10 @@ describe("cloudflared update-check workflow contract", () => {
   });
 
   it("passes only when the latest release asset matches the reviewed SHA256", () => {
-    const fixture = runFixtureCheck({ pinnedVersion: "2026.7.1", latestVersion: "2026.7.1" });
+    const fixture = runFixtureCheck(
+      { pinnedVersion: "2026.7.1", latestVersion: "2026.7.1" },
+      configuredCheckCommand,
+    );
     try {
       expect(fixture.result.status, fixture.result.stderr).toBe(0);
       expect(fixture.result.stdout).toContain("cloudflared pin is current");
@@ -177,7 +171,10 @@ describe("cloudflared update-check workflow contract", () => {
   });
 
   it("fails an outdated pin with the latest version, hash, and all update locations", () => {
-    const fixture = runFixtureCheck({ pinnedVersion: "2026.6.1", latestVersion: "2026.7.1" });
+    const fixture = runFixtureCheck(
+      { pinnedVersion: "2026.6.1", latestVersion: "2026.7.1" },
+      configuredCheckCommand,
+    );
     try {
       expect(fixture.result.status).toBe(1);
       expect(fixture.result.stderr).toContain("cloudflared update required");
@@ -188,7 +185,7 @@ describe("cloudflared update-check workflow contract", () => {
       );
       expect(fixture.result.stderr).toContain("CLOUDFLARED_VERSION lines:");
       expect(fixture.result.stderr).toContain("CLOUDFLARED_DEB_SHA256 lines:");
-      expect(fixture.result.stderr).toContain("Set all three version/SHA256 pairs");
+      expect(fixture.result.stderr).toContain("Set all five version/SHA256 pairs");
     } finally {
       fs.rmSync(fixture.tempDir, { recursive: true, force: true });
     }

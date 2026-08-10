@@ -19,10 +19,12 @@ describe("snapshot credential scanner", () => {
   it("keeps required provider aliases in the shared credential inventory", () => {
     for (const name of [
       "NVIDIA_API_KEY",
+      "OPENROUTER_API_KEY",
       "GEMINI_API_KEY",
       "GOOGLE_API_KEY",
       "AWS_BEARER_TOKEN_BEDROCK",
       "COMPATIBLE_ANTHROPIC_API_KEY",
+      "NEMOCLAW_LLAMACPP_LOCAL_TOKEN",
     ]) {
       expect(SUPPORTED_CREDENTIAL_ENV_NAMES.has(name), name).toBe(true);
     }
@@ -112,6 +114,12 @@ describe("snapshot credential scanner", () => {
     expect(
       snapshotFileContainsCredentialLeak("openclaw.json", '{"value":"nvapi-concrete-secret"}'),
     ).toBe(true);
+    expect(
+      snapshotFileContainsCredentialLeak(
+        "credentials.json",
+        '{"apiKey":"[STRIPPED_BY_MIGRATION]","marker":"non-secret"}',
+      ),
+    ).toBe(false);
     expect(snapshotFileContainsCredentialLeak("settings.json", '{"apiKey":"opaque"}')).toBe(true);
     expect(snapshotFileContainsCredentialLeak("runtime.env", "OPENAI_API_KEY=concrete")).toBe(true);
     expect(

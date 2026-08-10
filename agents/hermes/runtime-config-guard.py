@@ -54,11 +54,15 @@ MCP_HASH_STATE_RE = re.compile(
 )
 NEMOCLAW_START_ARGV = (b"nemoclaw-start", b"/usr/local/bin/nemoclaw-start")
 OPENSHELL_SUPERVISOR_ARGV0 = b"/opt/openshell/bin/openshell-sandbox"
+# Keep this in exact parity with manifest config_file + config.shields_files +
+# .config-hash. The host manifest remains authoritative for host transitions;
+# the integration test protects this separate in-image recovery boundary.
 SEALED_FILE_NAMES = ("config.yaml", ".env", ".config-hash")
 RESTART_ORPHAN_MARKER_NAME = ".nemoclaw-hermes-restart-seal"
 SHIELDS_TRANSITION_LEASE_SECONDS = 300
 STATE_WORKER_LEASE_SECONDS = 15 * 60
 HERMES_STARTUP_READY_FILE = "/run/nemoclaw/hermes-startup-ready"
+HERMES_ROOT_LIFECYCLE_MARKER = "/run/nemoclaw/hermes-root-lifecycle"
 NEMOCLAW_RUNTIME_DIR = "/run/nemoclaw"
 NEMOCLAW_RUNTIME_DIR_MODE = 0o711
 HERMES_RESTART_STATE_FILE = "/run/nemoclaw/hermes-restart-seal.json"
@@ -67,6 +71,7 @@ DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS = frozenset(
     {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
 )
 _DIRECTORY_FSYNC_WARNING_EMITTED = False
+_DIRECTORY_METADATA_FSYNC_WARNING_EMITTED = False
 INSTALLED_RUNTIME_CONFIG_GUARD = (
     "/usr/local/lib/nemoclaw/hermes-runtime-config-guard.py"
 )
@@ -302,7 +307,17 @@ def _proc_pid_namespace_inode(proc_pid_fd: int) -> int | None:
 
 
 def _cmdline_is_nemoclaw_start(raw: bytes) -> bool:
-    return any(argument in NEMOCLAW_START_ARGV for argument in raw.split(b"\0"))
+    normalized = raw.rstrip(b"\0")
+    arguments = tuple(normalized.split(b"\0")) if normalized else ()
+    # Docker appends CMD arguments after ENTRYPOINT. Authenticate the canonical
+    # startup script position while allowing those opaque trailing arguments.
+    direct = bool(arguments) and arguments[0] in NEMOCLAW_START_ARGV
+    bash = (
+        len(arguments) >= 2
+        and arguments[0] in {b"bash", b"/bin/bash", b"/usr/bin/bash"}
+        and arguments[1] in NEMOCLAW_START_ARGV
+    )
+    return direct or bash
 
 
 def _cmdline_is_openshell_supervisor(raw: bytes) -> bool:
@@ -575,7 +590,7 @@ def _pinned_process_matches_supervised_nonroot_start(
     supervisor_identity: tuple[str, int | None],
     expected_effective_uid: int,
 ) -> bool:
-    # OpenShell 0.0.72 keeps its supervisor at PID 1 and launches the non-root
+    # OpenShell 0.0.101 keeps its supervisor at PID 1 and launches the non-root
     # NemoClaw entrypoint as a child, so startup authority must be proved from
     # pinned procfs identity rather than a PID-1 equality check. Remove this
     # compatibility proof when #6256 provides authenticated supervisor/runtime
@@ -635,6 +650,7 @@ def _pinned_process_matches_supervised_nonroot_start(
             and second_status[0] == expected_effective_uid
             and first_status[1][-1] == numeric_pid
             and second_status[1][-1] == numeric_pid
+            and first_cmdline == second_cmdline
             and _cmdline_is_nemoclaw_start(first_cmdline)
             and _cmdline_is_nemoclaw_start(second_cmdline)
             and namespace_matches
@@ -726,6 +742,65 @@ def _startup_ready_marker_absent() -> bool:
     except OSError:
         return False
     return False
+
+
+def _root_lifecycle_marker_state() -> str:
+    try:
+        opened = _open_regular(HERMES_ROOT_LIFECYCLE_MARKER)
+    except FileNotFoundError:
+        return "absent"
+    except (OSError, UnsafePathError) as exc:
+        raise UnsafePathError("Hermes root lifecycle marker is unsafe") from exc
+    try:
+        marker = opened.snapshot
+        if (
+            marker.uid != 0
+            or marker.gid != 0
+            or marker.mode != 0o444
+            or marker.nlink != 1
+            or not secrets.compare_digest(opened.read_bytes(64), b"root-separated\n")
+        ):
+            raise UnsafePathError("Hermes root lifecycle marker is unsafe")
+    finally:
+        opened.close()
+    return "root-separated"
+
+
+def _attested_shields_runtime_topology() -> str:
+    marker_state = _root_lifecycle_marker_state()
+    if marker_state == "root-separated":
+        if (
+            os.geteuid() == 0
+            and _pid1_is_nemoclaw_start()
+            and _process_effective_uid(1) == 0
+        ):
+            return marker_state
+        raise UnsafePathError(
+            "Hermes root lifecycle marker does not match the live PID 1 topology"
+        )
+
+    if (
+        os.path.abspath(__file__) != INSTALLED_RUNTIME_CONFIG_GUARD
+        or os.geteuid() != 0
+        or not _startup_ready_marker_absent()
+    ):
+        return "unknown"
+    try:
+        sandbox_uid = pwd.getpwnam("sandbox").pw_uid
+    except KeyError:
+        return "unknown"
+    if sandbox_uid <= 0:
+        return "unknown"
+    if _openshell_supervised_nonroot_start_is_live(0, sandbox_uid):
+        if (
+            _root_lifecycle_marker_state() != marker_state
+            or not _startup_ready_marker_absent()
+        ):
+            raise UnsafePathError(
+                "Hermes runtime topology changed during attestation"
+            )
+        return "same-uid-nonroot"
+    return "unknown"
 
 
 def _validate_action_readiness(action: str, startup_owner: bool) -> None:
@@ -1054,6 +1129,22 @@ def _fsync_directory_after_replace(dir_fd: int) -> None:
             _DIRECTORY_FSYNC_WARNING_EMITTED = True
 
 
+def _fsync_directory_metadata(dir_fd: int) -> None:
+    global _DIRECTORY_METADATA_FSYNC_WARNING_EMITTED
+
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        if exc.errno not in DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS:
+            raise
+        if not _DIRECTORY_METADATA_FSYNC_WARNING_EMITTED:
+            print(
+                "[security] directory fsync is unsupported; the Hermes root metadata update completed without a directory durability barrier",
+                file=sys.stderr,
+            )
+            _DIRECTORY_METADATA_FSYNC_WARNING_EMITTED = True
+
+
 def _atomic_replace_preserving_flags(
     path: str, data: bytes, expected: FileSnapshot
 ) -> None:
@@ -1223,6 +1314,76 @@ def _hash_text(
     return text, config_snapshot, env_snapshot
 
 
+def _applied_mcp_hash_text(
+    config_path: str,
+    env_path: str,
+    compat_hash: str,
+    source_hash_text: str,
+    current_mcp: str,
+    state: McpHashState,
+    mode: str,
+) -> tuple[str, FileSnapshot, FileSnapshot]:
+    """Build the metadata-only MCP applied-state commit from one stable input."""
+    if not secrets.compare_digest(current_mcp, state.intended):
+        raise UnsafePathError("Hermes MCP config changed before applied-state commit")
+    # Applying intent is a metadata-only commit. Require the complete
+    # config/env snapshot to still match the pending trust anchor rather than
+    # re-hashing and blessing unrelated concurrent changes.
+    pending_hash_text, config_snapshot, env_snapshot = _hash_text(
+        config_path, env_path, state
+    )
+    if not secrets.compare_digest(pending_hash_text, source_hash_text):
+        raise UnsafePathError(
+            "Hermes config or env changed before applied-state commit"
+        )
+    if mode == "both" and not secrets.compare_digest(
+        _read_hash_file(compat_hash), source_hash_text
+    ):
+        raise UnsafePathError(
+            "Hermes strict and compatibility MCP state differ before "
+            "applied-state commit"
+        )
+    applied_state = McpHashState(state.intended, state.intended)
+    lines = pending_hash_text.splitlines(keepends=True)
+    state_line = (
+        f"{MCP_HASH_STATE_PREFIX} intended={applied_state.intended} "
+        f"applied={applied_state.applied}\n"
+    )
+    for index, line in enumerate(lines):
+        if line.startswith(MCP_HASH_STATE_PREFIX):
+            lines[index] = state_line
+            break
+    else:
+        raise UnsafePathError(
+            "Hermes MCP state marker missing before applied-state commit"
+        )
+    return "".join(lines), config_snapshot, env_snapshot
+
+
+def _hash_text_for_refresh(
+    config_path: str,
+    env_path: str,
+    compat_hash: str,
+    source_hash_text: str,
+    current_mcp: str,
+    state: McpHashState,
+    mode: str,
+    mcp_transition: str,
+) -> tuple[str, FileSnapshot, FileSnapshot]:
+    """Resolve the hash refresh payload and its input snapshots in one step."""
+    if mcp_transition == "apply":
+        return _applied_mcp_hash_text(
+            config_path,
+            env_path,
+            compat_hash,
+            source_hash_text,
+            current_mcp,
+            state,
+            mode,
+        )
+    return _hash_text(config_path, env_path, state)
+
+
 def _sealed_file_limit(name: str) -> int:
     if name == "config.yaml":
         return MAX_CONFIG_INPUT_BYTES
@@ -1322,38 +1483,16 @@ def refresh_hashes(
                 "Hermes MCP rollback config does not match the previously applied state"
             )
         state = McpHashState(current_mcp, state.intended)
-    else:
-        if not secrets.compare_digest(current_mcp, state.intended):
-            raise UnsafePathError(
-                "Hermes MCP config changed before applied-state commit"
-            )
-        # Applying intent is a metadata-only commit. Require the complete
-        # config/env snapshot to still match the pending trust anchor rather
-        # than re-hashing and blessing unrelated concurrent changes.
-        pending_hash_text, config_snapshot, env_snapshot = _hash_text(
-            config_path, env_path, state
-        )
-        if not secrets.compare_digest(pending_hash_text, source_hash_text):
-            raise UnsafePathError(
-                "Hermes config or env changed before applied-state commit"
-            )
-        if mode == "both" and not secrets.compare_digest(
-            _read_hash_file(compat_hash), source_hash_text
-        ):
-            raise UnsafePathError(
-                "Hermes strict and compatibility MCP state differ before applied-state commit"
-            )
-        state = McpHashState(state.intended, state.intended)
-        lines = pending_hash_text.splitlines(keepends=True)
-        lines[2] = (
-            f"{MCP_HASH_STATE_PREFIX} intended={state.intended} applied={state.applied}\n"
-        )
-        hash_text = "".join(lines)
-
-    if mcp_transition != "apply":
-        hash_text, config_snapshot, env_snapshot = _hash_text(
-            config_path, env_path, state
-        )
+    hash_text, config_snapshot, env_snapshot = _hash_text_for_refresh(
+        config_path,
+        env_path,
+        compat_hash,
+        source_hash_text,
+        current_mcp,
+        state,
+        mode,
+        mcp_transition,
+    )
 
     def assert_inputs_stable() -> None:
         config = _open_regular(config_path)
@@ -1618,7 +1757,9 @@ def _mutable_nonroot_reconciliation_posture_is_allowed(
     # OpenShell can present the live non-root home as private 0700 after the
     # managed supervisor/dashboard has started. Shields-down transitions use
     # the canonical set-id 03770 form. Both are sandbox-owned mutable roots;
-    # the root-owned 0755/0444 shields-up posture must never be reconciled.
+    # a shields-up posture must never be reconciled here. The locked root also
+    # carries 03770 since #7865, so the sandbox-owner check below — not the
+    # mode — is what keeps the two apart.
     if (
         hermes_meta.get("uid") != sandbox_uid
         or hermes_meta.get("gid") != sandbox_gid
@@ -2653,7 +2794,7 @@ def seal_restart(
         try:
             _verify_strict_hash(hermes_dir, hash_file)
         except StrictHashMismatchError:
-            if purpose != "config-write" or expected_config_sha256 is None:
+            if purpose not in ("config-write", "shields-mutable") or expected_config_sha256 is None:
                 raise
             _reconcile_nonroot_startup_api_key_hash(
                 hermes_dir,
@@ -2778,6 +2919,27 @@ def _record_current_sealed_inodes(
     _write_restart_state(state_file, state_data, create=False)
 
 
+def _is_locked_hermes_root(uid: object, gid: object, mode: object) -> bool:
+    """Report whether a recorded `.hermes` root is in the shields-locked posture.
+
+    The current locked root is root-owned in the sandbox group and keeps the
+    set-id/sticky shape so Hermes can still write its top-level runtime state
+    (#7865). Sandboxes locked before that change recorded a root:root 0755
+    root, so keep accepting it here: rollback and re-lock must classify an
+    already-locked sandbox correctly, and the host verifier reports the legacy
+    shape as drift so `shields up` repairs it.
+    """
+    if uid != os.geteuid():
+        return False
+    if gid == os.getegid() and mode == 0o755:
+        return True
+    try:
+        _, sandbox_gid = _sandbox_identity()
+    except UnsafePathError:
+        return False
+    return gid == sandbox_gid and mode == 0o3770
+
+
 def _restart_state_was_locked(state_data: dict[str, object]) -> bool:
     recorded = state_data.get("original_locked")
     if isinstance(recorded, bool):
@@ -2786,10 +2948,8 @@ def _restart_state_was_locked(state_data: dict[str, object]) -> bool:
     files = state_data.get("files")
     if not isinstance(hermes_meta, dict) or not isinstance(files, dict):
         raise UnsafePathError("refusing malformed Hermes restart seal metadata")
-    if (
-        hermes_meta.get("uid") != os.geteuid()
-        or hermes_meta.get("gid") != os.getegid()
-        or hermes_meta.get("mode") != 0o755
+    if not _is_locked_hermes_root(
+        hermes_meta.get("uid"), hermes_meta.get("gid"), hermes_meta.get("mode")
     ):
         return False
     for name in ("config.yaml", ".env"):
@@ -3077,9 +3237,9 @@ def _seal_shields_locked(
 
         original_locked = (
             not unavailable_reasons
-            and hermes_meta["uid"] == os.geteuid()
-            and hermes_meta["gid"] == os.getegid()
-            and hermes_meta["mode"] == 0o755
+            and _is_locked_hermes_root(
+                hermes_meta["uid"], hermes_meta["gid"], hermes_meta["mode"]
+            )
             and all(
                 initial_stats[name] is not None
                 and initial_stats[name].st_uid == os.geteuid()
@@ -3441,8 +3601,23 @@ def begin_shields_transition(
             rollback_mode or "mutable",
         )
 
+    # A fresh managed non-root Hermes start mints exactly one API_SERVER_KEY and
+    # refreshes its sandbox-owned compatibility anchor, while the root-owned
+    # strict anchor deliberately remains unchanged. The first shields-down is
+    # the next root transaction and must admit that same narrowly reviewed
+    # reconciliation as write-config. Derive the expected config digest from
+    # the existing strict anchor so shields can never bless config drift.
+    strict_config_sha256, _strict_env_sha256, _strict_mcp_state = _parse_config_hash(
+        _read_hash_file(hash_file),
+        os.path.join(hermes_dir, "config.yaml"),
+        os.path.join(hermes_dir, ".env"),
+    )
     original_locked = seal_restart(
-        hermes_dir, hash_file, state_file, purpose="shields-mutable"
+        hermes_dir,
+        hash_file,
+        state_file,
+        purpose="shields-mutable",
+        expected_config_sha256=strict_config_sha256,
     )
     try:
         state_data = _load_restart_state(state_file)
@@ -3567,30 +3742,40 @@ def _configure_shields_target_metadata(
             )
 
     sandbox_uid, sandbox_gid = _sandbox_identity()
-    if mode == "locked":
-        desired_uid = os.geteuid()
-        desired_gid = os.getegid()
-        desired_dir_mode = 0o755
-        desired_file_mode = 0o444
-        # `/sandbox` must remain a usable home, but its sticky root-owned entry
-        # prevents the sandbox identity from renaming the root-owned `.hermes`
-        # lock root out from under the protected files.
-        parent_meta.update({"uid": os.geteuid(), "gid": sandbox_gid, "mode": 0o1775})
-    elif mode == "mutable":
-        desired_uid = sandbox_uid
-        desired_gid = sandbox_gid
-        desired_dir_mode = 0o3770
-        desired_file_mode = 0o640
-        parent_meta.update({"uid": sandbox_uid, "gid": sandbox_gid, "mode": 0o755})
-    else:
+    if mode not in ("locked", "mutable"):
         raise UnsafePathError(f"refusing unsupported Hermes shields target: {mode}")
+
+    locked = mode == "locked"
+    desired_uid = os.geteuid() if locked else sandbox_uid
+    desired_gid = os.getegid() if locked else sandbox_gid
+    desired_file_mode = 0o444 if locked else 0o640
+    # The config root keeps one set-id/sticky shape in both postures; only its
+    # owner changes. Hermes writes its top-level runtime state directly here —
+    # auth.json, the drain request, and the temporary files that back every
+    # atomic gateway_state/pid replace — so a root-owned root without group
+    # write stops every gateway launch and the supervisor quarantines relaunch
+    # until the sandbox is recreated (#7865). Root ownership plus the sticky
+    # bit is what protects the sealed entries under lockdown: the sandbox
+    # identity manages its own runtime files but cannot unlink or rename the
+    # root-owned config, which is the same trade `/sandbox` already makes.
+    desired_dir_mode = 0o3770
+    # `/sandbox` must remain a usable home, but its sticky root-owned entry
+    # prevents the sandbox identity from renaming the root-owned `.hermes`
+    # lock root out from under the protected files.
+    parent_meta.update(
+        {
+            "uid": desired_uid,
+            "gid": sandbox_gid,
+            "mode": 0o1775 if locked else 0o755,
+        }
+    )
 
     state_data["parent"] = parent_meta
     state_data["parent_flags"] = int(state_data.get("parent_flags", 0)) & ~(
         FS_IMMUTABLE_FL | FS_APPEND_FL
     )
     hermes_meta.update(
-        {"uid": desired_uid, "gid": desired_gid, "mode": desired_dir_mode}
+        {"uid": desired_uid, "gid": sandbox_gid, "mode": desired_dir_mode}
     )
     state_data["hermes"] = hermes_meta
     state_data["hermes_flags"] = int(state_data.get("hermes_flags", 0)) & ~(
@@ -3746,6 +3931,34 @@ def apply_shields_transition(
             )
             os.fchown(parent_fd, os.geteuid(), os.getegid())
             os.fchmod(parent_fd, 0o755)
+            # Re-apply the recorded config-root posture. The pending phase
+            # clamps this root to a transient root-only mode, so an interruption
+            # between publishing the applied phase and restoring the seal leaves
+            # the clamp in place; finish would then refuse the drifted root and
+            # wedge the transaction instead of converging. Repairing here keeps
+            # resume idempotent, and the inode pin below is what makes it safe.
+            hermes_meta = state_data.get("hermes")
+            if not isinstance(hermes_meta, dict):
+                raise UnsafePathError(
+                    "refusing applied shields resume without .hermes metadata"
+                )
+            resumed_fd = _open_child_directory(
+                parent_fd, _split_path(hermes_dir)[1], hermes_dir
+            )
+            try:
+                if not _same_inode(os.fstat(resumed_fd), hermes_meta):
+                    raise UnsafePathError(
+                        "refusing applied shields resume because .hermes changed"
+                    )
+                _set_inode_flags(
+                    resumed_fd,
+                    _get_inode_flags(resumed_fd) & ~(FS_IMMUTABLE_FL | FS_APPEND_FL),
+                )
+                # Chown can clear set-id bits, so the mode restore follows it.
+                os.fchown(resumed_fd, hermes_meta["uid"], hermes_meta["gid"])
+                os.fchmod(resumed_fd, hermes_meta["mode"])
+            finally:
+                os.close(resumed_fd)
         finally:
             os.close(parent_fd)
         hash_file = str(state_data.get("hash_file", ""))
@@ -3911,6 +4124,109 @@ def _freeze_shields_directories(state_data: dict[str, object], hermes_dir: str) 
         os.close(parent_fd)
 
 
+def _reconcile_private_mutable_shields_root(
+    hermes_fd: int,
+    hermes_st: os.stat_result,
+    hermes_meta: dict[str, object],
+    mode: str,
+) -> tuple[os.stat_result, str]:
+    if (
+        mode != "mutable"
+        or stat.S_IMODE(hermes_st.st_mode) != 0o700
+        or hermes_st.st_uid != hermes_meta.get("uid")
+        or hermes_st.st_gid != hermes_meta.get("gid")
+        or hermes_meta.get("mode") != 0o3770
+    ):
+        return hermes_st, "exact"
+
+    topology = _attested_shields_runtime_topology()
+    if topology == "same-uid-nonroot":
+        # The pinned OpenShell supervisor/entrypoint proof establishes that the
+        # non-root entrypoint and every child it can launch share the sandbox
+        # uid. A private sandbox-owned root remains traversable to that gateway.
+        confirmed = os.fstat(hermes_fd)
+        if (
+            not _same_inode(confirmed, hermes_meta)
+            or confirmed.st_uid != hermes_meta.get("uid")
+            or confirmed.st_gid != hermes_meta.get("gid")
+            or stat.S_IMODE(confirmed.st_mode) != 0o700
+        ):
+            raise UnsafePathError(
+                "refusing shields finish because the private same-UID Hermes root drifted during attestation"
+            )
+        return confirmed, "same-uid-nonroot"
+    if topology == "root-separated":
+        # The root entrypoint launches Hermes as the dedicated gateway uid in
+        # the sandbox group. Restore the descriptor-pinned set-id/sticky root
+        # before committing the transaction so that gateway can traverse it.
+        os.fchmod(hermes_fd, 0o3770)
+        repaired = os.fstat(hermes_fd)
+        if (
+            not _same_inode(repaired, hermes_meta)
+            or repaired.st_uid != hermes_meta.get("uid")
+            or repaired.st_gid != hermes_meta.get("gid")
+            or stat.S_IMODE(repaired.st_mode) != 0o3770
+        ):
+            raise UnsafePathError(
+                "refusing shields finish because the root-separated Hermes root could not be restored"
+            )
+        return repaired, "root-separated"
+    raise UnsafePathError(
+        "refusing shields finish because private mutable .hermes lacks an attested same-UID topology"
+    )
+
+
+def _enforce_final_shields_root_posture(
+    hermes_fd: int,
+    hermes_meta: dict[str, object],
+    mode: str,
+    posture: str,
+) -> os.stat_result:
+    expected_mode = hermes_meta.get("mode")
+    if posture == "root-separated":
+        if mode != "mutable" or expected_mode != 0o3770:
+            raise UnsafePathError(
+                "refusing shields finish because the root-separated Hermes posture is inconsistent"
+            )
+        # The sandbox owner can chmod its root after the initial topology check.
+        # Repair the pinned descriptor again at the commit boundary, make the
+        # metadata update durable where directory fsync is supported, and only
+        # trust the fresh stat collected after both operations.
+        os.fchmod(hermes_fd, 0o3770)
+        _fsync_directory_metadata(hermes_fd)
+        allowed_modes = (0o3770,)
+    elif posture == "same-uid-nonroot":
+        if mode != "mutable" or expected_mode != 0o3770:
+            raise UnsafePathError(
+                "refusing shields finish because the same-UID Hermes posture is inconsistent"
+            )
+        # Both modes are intentional for a same-UID mutable runtime: 03770 is
+        # the canonical posture, while 0700 remains traversable by the gateway.
+        allowed_modes = (0o700, 0o3770)
+    elif posture == "exact":
+        if not isinstance(expected_mode, int):
+            raise UnsafePathError(
+                "refusing shields finish because the expected Hermes mode is malformed"
+            )
+        allowed_modes = (expected_mode,)
+    else:
+        raise UnsafePathError(
+            "refusing shields finish because the Hermes root posture is unknown"
+        )
+
+    current = os.fstat(hermes_fd)
+    if (
+        not _same_inode(current, hermes_meta)
+        or current.st_uid != hermes_meta.get("uid")
+        or current.st_gid != hermes_meta.get("gid")
+        or stat.S_IMODE(current.st_mode) not in allowed_modes
+    ):
+        raise UnsafePathError(
+            "refusing shields finish because the final .hermes metadata drifted"
+        )
+    return current
+
+
 def finish_shields_transition(
     hermes_dir: str, hash_file: str, state_file: str, lock_token: str
 ) -> tuple[str, bool]:
@@ -3948,10 +4264,16 @@ def finish_shields_transition(
         hermes_st = os.fstat(hermes_fd)
         if not _same_inode(hermes_st, hermes_meta):
             raise UnsafePathError("refusing shields finish because .hermes changed")
+        hermes_st, root_posture = _reconcile_private_mutable_shields_root(
+            hermes_fd, hermes_st, hermes_meta, mode
+        )
         if (
             hermes_st.st_uid != hermes_meta.get("uid")
             or hermes_st.st_gid != hermes_meta.get("gid")
-            or stat.S_IMODE(hermes_st.st_mode) != hermes_meta.get("mode")
+            or (
+                stat.S_IMODE(hermes_st.st_mode) != hermes_meta.get("mode")
+                and root_posture != "same-uid-nonroot"
+            )
         ):
             raise UnsafePathError(
                 "refusing shields finish because .hermes metadata drifted"
@@ -4009,6 +4331,9 @@ def finish_shields_transition(
         _verify_compat_hash(hash_file, os.path.join(hermes_dir, ".config-hash"))
         os.fchmod(parent_fd, parent_meta["mode"])
         _set_inode_flags(parent_fd, int(state_data.get("parent_flags", 0)))
+        _enforce_final_shields_root_posture(
+            hermes_fd, hermes_meta, mode, root_posture
+        )
         _remove_restart_orphan_marker(hermes_fd)
         # Parent ownership is the last persistent metadata change. Seal rejects
         # set-id parent modes, so this chown cannot clear a prepared mode bit.
@@ -4089,7 +4414,11 @@ def abort_shields_transition(hermes_dir: str, state_file: str, lock_token: str) 
 
 
 def run_state_dir_transition(
-    hermes_dir: str, state_file: str, lock_token: str, action: str
+    hermes_dir: str,
+    state_file: str,
+    lock_token: str,
+    action: str,
+    state_lock_plan_json: str,
 ) -> None:
     if action not in ("lock", "unlock"):
         raise UnsafePathError("refusing unsupported Hermes state-dir action")
@@ -4111,6 +4440,13 @@ def run_state_dir_transition(
     helper = installed if os.path.isfile(installed) else checkout
     if not os.path.isfile(helper):
         raise UnsafePathError("Hermes state-dir guard is unavailable")
+    if state_lock_plan_json:
+        plan_args = ["--plan-json", state_lock_plan_json]
+    else:
+        plan_file = "/usr/local/share/nemoclaw/state-lock-plan.json"
+        if not os.path.isfile(plan_file):
+            raise UnsafePathError("Hermes state lock plan is unavailable")
+        plan_args = ["--plan-file", plan_file]
     # Preserve this exact PID/start identity as GNU timeout while it owns and
     # waits for the recursive worker. Cancel the Python alarm before exec so
     # timeout alone owns TERM/KILL tree cleanup and no orphan child survives.
@@ -4127,6 +4463,7 @@ def run_state_dir_transition(
             action,
             "--config-dir",
             hermes_dir,
+            *plan_args,
         ],
     )
 
@@ -4682,6 +5019,7 @@ def main() -> int:
     parser.add_argument("--expected-config-sha256", default="")
     parser.add_argument("--lock-token", default="")
     parser.add_argument("--state-action", choices=("lock", "unlock"), default="")
+    parser.add_argument("--state-lock-plan-json", default="")
     parser.add_argument("--shields-mode", choices=("locked", "mutable"), default="")
     parser.add_argument(
         "--rollback-shields-mode", choices=("locked", "mutable"), default=""
@@ -4864,6 +5202,7 @@ def main() -> int:
                 args.state_file,
                 args.lock_token,
                 args.state_action,
+                args.state_lock_plan_json,
             )
     except UnsafePathError as exc:
         _die(str(exc))

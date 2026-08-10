@@ -10,6 +10,7 @@ content:
   type: "how_to"
 skill:
   priority: 40
+agent-variants: ["hermes"]
 ---
 Hermes plugins extend the Hermes runtime inside a NemoClaw-managed sandbox.
 They are different from NemoClaw skills and from OpenClaw plugins, so install them through the Hermes plugin path instead of `skill install`.
@@ -38,24 +39,25 @@ When you change a supported startup-only setting with a NemoClaw host command, r
 nemohermes <name> gateway restart
 ```
 
-The restart command sends an authenticated lifecycle request through registry-scoped privileged direct-container control.
-In a direct root-entrypoint container, root PID 1 validates `/sandbox/.hermes/.env`, the runtime environment, and the strict root-owned config hash before it relaunches the gateway under the separate `gateway` user with the restart seal.
-In an OpenShell-managed container, OpenShell is PID 1 and nonroot `nemoclaw-start`, the gateway, and the agent use the same sandbox UID.
-The installed root controller preflights the Hermes secret boundary, verifies the strict hash when the config inputs are root-owned and locked, pidfd-targets the exact observed child, and proves the replacement listener and HTTP health.
-Mutable config in that managed topology keeps the same trust and time-of-check/time-of-use limits as managed cold start, and same-UID malicious process provenance cannot be proven.
-Use `nemohermes <name> config set` or `nemohermes inference set` for supported configuration changes so NemoClaw updates the managed config metadata together.
-The Hermes entrypoint supervisor owns and repairs the gateway, dashboard, internal API relay, dashboard relay, and gateway log stream; the host only checks or recovers the host-side OpenShell forwards after health passes.
-`recover` re-evaluates the Hermes secret boundary on every run, including healthy gateways, and repairs stopped supervised processes or host forwards.
-Use `gateway restart` when you need a forced runtime reload.
+The command reloads supported startup-only state through NemoClaw's authenticated lifecycle controller.
+Use `nemohermes <name> config set` or `nemohermes inference set` for supported configuration changes so NemoClaw updates managed config metadata together.
+For the controller topology, trust boundary, health proof, and fail-closed behavior, refer to [Understand Gateway Lifecycle Control](configure-sandboxes/understand-gateway-lifecycle-control).
 
 ## Prepare a Build Directory
 
 Put the custom Dockerfile and every file it needs to `COPY` in one directory.
 `nemohermes onboard --from <Dockerfile>` sends the Dockerfile's parent directory as the Docker build context.
-Add a `.dockerignore` next to the Dockerfile to keep local caches, generated artifacts, model files, or other unneeded paths out of the staged context.
+
+The one exception is the managed Hermes Dockerfile itself: passing the `agents/hermes/Dockerfile` from the NemoClaw checkout the CLI runs from stages the repository root as the build context, exactly as the managed build does.
+The managed exception applies the `.dockerignore` from the repository root, not one under `agents/hermes/`.
+Use that path when you want to edit the managed Dockerfile in place (for example, to install extra Python packages) and rebuild the stock image with your changes.
+
+For a standalone custom Dockerfile, add a `.dockerignore` next to the Dockerfile to keep local caches, generated artifacts, model files, or other unneeded paths out of the staged context.
 NemoClaw still excludes credential-like paths such as `.env*`, `.ssh/`, `.aws/`, `.npmrc`, `secrets/`, `*.pem`, and `*.key`, even if `.dockerignore` tries to include them.
+
 NemoClaw sends user-supplied `--from` contexts to the OpenShell gateway builder and reserves its host-side local BuildKit prebuild for contexts that NemoClaw generates itself.
 On a local Docker-driver gateway, a `Local BuildKit build skipped` notice is expected and the custom image build continues through the gateway.
+The managed Hermes Dockerfile keeps image probes in a checked-in runner so OpenShell gateway builders without Dockerfile heredoc support execute the same assertions.
 
 ```text
 my-hermes-plugin-sandbox/
@@ -76,6 +78,7 @@ The image must still include the generated Hermes config, NemoClaw Hermes plugin
 
 If `gateway restart` or `recover` reports `privileged control unavailable` for an older custom image, update the Dockerfile to the current Hermes image contract and rebuild it with `nemohermes <name> rebuild --yes`.
 The current contract supports a direct root entrypoint and the OpenShell-managed topology where OpenShell is PID 1 and launches `nemoclaw-start` as nonroot.
+
 An arbitrary nonroot entrypoint that does not match the supported OpenShell-managed process shape cannot use lifecycle control.
 Kubernetes and other deployments without a matching direct container fail closed and do not fall back to ordinary `openshell sandbox exec` or an in-sandbox manual relaunch.
 
@@ -150,4 +153,4 @@ The following places commonly mix Hermes plugin installation with other NemoClaw
 
 - Review [NemoHermes Command Reference](../reference/commands#nemohermes-onboard-from) for `nemohermes onboard --from` details.
 - Review [Customize Network Policy](../network-policy/customize-network-policy) if the plugin needs runtime network egress.
-- Review [Runtime Controls](./runtime-controls) before changing shields or mutability settings for a plugin-enabled sandbox.
+- Review [Understand Runtime Changes](configure-sandboxes/understand-runtime-changes) before changing shields or mutability settings for a plugin-enabled sandbox.

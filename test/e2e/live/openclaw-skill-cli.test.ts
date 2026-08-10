@@ -24,7 +24,7 @@ import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 // onboard a Docker/OpenShell sandbox, execute OpenClaw's skills CLI inside the
 // sandbox, and verify install/list/info/check agree on the workspace skill path.
 
-const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-openclaw-skill-cli";
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-oc-skill-cli";
 const SKILL_ID = "openclaw-skill-cli-fixture";
 const SKILL_DESCRIPTION = "E2E fixture proving openclaw skills install + list roundtrip";
 const REMOTE_SKILL_DIR = `/tmp/${SKILL_ID}`;
@@ -37,18 +37,11 @@ function isEndpointRateLimited(text: string): boolean {
   return /HTTP 429|rate limit|too many requests/i.test(text);
 }
 
-function singleLineSandboxScript(script: string) {
-  if (/[\r\n]/.test(script)) {
-    throw new Error("openshell sandbox exec command args must stay single-line");
-  }
-  return trustedSandboxShellScript(script);
-}
-
 function testEnv(home: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return testHomeEnvironment(home, extra);
 }
 
-async function bestEffort(run: () => Promise<unknown>): Promise<void> {
+async function bestEffortPreclean(run: () => Promise<unknown>): Promise<void> {
   try {
     await run();
   } catch {
@@ -57,27 +50,27 @@ async function bestEffort(run: () => Promise<unknown>): Promise<void> {
   }
 }
 
-async function cleanupOpenClawSkillCliState(
+async function precleanOpenClawSkillCliState(
   host: HostCliClient,
   sandbox: SandboxClient,
   home: string,
 ): Promise<void> {
   const env = testEnv(home);
-  await bestEffort(() =>
+  await bestEffortPreclean(() =>
     host.command("node", [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes"], {
       artifactName: "cleanup-nemoclaw-destroy-openclaw-skill-cli",
       env,
       timeoutMs: 120_000,
     }),
   );
-  await bestEffort(() =>
+  await bestEffortPreclean(() =>
     sandbox.openshell(["sandbox", "delete", SANDBOX_NAME], {
       artifactName: "cleanup-openshell-sandbox-delete-openclaw-skill-cli",
       env,
       timeoutMs: 60_000,
     }),
   );
-  await bestEffort(() =>
+  await bestEffortPreclean(() =>
     sandbox.openshell(["gateway", "destroy", "-g", "nemoclaw"], {
       artifactName: "cleanup-openshell-gateway-destroy-openclaw-skill-cli",
       env,
@@ -113,7 +106,7 @@ async function expectSandboxShellZero(
   artifactName: string,
   env: NodeJS.ProcessEnv,
 ): Promise<ShellProbeResult> {
-  const result = await sandbox.execShell(SANDBOX_NAME, singleLineSandboxScript(script), {
+  const result = await sandbox.execShell(SANDBOX_NAME, trustedSandboxShellScript(script), {
     artifactName,
     env,
     timeoutMs: SANDBOX_EXEC_TIMEOUT_MS,
@@ -124,7 +117,18 @@ async function expectSandboxShellZero(
 
 test("openclaw-skill-cli: direct OpenClaw skills install/list/info/check roundtrip uses workspace path", {
   timeout: INSTALL_TIMEOUT_MS + 10 * 60_000,
-}, async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
+  meta: {
+    e2ePhases: [
+      "confirm built CLI Docker and hosted inference",
+      "clear the OpenClaw skill CLI sandbox",
+      "install and onboard the OpenClaw sandbox",
+      "confirm OpenClaw runtime directories",
+      "install the workspace skill fixture",
+      "inspect the installed skill through every CLI view",
+      "record the workspace skill contract",
+    ],
+  },
+}, async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
   expect(
     fs.existsSync(CLI_ENTRYPOINT),
     "run `npm run build:cli` before live repo CLI targets",
@@ -164,12 +168,30 @@ test("openclaw-skill-cli: direct OpenClaw skills install/list/info/check roundtr
 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openclaw-skill-cli-home-"));
   const env = testEnv(home);
-  cleanup.add(`remove openclaw-skill-cli state for ${SANDBOX_NAME}`, async () => {
-    await cleanupOpenClawSkillCliState(host, sandbox, home);
+  cleanup.trackDisposable(`remove openclaw-skill-cli test home for ${SANDBOX_NAME}`, () => {
     fs.rmSync(home, { recursive: true, force: true });
   });
-  await cleanupOpenClawSkillCliState(host, sandbox, home);
+  cleanup.trackGateway(host, "nemoclaw", {
+    artifactName: "cleanup-openshell-gateway-destroy-openclaw-skill-cli",
+    env,
+    timeoutMs: 120_000,
+  });
+  cleanup.trackDisposable(`delete OpenShell sandbox ${SANDBOX_NAME}`, () =>
+    sandbox.cleanupSandbox(SANDBOX_NAME, {
+      artifactName: "cleanup-openshell-sandbox-delete-openclaw-skill-cli",
+      env,
+      timeoutMs: 60_000,
+    }),
+  );
+  cleanup.trackSandbox(host, SANDBOX_NAME, {
+    artifactName: "cleanup-nemoclaw-destroy-openclaw-skill-cli",
+    env,
+    timeoutMs: 120_000,
+  });
+  progress.phase("clear the OpenClaw skill CLI sandbox");
+  await precleanOpenClawSkillCliState(host, sandbox, home);
 
+  progress.phase("install and onboard the OpenClaw sandbox");
   const install = await host.command(
     "bash",
     ["install.sh", "--non-interactive", "--yes-i-accept-third-party-software"],
@@ -194,6 +216,7 @@ test("openclaw-skill-cli: direct OpenClaw skills install/list/info/check roundtr
   }
   expect(install.exitCode, installText).toBe(0);
 
+  progress.phase("confirm OpenClaw runtime directories");
   const envCheck = await expectSandboxShellZero(
     sandbox,
     'printf "OPENCLAW_HOME=%s\\nOPENCLAW_STATE_DIR=%s\\nOPENCLAW_WORKSPACE_DIR=%s\\n" "${OPENCLAW_HOME:-}" "${OPENCLAW_STATE_DIR:-}" "${OPENCLAW_WORKSPACE_DIR:-}"',
@@ -207,6 +230,7 @@ test("openclaw-skill-cli: direct OpenClaw skills install/list/info/check roundtr
     ).toMatch(new RegExp(`^${requiredVar}=.+$`, "m"));
   }
 
+  progress.phase("install the workspace skill fixture");
   await expectSandboxShellZero(
     sandbox,
     buildWriteSkillFixtureScript(),
@@ -222,6 +246,7 @@ test("openclaw-skill-cli: direct OpenClaw skills install/list/info/check roundtr
   );
   await artifacts.writeText("openclaw-skills-install-output.txt", resultText(skillInstall));
 
+  progress.phase("inspect the installed skill through every CLI view");
   const diskCheck = await expectSandboxShellZero(
     sandbox,
     `ls -1 "\${OPENCLAW_WORKSPACE_DIR}/skills/${SKILL_ID}/" 2>&1; test -f "\${OPENCLAW_WORKSPACE_DIR}/skills/${SKILL_ID}/SKILL.md" && echo SKILL_MD_PRESENT`,
@@ -258,6 +283,7 @@ test("openclaw-skill-cli: direct OpenClaw skills install/list/info/check roundtr
   );
   expect(resultText(check)).toContain(`"${SKILL_ID}"`);
 
+  progress.phase("record the workspace skill contract");
   await artifacts.target.complete({
     id: "openclaw-skill-cli",
     status: "passed",

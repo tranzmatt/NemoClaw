@@ -2,32 +2,55 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { getSandboxInferenceConfig } from "../inference/config";
+import { MAX_AUTODETECTED_OLLAMA_CONTEXT_WINDOW } from "../inference/ollama-runtime-context";
 import {
   isWebSearchEnabled,
   type WebSearchConfig,
   webSearchProviderForConfig,
 } from "../inference/web-search";
-import { hydrateDerivedSandboxMessagingPlanFields, MessagingSetupApplier } from "../messaging";
+import {
+  hydrateDerivedSandboxMessagingPlanFields,
+  MessagingSetupApplier,
+  type SandboxMessagingPlan,
+} from "../messaging";
 import { parseSandboxMessagingPlan } from "../messaging/plan-validation";
 import {
   formatSandboxBaseImageResolutionLabels,
   type SandboxBaseImageResolutionMetadata,
 } from "../sandbox-base-image";
 import {
+  mergeHermesPreservedEnvIntoMessagingPlan,
+  type PreservedEnvFile,
+} from "../state/preserved-env/index";
+import {
   DEFAULT_TOOL_DISCLOSURE,
   normalizeToolDisclosure,
   type ToolDisclosure,
 } from "../tool-disclosure";
+import {
+  CORPORATE_CA_EXPLICIT_ENV,
+  encodeCorporateCaArg,
+  resolveCorporateCa,
+} from "./corporate-ca";
+import {
+  DCODE_AUTO_APPROVAL_BUILD_ARG,
+  type DcodeAutoApprovalMode,
+  isDcodeAutoApprovalMode,
+} from "./dcode-auto-approval";
+import * as remoteDashboardBindContract from "./dockerfile-remote-dashboard-bind-contract";
 import {
   dockerfileInstructions,
   readDockerfilePatchSnapshot,
   replaceDockerfilePatchSnapshot,
   validateToolDisclosureDockerfileContract,
 } from "./dockerfile-tool-disclosure-contract";
+import { normalizeReasoningEffort, REASONING_EFFORT_ENV } from "./reasoning-mode";
 
 export { assertToolDisclosureDockerfileContract } from "./dockerfile-tool-disclosure-contract";
 
 const SANDBOX_BASE_IMAGE = "ghcr.io/nvidia/nemoclaw/sandbox-base";
+const NODE_RUNTIME_REFRESH_INSTRUCTION =
+  "COPY --from=builder /usr/local/bin/node /usr/local/bin/node";
 const PROXY_HOST_RE = /^[A-Za-z0-9._-]+$/;
 const POSITIVE_INT_RE = /^[1-9][0-9]*$/;
 
@@ -45,13 +68,60 @@ function encodeSanitizedDockerJsonArg(value: unknown): string {
   return sanitizeDockerArg(encodeDockerJsonArg(value));
 }
 
+function normalizeOptionalEndpointUrlArg(value: string | null | undefined, name: string): string {
+  if (value === null || value === undefined || value.trim() === "") return "";
+  if (/[\p{Cc}\p{Cf}]/u.test(value)) {
+    throw new Error(`${name} must not contain control characters.`);
+  }
+  const text = value.trim();
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    throw new Error(`${name} must be a valid URL.`);
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`${name} must use HTTP or HTTPS.`);
+  }
+  if (url.username || url.password) {
+    throw new Error(`${name} must not include credentials.`);
+  }
+  if (url.search || url.hash) {
+    throw new Error(`${name} must not include query strings or fragments.`);
+  }
+  return url.href;
+}
+
 export type DockerfileBuildIdPolicy = "preserve" | "rewrite";
 
 export interface PatchStagedDockerfileOptions {
   buildIdPolicy?: DockerfileBuildIdPolicy;
   toolDisclosure?: ToolDisclosure;
   requireToolDisclosureContract?: boolean;
+  trustedManagedDockerfile?: boolean;
   baseImageResolutionMetadata?: SandboxBaseImageResolutionMetadata | null;
+  dcodeAutoApprovalMode?: DcodeAutoApprovalMode;
+  upstreamEndpointUrl?: string | null;
+  compatibleEndpointReasoning?: "true" | "false";
+  wslDashboardExposure?: boolean;
+  rebuildPreservedEnv?: readonly PreservedEnvFile[];
+}
+
+export function patchDcodeAutoApprovalDockerArg(
+  dockerfile: string,
+  mode: DcodeAutoApprovalMode,
+): string {
+  if (!isDcodeAutoApprovalMode(mode)) {
+    throw new Error("Invalid DCode auto-approval mode; refusing to patch the Dockerfile.");
+  }
+  const instruction = new RegExp(`^ARG ${DCODE_AUTO_APPROVAL_BUILD_ARG}=[^\\r\\n]*$`, "gm");
+  const matches = dockerfile.match(instruction) ?? [];
+  if (matches.length !== 1) {
+    throw new Error(
+      `Dockerfile must contain exactly one ARG ${DCODE_AUTO_APPROVAL_BUILD_ARG}=... instruction; found ${matches.length}.`,
+    );
+  }
+  return dockerfile.replace(instruction, `ARG ${DCODE_AUTO_APPROVAL_BUILD_ARG}=${mode}`);
 }
 
 export function isValidProxyHost(value: string): boolean {
@@ -62,6 +132,44 @@ export function isValidProxyPort(value: string): boolean {
   if (!/^[0-9]{1,5}$/.test(value)) return false;
   const port = Number(value);
   return port >= 1 && port <= 65535;
+}
+
+export type PatchedDockerfileMetadata = { dashboardRemoteBindPrepared: boolean };
+
+export { hasPreparedRemoteDashboardBind } from "./dockerfile-remote-dashboard-bind-contract";
+
+function patchMessagingPlanDockerArg(
+  dockerfile: string,
+  plan: SandboxMessagingPlan,
+  preservedEnv: readonly PreservedEnvFile[] | undefined,
+): string {
+  const baseMessagingPlan = hydrateDerivedSandboxMessagingPlanFields(
+    parseSandboxMessagingPlan(plan) ?? plan,
+  );
+  const imageMessagingPlan = mergeHermesPreservedEnvIntoMessagingPlan(
+    baseMessagingPlan,
+    preservedEnv,
+  );
+  const messagingPlanArgPattern = /^ARG NEMOCLAW_MESSAGING_PLAN_B64=.*$/m;
+  if (!messagingPlanArgPattern.test(dockerfile)) {
+    throw new Error(
+      "Dockerfile is missing ARG NEMOCLAW_MESSAGING_PLAN_B64; cannot apply messaging plan.",
+    );
+  }
+  return dockerfile.replace(
+    messagingPlanArgPattern,
+    `ARG NEMOCLAW_MESSAGING_PLAN_B64=${sanitizeDockerArg(MessagingSetupApplier.encodePlanForImageBuild(imageMessagingPlan))}`,
+  );
+}
+
+export function patchStagedDockerfileMessagingPlan(
+  dockerfilePath: string,
+  plan: SandboxMessagingPlan,
+  preservedEnv: readonly PreservedEnvFile[],
+): void {
+  const patchSnapshot = readDockerfilePatchSnapshot(dockerfilePath);
+  const dockerfile = patchMessagingPlanDockerArg(patchSnapshot.content, plan, preservedEnv);
+  replaceDockerfilePatchSnapshot(dockerfilePath, patchSnapshot, dockerfile);
 }
 
 export function patchStagedDockerfile(
@@ -77,7 +185,7 @@ export function patchStagedDockerfile(
   inferenceBaseUrlOverride: string | null = null,
   hermesToolGateways: string[] = [],
   options: PatchStagedDockerfileOptions = {},
-): void {
+): PatchedDockerfileMetadata {
   const sanitizedModel = sanitizeDockerArg(model);
   const sandboxInference = getSandboxInferenceConfig(
     sanitizedModel,
@@ -100,6 +208,9 @@ export function patchStagedDockerfile(
   if (toolDisclosureInstruction) {
     dockerfile = `${dockerfile.slice(0, toolDisclosureInstruction.start)}ARG NEMOCLAW_TOOL_DISCLOSURE=${sanitizeDockerArg(toolDisclosure)}${dockerfile.slice(toolDisclosureInstruction.end)}`;
   }
+  if (options.dcodeAutoApprovalMode !== undefined) {
+    dockerfile = patchDcodeAutoApprovalDockerArg(dockerfile, options.dcodeAutoApprovalMode);
+  }
   // Pin the base image to a specific digest when available (#1904).
   // The ref must come from pullAndResolveBaseImageDigest() — never from
   // blueprint.yaml, whose digest belongs to a different registry.
@@ -121,9 +232,38 @@ export function patchStagedDockerfile(
       },
     );
   }
+  // A source=local resolution is built from this checkout's Dockerfile.base,
+  // whose Node image pin is kept identical to the managed Dockerfile builder.
+  // Copying that same 125 MB binary into the final image creates a redundant
+  // export layer. Keep the checked-in COPY as the safe default for published
+  // and legacy bases, and elide it only for this trusted, authoritative local
+  // base path. Custom Dockerfiles never receive trusted resolution metadata.
+  if (
+    options.trustedManagedDockerfile === true &&
+    options.baseImageResolutionMetadata?.imageName === SANDBOX_BASE_IMAGE &&
+    options.baseImageResolutionMetadata.source === "local" &&
+    sanitizedBaseImageRef === options.baseImageResolutionMetadata.ref
+  ) {
+    const instructionCount = dockerfile
+      .split(/\r?\n/)
+      .filter((line) => line.trim() === NODE_RUNTIME_REFRESH_INSTRUCTION).length;
+    if (instructionCount !== 1) {
+      throw new Error(
+        `Managed OpenClaw Dockerfile must contain exactly one ${NODE_RUNTIME_REFRESH_INSTRUCTION} instruction; found ${instructionCount}.`,
+      );
+    }
+    dockerfile = dockerfile.replace(
+      NODE_RUNTIME_REFRESH_INSTRUCTION,
+      "# Node runtime refresh omitted: authoritative local base already uses the builder pin.",
+    );
+  }
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_MODEL=.*$/m,
     `ARG NEMOCLAW_MODEL=${sanitizedModel}`,
+  );
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_INFERENCE_PROVIDER_ID=.*$/m,
+    `ARG NEMOCLAW_INFERENCE_PROVIDER_ID=${sanitizeDockerArg(providerKey)}`,
   );
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_PROVIDER_KEY=.*$/m,
@@ -139,6 +279,14 @@ export function patchStagedDockerfile(
     /^ARG NEMOCLAW_UPSTREAM_PROVIDER=.*$/m,
     `ARG NEMOCLAW_UPSTREAM_PROVIDER=${sanitizeDockerArg(upstreamProvider)}`,
   );
+  const upstreamEndpointUrl = normalizeOptionalEndpointUrlArg(
+    options.upstreamEndpointUrl,
+    "NEMOCLAW_UPSTREAM_ENDPOINT_URL",
+  );
+  dockerfile = dockerfile.replace(
+    /^ARG NEMOCLAW_UPSTREAM_ENDPOINT_URL=.*$/m,
+    `ARG NEMOCLAW_UPSTREAM_ENDPOINT_URL=${upstreamEndpointUrl}`,
+  );
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_PRIMARY_MODEL_REF=.*$/m,
     `ARG NEMOCLAW_PRIMARY_MODEL_REF=${sanitizeDockerArg(primaryModelRef)}`,
@@ -147,6 +295,28 @@ export function patchStagedDockerfile(
     /^ARG CHAT_UI_URL=.*$/m,
     `ARG CHAT_UI_URL=${sanitizeDockerArg(chatUiUrl)}`,
   );
+  if (options.wslDashboardExposure !== undefined) {
+    const wslDashboardExposureArg = /^ARG NEMOCLAW_WSL_DASHBOARD_EXPOSURE=.*$/m;
+    const hasWslDashboardExposureArg = wslDashboardExposureArg.test(dockerfile);
+    if (options.wslDashboardExposure && !hasWslDashboardExposureArg) {
+      throw new Error(
+        "Dockerfile is missing ARG NEMOCLAW_WSL_DASHBOARD_EXPOSURE; cannot record WSL dashboard exposure.",
+      );
+    }
+    if (hasWslDashboardExposureArg) {
+      dockerfile = dockerfile.replace(
+        wslDashboardExposureArg,
+        `ARG NEMOCLAW_WSL_DASHBOARD_EXPOSURE=${options.wslDashboardExposure ? "1" : "0"}`,
+      );
+    }
+  }
+  const remoteDashboardBind = remoteDashboardBindContract.patchRequestedRemoteDashboardBindContract(
+    dockerfile,
+    process.env.NEMOCLAW_DASHBOARD_BIND,
+    options.trustedManagedDockerfile === true,
+  );
+  dockerfile = remoteDashboardBind.dockerfile;
+  const { dashboardRemoteBindPrepared } = remoteDashboardBind;
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_INFERENCE_BASE_URL=.*$/m,
     `ARG NEMOCLAW_INFERENCE_BASE_URL=${sanitizeDockerArg(inferenceBaseUrl)}`,
@@ -175,7 +345,15 @@ export function patchStagedDockerfile(
   // Honor NEMOCLAW_CONTEXT_WINDOW / NEMOCLAW_MAX_TOKENS / NEMOCLAW_REASONING
   // so the user can tune model metadata without editing the Dockerfile.
   const contextWindow = process.env.NEMOCLAW_CONTEXT_WINDOW;
-  if (contextWindow && POSITIVE_INT_RE.test(contextWindow)) {
+  // Validate the ceiling as well as the format: POSITIVE_INT_RE alone would let
+  // an implausibly large value (which the auto-detect/probe paths reject) bake
+  // into the image ARG. Match the auto-detect ceiling. See PR #6293 PRA-4
+  // (Nemotron).
+  if (
+    contextWindow &&
+    POSITIVE_INT_RE.test(contextWindow) &&
+    Number(contextWindow) <= MAX_AUTODETECTED_OLLAMA_CONTEXT_WINDOW
+  ) {
     dockerfile = dockerfile.replace(
       /^ARG NEMOCLAW_CONTEXT_WINDOW=.*$/m,
       `ARG NEMOCLAW_CONTEXT_WINDOW=${sanitizeDockerArg(contextWindow)}`,
@@ -188,11 +366,18 @@ export function patchStagedDockerfile(
       `ARG NEMOCLAW_MAX_TOKENS=${sanitizeDockerArg(maxTokens)}`,
     );
   }
-  const reasoning = process.env.NEMOCLAW_REASONING;
+  const reasoning = options.compatibleEndpointReasoning ?? process.env.NEMOCLAW_REASONING;
   if (reasoning === "true" || reasoning === "false") {
     dockerfile = dockerfile.replace(
       /^ARG NEMOCLAW_REASONING=.*$/m,
       `ARG NEMOCLAW_REASONING=${sanitizeDockerArg(reasoning)}`,
+    );
+  }
+  const reasoningEffort = normalizeReasoningEffort(process.env[REASONING_EFFORT_ENV]);
+  if (reasoningEffort) {
+    dockerfile = dockerfile.replace(
+      /^ARG NEMOCLAW_REASONING_EFFORT=.*$/m,
+      `ARG NEMOCLAW_REASONING_EFFORT=${sanitizeDockerArg(reasoningEffort)}`,
     );
   }
   // Honor NEMOCLAW_INFERENCE_INPUTS for vision-capable models. OpenClaw's
@@ -206,8 +391,8 @@ export function patchStagedDockerfile(
       `ARG NEMOCLAW_INFERENCE_INPUTS=${sanitizeDockerArg(inferenceInputs)}`,
     );
   }
-  // NEMOCLAW_AGENT_TIMEOUT — override agents.defaults.timeoutSeconds at build
-  // time. Lets users increase the per-request inference timeout without
+  // NEMOCLAW_AGENT_TIMEOUT overrides the agent-run and provider-request timeouts
+  // at build time. Users can increase the inference timeout without
   // editing the Dockerfile. Ref: issue #2281
   const agentTimeout = process.env.NEMOCLAW_AGENT_TIMEOUT;
   if (agentTimeout && POSITIVE_INT_RE.test(agentTimeout)) {
@@ -267,26 +452,14 @@ export function patchStagedDockerfile(
       dockerfile = dockerfile.replace(argPattern, `ARG ${envKey}=${sanitizeDockerArg(rawValue)}`);
     }
   }
-  // Onboard flow expects immediate dashboard access without device pairing,
-  // so disable device auth for images built during onboard (see #1217).
-  dockerfile = dockerfile.replace(
-    /^ARG NEMOCLAW_DISABLE_DEVICE_AUTH=.*$/m,
-    `ARG NEMOCLAW_DISABLE_DEVICE_AUTH=${sanitizeDockerArg("1")}`,
-  );
+  // Keep the managed pairing opt-out distinct from an operator's choice.
+  dockerfile = remoteDashboardBindContract.patchManagedDeviceAuthOptOutContract(dockerfile);
   const messagingPlan = MessagingSetupApplier.readPlanFromEnv();
   if (messagingPlan) {
-    const hydratedMessagingPlan = hydrateDerivedSandboxMessagingPlanFields(
-      parseSandboxMessagingPlan(messagingPlan) ?? messagingPlan,
-    );
-    const messagingPlanArgPattern = /^ARG NEMOCLAW_MESSAGING_PLAN_B64=.*$/m;
-    if (!messagingPlanArgPattern.test(dockerfile)) {
-      throw new Error(
-        "Dockerfile is missing ARG NEMOCLAW_MESSAGING_PLAN_B64; cannot apply messaging plan.",
-      );
-    }
-    dockerfile = dockerfile.replace(
-      messagingPlanArgPattern,
-      `ARG NEMOCLAW_MESSAGING_PLAN_B64=${sanitizeDockerArg(MessagingSetupApplier.encodePlan(hydratedMessagingPlan))}`,
+    dockerfile = patchMessagingPlanDockerArg(
+      dockerfile,
+      messagingPlan,
+      options.rebuildPreservedEnv,
     );
   }
   if (hermesToolGateways.length > 0) {
@@ -322,5 +495,34 @@ export function patchStagedDockerfile(
       `ARG NEMOCLAW_EXTRA_AGENTS_JSON_B64=${encoded}`,
     );
   }
+  // Corporate proxy CA import (#6210). When the host exposes an operator
+  // corporate CA bundle — via env var or an installed host trust-store anchor —
+  // bake its base64 so the entrypoint can append it to the OpenShell trust
+  // bundle at runtime (never replacing it). The replace is a silent no-op on
+  // custom/legacy Dockerfiles that predate this ARG.
+  const corporateCa = resolveCorporateCa(process.env);
+  if (corporateCa) {
+    const corporateCaArgPattern = /^ARG NEMOCLAW_CORPORATE_CA_B64=.*$/m;
+    if (corporateCaArgPattern.test(dockerfile)) {
+      dockerfile = dockerfile.replace(
+        corporateCaArgPattern,
+        `ARG NEMOCLAW_CORPORATE_CA_B64=${sanitizeDockerArg(encodeCorporateCaArg(corporateCa.pem))}`,
+      );
+      // Surface which host source is being baked so a fallback import (from a
+      // conventional CA env var rather than the explicit opt-in) is never
+      // silent. The CA is a public certificate, so logging its source is safe.
+      console.error(
+        `[nemoclaw] baking corporate proxy CA from ${corporateCa.sourceEnv} (${corporateCa.sourcePath}) into the sandbox image trust (#6210)`,
+      );
+    } else if (corporateCa.sourceEnv === CORPORATE_CA_EXPLICIT_ENV) {
+      // Explicit opt-in must not silently no-op on a managed Dockerfile.
+      throw new Error(
+        "Dockerfile is missing ARG NEMOCLAW_CORPORATE_CA_B64; cannot bake the corporate CA from NEMOCLAW_CORPORATE_CA_BUNDLE.",
+      );
+    }
+    // Fallback source + a custom Dockerfile without the ARG: leave a no-op.
+  }
+
   replaceDockerfilePatchSnapshot(dockerfilePath, patchSnapshot, dockerfile);
+  return { dashboardRemoteBindPrepared };
 }

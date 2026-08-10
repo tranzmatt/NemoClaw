@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { createSession } from "../state/onboard-session";
 import {
   applyOnboardRuntimeControlRequests,
-  applySelectedAgentTransition,
+  planSelectedAgentTransition,
   updateSessionAgent,
 } from "./runtime-control-flow";
 
@@ -20,15 +20,18 @@ describe("onboard runtime control flow", () => {
       applyOnboardRuntimeControlRequests({
         toolDisclosure: "direct",
         observabilityEnabled: true,
+        dcodeAutoApprovalMode: "thread-opt-in",
       }),
     ).toEqual({
       requestedToolDisclosure: "direct",
       requestedObservabilityEnabled: true,
+      requestedDcodeAutoApprovalMode: "thread-opt-in",
     });
     delete process.env.NEMOCLAW_TOOL_DISCLOSURE;
     expect(applyOnboardRuntimeControlRequests({})).toEqual({
       requestedToolDisclosure: null,
       requestedObservabilityEnabled: null,
+      requestedDcodeAutoApprovalMode: null,
     });
   });
 
@@ -41,6 +44,7 @@ describe("onboard runtime control flow", () => {
     ).toEqual({
       requestedToolDisclosure: null,
       requestedObservabilityEnabled: null,
+      requestedDcodeAutoApprovalMode: null,
     });
   });
 
@@ -72,7 +76,7 @@ describe("onboard runtime control flow", () => {
     expect(session).toEqual(before);
   });
 
-  it("rejects an invalid resumed agent transition before router or session mutation", async () => {
+  it("rejects an invalid resumed agent transition before router or session mutation", () => {
     const session = createSession({
       agent: "langchain-deepagents-code",
       observabilityEnabled: true,
@@ -82,7 +86,6 @@ describe("onboard runtime control flow", () => {
     const before = structuredClone(session);
     const stopTrackedModelRouterForAgentChange = vi.fn(async () => undefined);
     const clearAgentScopedResumeState = vi.fn((current) => current);
-    const setOnboardBrandingAgent = vi.fn();
     const updateSession = vi.fn((mutator) => mutator(session) ?? session);
     const note = vi.fn();
     const error = vi.fn();
@@ -90,8 +93,8 @@ describe("onboard runtime control flow", () => {
       throw new Error("exit 1");
     });
 
-    await expect(
-      applySelectedAgentTransition(
+    expect(() =>
+      planSelectedAgentTransition(
         {
           resume: true,
           session,
@@ -102,19 +105,58 @@ describe("onboard runtime control flow", () => {
         {
           stopTrackedModelRouterForAgentChange,
           clearAgentScopedResumeState,
-          setOnboardBrandingAgent,
           updateSession,
           error,
           exitProcess,
         },
       ),
-    ).rejects.toThrow("exit 1");
+    ).toThrow("exit 1");
 
     expect(stopTrackedModelRouterForAgentChange).not.toHaveBeenCalled();
     expect(clearAgentScopedResumeState).not.toHaveBeenCalled();
-    expect(setOnboardBrandingAgent).not.toHaveBeenCalled();
     expect(updateSession).not.toHaveBeenCalled();
     expect(note).not.toHaveBeenCalled();
     expect(session).toEqual(before);
+  });
+
+  it("plans without effects and commits router cleanup before durable session clearing (#7411)", async () => {
+    const session = createSession({
+      agent: "langchain-deepagents-code",
+      provider: "nvidia",
+      routerPid: 1234,
+    });
+    const before = structuredClone(session);
+    const effects: string[] = [];
+    const updateSession = vi.fn((mutator) => {
+      effects.push("update-session");
+      return mutator(session) ?? session;
+    });
+
+    const plan = planSelectedAgentTransition(
+      {
+        resume: true,
+        session,
+        selectedAgentName: "openclaw",
+        routerPort: 4000,
+        note: () => undefined,
+      },
+      {
+        stopTrackedModelRouterForAgentChange: async () => {
+          effects.push("stop-router");
+        },
+        updateSession,
+      },
+    );
+
+    expect(plan.resumeAgentChanged).toBe(true);
+    expect(plan.session.routerPid).toBeNull();
+    expect(effects).toEqual([]);
+    expect(updateSession).not.toHaveBeenCalled();
+    expect(session).toEqual(before);
+
+    await plan.commit();
+
+    expect(effects).toEqual(["stop-router", "update-session"]);
+    expect(session.routerPid).toBeNull();
   });
 });

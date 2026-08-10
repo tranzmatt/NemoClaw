@@ -4,11 +4,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { hashCredential } from "../../../security/credential-hash";
+import {
+  decisionDeclined,
+  decisionSelected,
+  decisionUnset,
+} from "../../../state/onboard-checkpoint-decision";
+import { CHECKPOINT_SCHEMA_VERSION } from "../../../state/onboard-checkpoint-types";
 import { createSession, type Session } from "../../../state/onboard-session";
 import { detectMessagingChannelsFromEnv } from "../../messaging-channel-setup";
 import { handleSandboxState } from "./sandbox";
 import {
   baseOptions,
+  bindJournaledRecreate,
   createDeps,
   makeMinimalPlan,
   withEnv,
@@ -47,9 +54,10 @@ describe("handleSandboxState", () => {
     });
     calls.setupMessaging.mockResolvedValue(["telegram"]);
 
-    const result = await handleSandboxState(baseOptions(deps));
+    const result = await handleSandboxState({ ...baseOptions(deps), fresh: true });
 
     expect(calls.startStep).toHaveBeenCalledWith("sandbox", {
+      sandboxName: "my-assistant",
       provider: "provider",
       model: "model",
     });
@@ -70,7 +78,14 @@ describe("handleSandboxState", () => {
       null,
       [],
       null,
-      { recreate: false, toolDisclosure: "progressive", observabilityEnabled: false },
+      {
+        resolved: expect.any(Object),
+        recreate: false,
+        toolDisclosure: "progressive",
+        observabilityEnabled: false,
+        endpointSource: "onboard",
+        extraProviders: [],
+      },
     );
     expect(calls.updateSandbox).toHaveBeenCalledWith(
       "my-assistant",
@@ -95,6 +110,80 @@ describe("handleSandboxState", () => {
       updates: undefined,
       metadata: { state: "sandbox", sandboxName: "my-assistant", agent: "openclaw" },
     });
+    expect(result.session?.checkpoint?.webSearch).toEqual(decisionSelected({ fetchEnabled: true }));
+    expect(result.session?.checkpoint?.messaging).toEqual(decisionDeclined());
+  });
+
+  it("records credential-provider bindings and the resource-profile decision in the checkpoint (#7022)", async () => {
+    const { deps } = createDeps({
+      configureWebSearch: vi.fn(async () => ({ fetchEnabled: true as const })),
+      stageSandboxCredentialProviders: vi.fn(async () => [
+        { name: "my-assistant-brave-search", type: "brave", credentialEnv: "BRAVE_API_KEY" },
+      ]),
+      providerMatchesGatewayCredential: (name, type, credentialEnv) =>
+        name === "my-assistant-brave-search" &&
+        type === "brave" &&
+        credentialEnv === "BRAVE_API_KEY",
+      selectResourceProfileForSandbox: vi.fn(async () => ({ cpu: "2", memory: "4Gi" })),
+    });
+
+    const result = await handleSandboxState(baseOptions(deps));
+
+    expect(result.session?.checkpoint?.bindings.registeredProviders).toEqual([
+      { name: "my-assistant-brave-search", type: "brave", credentialEnv: "BRAVE_API_KEY" },
+    ]);
+    expect(result.session?.checkpoint?.bindings.credentialEnvs).toEqual(["BRAVE_API_KEY"]);
+    expect(result.session?.checkpoint?.resourceProfile).toEqual(
+      decisionSelected({ cpu: "2", memory: "4Gi" }),
+    );
+  });
+
+  it("skips re-registering a provider whose effect-group receipt and live postcondition both hold (#7022)", async () => {
+    const session = createSession({ sandboxName: "my-assistant" });
+    session.checkpoint = {
+      schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      sessionId: session.sessionId,
+      machineState: "sandbox",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      sandboxIdentity: decisionSelected({ name: "my-assistant", agent: "openclaw" }),
+      webSearch: decisionUnset(),
+      messaging: decisionUnset(),
+      resourceProfile: decisionUnset(),
+      gatewayAuthority: decisionUnset(),
+      effectGroups: {
+        web_search_provider: {
+          completedAt: "2026-01-01T00:00:00.000Z",
+          fingerprint: "my-assistant-brave-search",
+        },
+      },
+      bindings: {
+        credentialEnvs: [],
+        registeredProviders: [
+          { name: "my-assistant-brave-search", type: "brave", credentialEnv: "BRAVE_API_KEY" },
+        ],
+      },
+      sandboxRecreate: null,
+    };
+    const updateSession = vi.fn((mutator: (value: typeof session) => void) => {
+      mutator(session);
+      return session;
+    });
+    const stageSandboxCredentialProviders = vi.fn(async () => [
+      { name: "my-assistant-brave-search", type: "brave", credentialEnv: "BRAVE_API_KEY" },
+    ]);
+    const { deps } = createDeps({
+      updateSession,
+      configureWebSearch: vi.fn(async () => ({ fetchEnabled: true as const })),
+      stageSandboxCredentialProviders,
+      providerMatchesGatewayCredential: (name, type, credentialEnv) =>
+        name === "my-assistant-brave-search" &&
+        type === "brave" &&
+        credentialEnv === "BRAVE_API_KEY",
+    });
+
+    await handleSandboxState({ ...baseOptions(deps, session), sandboxName: "my-assistant" });
+
+    expect(stageSandboxCredentialProviders).not.toHaveBeenCalled();
   });
 
   it("does not auto-enable web search from ambient credentials during authoritative rebuild", async () => {
@@ -112,30 +201,6 @@ describe("handleSandboxState", () => {
     expect(result.webSearchConfig).toBeNull();
   });
 
-  it("carries durable observability intent in the sandbox create intent", async () => {
-    const session = createSession({
-      observabilityEnabled: true,
-      observabilityRequestedExplicitly: true,
-    });
-    const { deps, calls } = createDeps({
-      updateSession: vi.fn((mutator: (value: Session) => Session | void) => {
-        return mutator(session) ?? session;
-      }),
-    });
-
-    await handleSandboxState({
-      ...baseOptions(deps, session),
-      agent: { name: "langchain-deepagents-code" },
-    });
-
-    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toEqual({
-      recreate: false,
-      toolDisclosure: "progressive",
-      observabilityEnabled: true,
-      observabilityRequestedExplicitly: true,
-    });
-  });
-
   it("carries an authoritative rebuild tier in the sandbox create intent", async () => {
     const { deps, calls } = createDeps();
 
@@ -149,6 +214,22 @@ describe("handleSandboxState", () => {
     expect(calls.createSandbox.mock.calls[0]?.at(-1)).toMatchObject({
       policyTier: "restricted",
     });
+  });
+
+  it("preserves an authoritative null tier in the sandbox create intent", async () => {
+    const { deps, calls } = createDeps();
+
+    await handleSandboxState({
+      ...baseOptions(deps),
+      agent: { name: "langchain-deepagents-code" },
+      authoritativeResumeConfig: true,
+      authoritativePolicyTier: null,
+    });
+
+    expect(calls.resolveCreateIntent).toHaveBeenCalledWith(
+      expect.objectContaining({ policyTier: null }),
+    );
+    expect(calls.createSandbox.mock.calls[0]?.at(-1)).toHaveProperty("policyTier", null);
   });
 
   it("rejects observability for a selected non-DCode agent", async () => {
@@ -449,7 +530,14 @@ describe("handleSandboxState", () => {
       null,
       ["nous-audio"],
       null,
-      { recreate: false, toolDisclosure: "progressive", observabilityEnabled: false },
+      {
+        resolved: expect.any(Object),
+        recreate: false,
+        toolDisclosure: "progressive",
+        observabilityEnabled: false,
+        endpointSource: null,
+        extraProviders: [],
+      },
     );
     expect(result.hermesToolGateways).toEqual(["nous-audio"]);
     expect(calls.note).toHaveBeenCalledWith(
@@ -461,7 +549,8 @@ describe("handleSandboxState", () => {
     );
   });
 
-  it("reuses a completed ready sandbox on resume", async () => {
+  it("reuses a Ready sandbox from the registry without reading an invalid environment plan", async () => {
+    const registryPlan = makeMinimalPlan("saved", "openclaw", ["telegram"]);
     const session = createSession({
       sandboxName: "saved",
       messagingPlan: makeMinimalPlan("saved", "openclaw", ["slack"]),
@@ -469,6 +558,9 @@ describe("handleSandboxState", () => {
     session.steps.sandbox.status = "complete";
     const skippedSession = createSession({ sandboxName: "saved-after-skip" });
     const recordStateSkipped = vi.fn(async () => skippedSession);
+    const readMessagingPlanFromEnv = vi.fn(() => {
+      throw new Error("invalid environment plan");
+    });
     const { deps, calls } = createDeps({
       getSandboxReuseState: () => "ready",
       getSandboxRegistryEntry: () => ({
@@ -482,6 +574,8 @@ describe("handleSandboxState", () => {
         fromDockerfile: null,
         hermesAuthMethod: null,
       }),
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: registryPlan }),
+      readMessagingPlanFromEnv,
       recordStateSkipped,
     });
 
@@ -491,6 +585,7 @@ describe("handleSandboxState", () => {
       sandboxName: "saved",
     });
 
+    expect(readMessagingPlanFromEnv).not.toHaveBeenCalled();
     expect(calls.createSandbox).not.toHaveBeenCalled();
     expect(calls.updateSandbox).toHaveBeenCalledWith("saved", {
       pendingRouteReservation: undefined,
@@ -500,9 +595,167 @@ describe("handleSandboxState", () => {
       reason: "resume",
       sandboxName: "saved",
     });
-    expect(result.selectedMessagingChannels).toEqual(["slack"]);
+    expect(result.selectedMessagingChannels).toEqual(["telegram"]);
     expect(result.webSearchConfigChanged).toBe(false);
     expect(result.session).toBe(skippedSession);
+  });
+
+  it("treats checkpoint machine-state progress past sandbox as step-complete even when the legacy step status is stale (#6228)", async () => {
+    const session = createSession({
+      sandboxName: "saved",
+      machine: { version: 1, state: "agent_setup", stateEnteredAt: null, revision: 1 },
+    });
+    session.checkpoint = {
+      schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      sessionId: session.sessionId,
+      machineState: "agent_setup",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      sandboxIdentity: decisionUnset(),
+      webSearch: decisionUnset(),
+      messaging: decisionUnset(),
+      resourceProfile: decisionUnset(),
+      gatewayAuthority: decisionUnset(),
+      effectGroups: {},
+      bindings: { credentialEnvs: [], registeredProviders: [] },
+      sandboxRecreate: null,
+    };
+    const { deps, calls } = createDeps({
+      getSandboxReuseState: () => "ready",
+      getSandboxRegistryEntry: () => ({
+        name: "saved",
+        provider: "provider",
+        model: "model",
+        endpointUrl: null,
+        preferredInferenceApi: "openai-completions",
+        toolDisclosure: "progressive",
+        fromDockerfile: null,
+        hermesAuthMethod: null,
+      }),
+    });
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "saved",
+    });
+
+    expect(session.steps.sandbox.status).not.toBe("complete");
+    expect(calls.createSandbox).not.toHaveBeenCalled();
+    expect(calls.recordSkip).toHaveBeenCalled();
+  });
+
+  it("does not let a stale legacy complete marker override a checkpoint still at sandbox (#7022)", async () => {
+    const session = createSession({ sandboxName: "saved" });
+    session.steps.sandbox.status = "complete";
+    session.checkpoint = {
+      schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      sessionId: session.sessionId,
+      machineState: "sandbox",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      sandboxIdentity: decisionUnset(),
+      webSearch: decisionUnset(),
+      messaging: decisionUnset(),
+      resourceProfile: decisionUnset(),
+      gatewayAuthority: decisionUnset(),
+      effectGroups: {},
+      bindings: { credentialEnvs: [], registeredProviders: [] },
+      sandboxRecreate: null,
+    };
+    const { deps, calls } = createDeps({ getSandboxReuseState: () => "missing" });
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "saved",
+    });
+
+    expect(calls.createSandbox).toHaveBeenCalled();
+  });
+
+  it("prefers the checkpointed web-search decision over a stale legacy completion flag (#7022)", async () => {
+    const session = createSession({
+      sandboxName: "saved",
+      sandboxPromptProgress: {
+        sandboxName: true,
+        webSearch: true,
+        messaging: false,
+        resourceProfile: false,
+      },
+    });
+    session.checkpoint = {
+      schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      sessionId: session.sessionId,
+      machineState: "sandbox",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      sandboxIdentity: decisionSelected({ name: "saved", agent: "openclaw" }),
+      webSearch: decisionSelected({ fetchEnabled: true, provider: "brave" }),
+      messaging: decisionUnset(),
+      resourceProfile: decisionUnset(),
+      gatewayAuthority: decisionUnset(),
+      effectGroups: {},
+      bindings: { credentialEnvs: [], registeredProviders: [] },
+      sandboxRecreate: null,
+    };
+    const updateSession = vi.fn((mutator: (value: typeof session) => void) => {
+      mutator(session);
+      return session;
+    });
+    const { deps, calls } = createDeps({ getSandboxReuseState: () => "missing", updateSession });
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "saved",
+    });
+
+    expect(calls.configureWebSearch).not.toHaveBeenCalled();
+    expect((calls.createSandbox.mock.calls[0] as unknown[] | undefined)?.[5]).toEqual({
+      fetchEnabled: true,
+      provider: "brave",
+    });
+  });
+
+  it("prefers the checkpointed resource-profile decision over a stale legacy completion flag (#7022)", async () => {
+    const session = createSession({
+      sandboxName: "saved",
+      sandboxPromptProgress: {
+        sandboxName: true,
+        webSearch: true,
+        messaging: true,
+        resourceProfile: true,
+      },
+    });
+    session.checkpoint = {
+      schemaVersion: CHECKPOINT_SCHEMA_VERSION,
+      sessionId: session.sessionId,
+      machineState: "sandbox",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      sandboxIdentity: decisionSelected({ name: "saved", agent: "openclaw" }),
+      webSearch: decisionDeclined(),
+      messaging: decisionDeclined(),
+      resourceProfile: decisionSelected({ cpu: "4", memory: "8Gi" }),
+      gatewayAuthority: decisionUnset(),
+      effectGroups: {},
+      bindings: { credentialEnvs: [], registeredProviders: [] },
+      sandboxRecreate: null,
+    };
+    const updateSession = vi.fn((mutator: (value: typeof session) => void) => {
+      mutator(session);
+      return session;
+    });
+    const { deps, calls } = createDeps({ getSandboxReuseState: () => "missing", updateSession });
+
+    await handleSandboxState({
+      ...baseOptions(deps, session),
+      resume: true,
+      sandboxName: "saved",
+    });
+
+    expect(calls.selectResourceProfile).not.toHaveBeenCalled();
+    expect((calls.createSandbox.mock.calls[0] as unknown[] | undefined)?.[11]).toEqual({
+      cpu: "4",
+      memory: "8Gi",
+    });
   });
 
   it("recreates a resumed Hermes sandbox when its compatible Anthropic frontend is stale", async () => {
@@ -554,7 +807,14 @@ describe("handleSandboxState", () => {
       null,
       [],
       null,
-      { recreate: true, toolDisclosure: "progressive", observabilityEnabled: false },
+      {
+        resolved: expect.any(Object),
+        recreate: true,
+        toolDisclosure: "progressive",
+        observabilityEnabled: false,
+        endpointSource: null,
+        extraProviders: [],
+      },
     );
   });
 
@@ -597,13 +857,19 @@ describe("handleSandboxState", () => {
   it("marks web search changed when recreate implicitly enables Tavily", async () => {
     const session = createSession({ sandboxName: "saved" });
     session.steps.sandbox.status = "complete";
-    const { deps } = createDeps({
-      getSandboxReuseState: () => "not_ready",
-      configureWebSearch: vi.fn(async () => ({
-        fetchEnabled: true as const,
-        provider: "tavily" as const,
-      })),
-    });
+    const journal = bindJournaledRecreate(session);
+    const { deps } = createDeps(
+      {
+        getSandboxReuseState: () => "not_ready",
+        getSandboxRecreateObservation: journal.observe,
+        configureWebSearch: vi.fn(async () => ({
+          fetchEnabled: true as const,
+          provider: "tavily" as const,
+        })),
+        createSandbox: journal.completeCreate,
+      },
+      session,
+    );
 
     const result = await handleSandboxState({
       ...baseOptions(deps, session),
@@ -615,88 +881,31 @@ describe("handleSandboxState", () => {
     expect(result.webSearchConfigChanged).toBe(true);
   });
 
-  it("removes registry state when messaging config drift forces sandbox recreation", async () => {
-    const session = createSession();
-    session.steps.sandbox.status = "complete";
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "ready",
-      getStoredMessagingChannelConfig: () => ({ TELEGRAM_REQUIRE_MENTION: "1" }),
-      hydrateMessagingChannelConfig: () => ({ TELEGRAM_REQUIRE_MENTION: "0" }),
-      messagingChannelConfigsEqual: () => false,
-    });
-
-    await handleSandboxState({
-      ...baseOptions(deps, session),
-      resume: true,
-      sandboxName: "saved",
-    });
-
-    expect(calls.note).toHaveBeenCalledWith(
-      "  [resume] Messaging channel configuration changed; recreating sandbox.",
-    );
-    expect(calls.removeSandbox).toHaveBeenCalledWith("saved");
-    expect(calls.createSandbox).toHaveBeenCalled();
-  });
-
-  it("repairs not-ready resumed sandboxes before recreation", async () => {
-    const session = createSession({ sandboxName: "saved" });
-    session.steps.sandbox.status = "complete";
-    const { deps, calls } = createDeps({ getSandboxReuseState: () => "not_ready" });
-
-    await handleSandboxState({ ...baseOptions(deps, session), resume: true, sandboxName: "saved" });
-
-    expect(calls.repairEvent).toHaveBeenCalledWith("state.repair.started", {
-      state: "sandbox",
-      metadata: { repair: "recorded-sandbox-cleanup", sandboxName: "saved" },
-    });
-    expect(calls.repairSandbox).toHaveBeenCalledWith("saved");
-    expect(calls.repairEvent).toHaveBeenCalledWith("state.repair.completed", {
-      state: "sandbox",
-      metadata: { repair: "recorded-sandbox-cleanup", sandboxName: "saved" },
-    });
-    expect(calls.createSandbox).toHaveBeenCalled();
-  });
-
-  it("records failed sandbox repair events before propagating repair errors", async () => {
-    const session = createSession({ sandboxName: "saved" });
-    session.steps.sandbox.status = "complete";
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "not_ready",
-      repairRecordedSandbox: vi.fn(() => {
-        throw new Error("cleanup failed");
-      }),
-    });
-
-    await expect(
-      handleSandboxState({ ...baseOptions(deps, session), resume: true, sandboxName: "saved" }),
-    ).rejects.toThrow("cleanup failed");
-
-    expect(calls.repairEvent).toHaveBeenCalledWith("state.repair.started", {
-      state: "sandbox",
-      metadata: { repair: "recorded-sandbox-cleanup", sandboxName: "saved" },
-    });
-    expect(calls.repairEvent).toHaveBeenCalledWith("state.repair.failed", {
-      state: "sandbox",
-      error: "cleanup failed",
-      metadata: { repair: "recorded-sandbox-cleanup", sandboxName: "saved" },
-    });
-    expect(calls.repairEvent).not.toHaveBeenCalledWith("state.repair.completed", expect.anything());
-    expect(calls.createSandbox).not.toHaveBeenCalled();
-  });
-
   it("recreates when a saved web search sandbox is no longer supported", async () => {
     const session = createSession({
       sandboxName: "saved",
       webSearchConfig: { fetchEnabled: true },
+      sandboxPromptProgress: {
+        sandboxName: true,
+        webSearch: true,
+        messaging: false,
+        resourceProfile: false,
+      },
     });
     session.steps.sandbox.status = "complete";
-    const { deps, calls } = createDeps({
-      agentSupportsWebSearch: () => false,
-      getSandboxReuseState: () => "ready",
-      updateSession: vi.fn(
-        (mutator: (value: Session) => Session | void) => mutator(session) ?? session,
-      ),
-    });
+    const journal = bindJournaledRecreate(session);
+    const { deps, calls } = createDeps(
+      {
+        agentSupportsWebSearch: () => false,
+        getSandboxReuseState: () => "ready",
+        getSandboxRecreateObservation: journal.observe,
+        createSandbox: journal.completeCreate,
+        updateSession: vi.fn(
+          (mutator: (value: Session) => Session | void) => mutator(session) ?? session,
+        ),
+      },
+      session,
+    );
 
     await handleSandboxState({
       ...baseOptions(deps, session),
@@ -711,8 +920,10 @@ describe("handleSandboxState", () => {
     expect(calls.note).toHaveBeenCalledWith(
       "  [resume] Web Search configuration changed; recreating sandbox.",
     );
-    expect(calls.removeSandbox).toHaveBeenCalledWith("saved");
-    expect(calls.createSandbox).toHaveBeenCalled();
+    expect(calls.note).not.toHaveBeenCalledWith(
+      "  [resume] Reusing web search selection: disabled.",
+    );
+    expect(calls.removeSandbox).not.toHaveBeenCalled();
   });
 
   it("recreates when an explicit web-search provider differs from saved state", async () => {
@@ -721,10 +932,16 @@ describe("handleSandboxState", () => {
       webSearchConfig: { fetchEnabled: true, provider: "brave" },
     });
     session.steps.sandbox.status = "complete";
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "ready",
-      agentSupportsWebSearchProvider: () => true,
-    });
+    const journal = bindJournaledRecreate(session);
+    const { deps, calls } = createDeps(
+      {
+        getSandboxReuseState: () => "ready",
+        getSandboxRecreateObservation: journal.observe,
+        createSandbox: journal.completeCreate,
+        agentSupportsWebSearchProvider: () => true,
+      },
+      session,
+    );
 
     const result = await handleSandboxState({
       ...baseOptions(deps, session),
@@ -737,12 +954,12 @@ describe("handleSandboxState", () => {
     expect(calls.note).toHaveBeenCalledWith(
       "  [resume] Web Search configuration changed; recreating sandbox.",
     );
-    expect(calls.removeSandbox).toHaveBeenCalledWith("saved");
+    expect(calls.removeSandbox).not.toHaveBeenCalled();
     expect(calls.validateBrave).toHaveBeenCalledWith({
       fetchEnabled: true,
       provider: "tavily",
     });
-    expect(calls.createSandbox).toHaveBeenCalledWith(
+    expect(journal.completeCreate).toHaveBeenCalledWith(
       { type: "nvidia" },
       "model",
       "provider",
@@ -757,7 +974,20 @@ describe("handleSandboxState", () => {
       null,
       [],
       null,
-      { recreate: true, toolDisclosure: "progressive", observabilityEnabled: false },
+      expect.objectContaining({
+        resolved: expect.any(Object),
+        recreate: true,
+        toolDisclosure: "progressive",
+        observabilityEnabled: false,
+        endpointSource: null,
+        extraProviders: [],
+        reuseRegisteredCredentials: true,
+        recreateTransaction: expect.objectContaining({
+          id: expect.any(String),
+          targetGeneration: expect.any(String),
+          targetIntentFingerprint: expect.any(String),
+        }),
+      }),
     );
     expect(result.webSearchConfigChanged).toBe(true);
   });
@@ -787,7 +1017,6 @@ describe("handleSandboxState", () => {
     ).rejects.toThrow("Tavily credential rejected");
 
     expect(calls.removeSandbox).not.toHaveBeenCalled();
-    expect(calls.repairSandbox).not.toHaveBeenCalled();
     expect(calls.createSandbox).not.toHaveBeenCalled();
   });
 
@@ -842,11 +1071,17 @@ describe("handleSandboxState", () => {
     });
     session.steps.sandbox.status = "complete";
     const backToSelection = Object.freeze({ kind: "NEMOCLAW_BACK_TO_SELECTION" });
-    const { deps, calls } = createDeps({
-      getSandboxReuseState: () => "not_ready",
-      ensureValidatedWebSearchCredential: vi.fn(async () => backToSelection),
-      isBackToSelection: vi.fn((value: unknown) => value === backToSelection),
-    });
+    const journal = bindJournaledRecreate(session);
+    const { deps, calls } = createDeps(
+      {
+        getSandboxReuseState: () => "not_ready",
+        getSandboxRecreateObservation: journal.observe,
+        createSandbox: journal.completeCreate,
+        ensureValidatedWebSearchCredential: vi.fn(async () => backToSelection),
+        isBackToSelection: vi.fn((value: unknown) => value === backToSelection),
+      },
+      session,
+    );
 
     const result = await handleSandboxState({
       ...baseOptions(deps, session),
@@ -856,7 +1091,7 @@ describe("handleSandboxState", () => {
     });
 
     expect(calls.configureWebSearch).not.toHaveBeenCalled();
-    expect(calls.createSandbox).toHaveBeenCalledWith(
+    expect(journal.completeCreate).toHaveBeenCalledWith(
       { type: "nvidia" },
       "model",
       "provider",
@@ -871,7 +1106,20 @@ describe("handleSandboxState", () => {
       null,
       [],
       null,
-      { recreate: true, toolDisclosure: "progressive", observabilityEnabled: false },
+      expect.objectContaining({
+        resolved: expect.any(Object),
+        recreate: true,
+        toolDisclosure: "progressive",
+        observabilityEnabled: false,
+        endpointSource: null,
+        extraProviders: [],
+        reuseRegisteredCredentials: true,
+        recreateTransaction: expect.objectContaining({
+          id: expect.any(String),
+          targetGeneration: expect.any(String),
+          targetIntentFingerprint: expect.any(String),
+        }),
+      }),
     );
     expect(result.webSearchConfig).toBeNull();
   });
@@ -914,7 +1162,7 @@ describe("handleSandboxState", () => {
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
       readMessagingPlanFromEnv: () => null,
-      getRegistrySandboxMessagingPlan: () => registryPlan,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: registryPlan }),
     });
 
     await handleSandboxState({
@@ -926,17 +1174,19 @@ describe("handleSandboxState", () => {
     expect(writePlanToEnv).toHaveBeenCalledWith(registryPlan);
   });
 
-  it("prefers env-staged plan over registry plan on non-interactive resume (rebuild path)", async () => {
+  it("uses the registry plan without reading an invalid environment plan during sandbox creation", async () => {
     const registryPlan = makeMinimalPlan("my-assistant");
-    const rebuiltPlan = makeMinimalPlan("my-assistant", "openclaw", ["telegram"], ["telegram"]);
     const session = createSession({ sandboxName: "my-assistant", messagingPlan: registryPlan });
     const getRecordedMessagingChannelsForResume = vi.fn(() => ["telegram"]);
     const writePlanToEnv = vi.fn();
-    const { deps, getSession } = createDeps({
+    const readMessagingPlanFromEnv = vi.fn(() => {
+      throw new Error("invalid environment plan");
+    });
+    const { deps, calls, getSession } = createDeps({
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
-      readMessagingPlanFromEnv: () => rebuiltPlan,
-      getRegistrySandboxMessagingPlan: () => registryPlan,
+      readMessagingPlanFromEnv,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: registryPlan }),
     });
 
     await handleSandboxState({
@@ -945,14 +1195,10 @@ describe("handleSandboxState", () => {
       sandboxName: "my-assistant",
     });
 
-    expect(writePlanToEnv).not.toHaveBeenCalled();
-    expect(getSession().messagingPlan).toEqual(rebuiltPlan);
-    expect(getSession().messagingPlan?.disabledChannels).toEqual(["telegram"]);
-    expect(getSession().messagingPlan?.channels[0]).toMatchObject({
-      channelId: "telegram",
-      active: false,
-      disabled: true,
-    });
+    expect(readMessagingPlanFromEnv).not.toHaveBeenCalled();
+    expect(calls.createSandbox).toHaveBeenCalledOnce();
+    expect(writePlanToEnv).toHaveBeenCalledWith(registryPlan);
+    expect(getSession().messagingPlan).toEqual(registryPlan);
   });
 
   it("refreshes credential hashes when reusing an env-staged rebuild plan", async () => {
@@ -969,7 +1215,7 @@ describe("handleSandboxState", () => {
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
       readMessagingPlanFromEnv: () => rebuiltPlan,
-      getRegistrySandboxMessagingPlan: () => null,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: false, plan: null }),
     });
 
     await withEnv("TELEGRAM_BOT_TOKEN", "telegram-token-b", async () => {
@@ -1008,7 +1254,7 @@ describe("handleSandboxState", () => {
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
       readMessagingPlanFromEnv: () => null,
-      getRegistrySandboxMessagingPlan: () => registryPlan,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: registryPlan }),
     });
 
     await withEnv("TELEGRAM_BOT_TOKEN", "telegram-token-b", async () => {
@@ -1042,7 +1288,7 @@ describe("handleSandboxState", () => {
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
       readMessagingPlanFromEnv: () => emptyRebuildPlan,
-      getRegistrySandboxMessagingPlan: () => emptyRebuildPlan,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: emptyRebuildPlan }),
     });
 
     const result = await handleSandboxState({
@@ -1052,7 +1298,7 @@ describe("handleSandboxState", () => {
     });
 
     expect(calls.setupMessaging).not.toHaveBeenCalled();
-    expect(writePlanToEnv).not.toHaveBeenCalled();
+    expect(writePlanToEnv).toHaveBeenCalledWith(emptyRebuildPlan);
     expect(result.selectedMessagingChannels).toEqual([]);
     const createSandboxCall = calls.createSandbox.mock.calls[0] as unknown[];
     expect(createSandboxCall[6]).toEqual([]);
@@ -1093,7 +1339,7 @@ describe("handleSandboxState", () => {
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
       readMessagingPlanFromEnv: () => null,
-      getRegistrySandboxMessagingPlan: () => registryPlan,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: registryPlan }),
     });
 
     await handleSandboxState({
@@ -1128,15 +1374,12 @@ describe("handleSandboxState", () => {
       messagingPlan: makeMinimalPlan("my-assistant", "openclaw", ["slack"]),
     });
     const writePlanToEnv = vi.fn();
-    const readMessagingPlanFromEnv = vi
-      .fn()
-      .mockReturnValueOnce(null)
-      .mockReturnValue(refreshedPlan);
+    const readMessagingPlanFromEnv = vi.fn(() => refreshedPlan);
     const { deps, calls, getSession } = createDeps({
       getRecordedMessagingChannelsForResume: vi.fn(() => null),
       writePlanToEnv,
       readMessagingPlanFromEnv,
-      getRegistrySandboxMessagingPlan: () => registryPlan,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: registryPlan }),
     });
     // Fake-token rejection disables Telegram, so no channel survives setup.
     calls.setupMessaging.mockResolvedValue([]);
@@ -1147,6 +1390,7 @@ describe("handleSandboxState", () => {
     });
 
     expect(calls.setupMessaging).toHaveBeenCalledWith(null, ["whatsapp"], "my-assistant");
+    expect(readMessagingPlanFromEnv).toHaveBeenCalledOnce();
     expect(writePlanToEnv).not.toHaveBeenCalled();
     expect(calls.note).toHaveBeenCalledWith(
       "  [non-interactive] Detected messaging channel inputs for telegram; refreshing reused sandbox messaging plan.",
@@ -1168,7 +1412,7 @@ describe("handleSandboxState", () => {
       getRecordedMessagingChannelsForResume: vi.fn(() => null),
       writePlanToEnv,
       readMessagingPlanFromEnv: () => null,
-      getRegistrySandboxMessagingPlan: () => registryPlan,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: true, plan: registryPlan }),
     });
 
     const result = await handleSandboxState({
@@ -1192,7 +1436,7 @@ describe("handleSandboxState", () => {
       getRecordedMessagingChannelsForResume,
       writePlanToEnv,
       readMessagingPlanFromEnv: () => null,
-      getRegistrySandboxMessagingPlan: () => null,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: false, plan: null }),
     });
 
     await handleSandboxState({

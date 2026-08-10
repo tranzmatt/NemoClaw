@@ -42,7 +42,13 @@ export interface McpRebuildPreparation {
   entries: McpBridgeEntry[];
   detachedProviderEntries: McpBridgeEntry[];
   scrubbedAdapterEntries: McpBridgeEntry[];
+  /** Full read-only target, policy, provider, and registry proof before delete. */
+  revalidateBeforeDelete?: () => Promise<void>;
+  /** Final synchronous registry-only proof immediately before delete. */
+  assertDeleteEdgeUnchanged?: () => void;
 }
+
+export { prepareMcpBridgesForExecUnavailableRebuild } from "./mcp-bridge-rebuild-exec-unavailable";
 
 async function getCompleteMcpRebuildEntries(
   sandboxName: string,
@@ -218,7 +224,7 @@ export async function restoreMcpBridgesAfterRebuild(
   if (entries.length === 0) return;
   for (const entry of entries) assertAuthenticatedBridgeEntry(entry);
   const bridges = Object.fromEntries(
-    entries.map((entry) => [entry.server, { ...entry, env: [...entry.env] }]),
+    entries.map((entry) => [entry.server, cloneMcpBridgeEntry(entry)]),
   );
   // Persist the recovery contract before touching the gateway. If refresh
   // fails, `mcp restart` remains retryable after the operator fixes the cause.

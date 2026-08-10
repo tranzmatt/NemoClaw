@@ -18,6 +18,7 @@ PREFIX="04-deepagents-code-fresh-reonboard"
 PRIMARY_TARGET_MODEL="openai/openai/gpt-5.5"
 FALLBACK_TARGET_MODEL="nvidia/nvidia/nemotron-3-ultra"
 HOSTED_ENDPOINT="${NEMOCLAW_ENDPOINT_URL:-https://inference-api.nvidia.com/v1}"
+CREDENTIAL_CANARY="nemoclaw-dcode-config-get-canary"
 
 fail() {
   printf '%s: FAIL: %s\n' "$PREFIX" "$1" >&2
@@ -61,8 +62,31 @@ assert_identity() {
   [ "$endpoint" = "https://inference.local/v1" ] || fail "$phase identity endpoint is '${endpoint:-missing}'"
 }
 
-encode_source() {
-  base64 | tr -d '\n'
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
+wait_for_status_after_reonboard() {
+  local attempt attempts delay_seconds status_json status
+  attempts="${NEMOCLAW_E2E_DCODE_STATUS_ATTEMPTS:-5}"
+  delay_seconds="${NEMOCLAW_E2E_DCODE_STATUS_DELAY_SECONDS:-5}"
+  is_positive_integer "$attempts" || fail "status attempts must be a positive integer"
+  [[ "$delay_seconds" =~ ^[0-9]+$ ]] || fail "status retry delay must be a non-negative integer"
+
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    if status_json="$("$CLI" "$SANDBOX_NAME" status --json)"; then
+      printf '%s\n' "$status_json"
+      return 0
+    else
+      status=$?
+    fi
+    if [ "$attempt" -lt "$attempts" ]; then
+      sleep "$delay_seconds"
+    fi
+  done
+
+  printf '%s\n' "$status_json"
+  return "$status"
 }
 
 seed_config_source() {
@@ -74,7 +98,7 @@ import tomllib
 import tomli_w
 
 path = Path("/sandbox/.deepagents/config.toml")
-model = sys.argv[1]
+model, credential_canary = sys.argv[1:]
 config = tomllib.loads(path.read_text(encoding="utf-8"))
 provider = config["models"]["providers"]["openai"]
 config["models"]["default"] = f"openai:{model}"
@@ -88,7 +112,7 @@ config["threads"] = {
     "columns": {"initial_prompt": False},
 }
 config["agents"] = {"startup_command": "discard"}
-config["headers"] = {"authorization": "discard"}
+config["headers"] = {"authorization": credential_canary}
 config["hooks"] = {"post_start": "discard"}
 config["mcp"] = {"autoload": True, "config": "/sandbox/discard-mcp.json"}
 config["servers"] = {"discard": {"api_key": "discard"}}
@@ -117,7 +141,7 @@ initial_model, target_model = sys.argv[1:]
 text = path.read_text(encoding="utf-8")
 config = tomllib.loads(text)
 provider = config["models"]["providers"]["openai"]
-assert set(config) == {"models", "update", "ui", "threads"}
+assert set(config) == {"models", "update", "ui", "threads", "warnings"}
 assert config["models"]["default"] == f"openai:{target_model}"
 assert provider["models"] == [target_model]
 assert provider["api_key_env"] == "DEEPAGENTS_CODE_OPENAI_API_KEY"
@@ -125,6 +149,7 @@ assert provider["base_url"] == "https://inference.local/v1"
 assert config["update"] == {"check": False, "auto_update": False}
 assert config["ui"] == {"show_scrollbar": True, "show_url_open_toast": False}
 assert config["threads"] == {"relative_time": False, "sort_order": "created_at"}
+assert config["warnings"] == {"suppress": ["tavily"]}
 assert initial_model not in text
 for forbidden in (
     "compatible-anthropic-endpoint",
@@ -138,6 +163,10 @@ for forbidden in (
 print("NEMOCLAW_DCODE_FRESH_CONFIG_VERIFIED")
 PY
 }
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
 
 [ -n "$SANDBOX_NAME" ] || fail "sandbox name is required"
 
@@ -172,11 +201,53 @@ fi
 [ "$model_a" != "$model_b" ] || fail "model A and model B must differ"
 pass "initial live identity reports model A"
 
-seed_source="$(seed_config_source | encode_source)"
-seed_command="printf '%s' ${seed_source@Q} | base64 -d | /opt/venv/bin/python3 -I - ${model_a@Q}"
-seed_output="$(sandbox_exec "$seed_command")" || fail "could not seed stale DCode config"
+seed_source="$(seed_config_source)"
+seed_output="$(
+  openshell sandbox exec --name "$SANDBOX_NAME" -- \
+    /opt/venv/bin/python3 -I -c "$seed_source" "$model_a" "$CREDENTIAL_CANARY" 2>&1
+)" || fail "could not seed stale DCode config"
 printf '%s\n' "$seed_output" | grep -Fq "NEMOCLAW_DCODE_STALE_CONFIG_SEEDED" || fail "stale config seed marker is missing"
 pass "seeded safe preferences and stale managed data"
+
+config_json="$("$CLI" "$SANDBOX_NAME" config get 2>&1)" || fail "config get failed for live DCode TOML: $config_json"
+CONFIG_JSON="$config_json" MODEL_A="$model_a" CREDENTIAL_CANARY="$CREDENTIAL_CANARY" node -e '
+const config = JSON.parse(process.env.CONFIG_JSON);
+if (config.models?.default !== "openai:" + process.env.MODEL_A) process.exit(1);
+if (Object.hasOwn(config, "gateway")) process.exit(1);
+if (config.headers?.authorization !== "[STRIPPED_BY_MIGRATION]") process.exit(1);
+if (JSON.stringify(config).includes(process.env.CREDENTIAL_CANARY)) process.exit(1);
+' || fail "config get did not return sanitized, parseable JSON for model A"
+pass "config get parses live DCode TOML and redacts credentials"
+
+config_model_json="$("$CLI" "$SANDBOX_NAME" config get --key models.default 2>&1)" || fail "keyed config get failed for live DCode TOML: $config_model_json"
+CONFIG_MODEL_JSON="$config_model_json" MODEL_A="$model_a" node -e '
+if (JSON.parse(process.env.CONFIG_MODEL_JSON) !== "openai:" + process.env.MODEL_A) process.exit(1);
+' || fail "keyed config get did not return model A"
+pass "keyed config get returns the live model"
+
+config_yaml="$("$CLI" "$SANDBOX_NAME" config get --format yaml 2>&1)" || fail "YAML config get failed for live DCode TOML: $config_yaml"
+CONFIG_YAML="$config_yaml" MODEL_A="$model_a" CREDENTIAL_CANARY="$CREDENTIAL_CANARY" node -e '
+const config = require("yaml").parse(process.env.CONFIG_YAML);
+if (config.models?.default !== "openai:" + process.env.MODEL_A) process.exit(1);
+if (Object.hasOwn(config, "gateway")) process.exit(1);
+if (config.headers?.authorization !== "[STRIPPED_BY_MIGRATION]") process.exit(1);
+if (JSON.stringify(config).includes(process.env.CREDENTIAL_CANARY)) process.exit(1);
+' || fail "config get --format yaml did not return sanitized, parseable YAML for model A"
+pass "YAML config get preserves the sanitized live DCode shape"
+
+config_sha_before="$(sandbox_exec "sha256sum /sandbox/.deepagents/config.toml | awk '{print \$1}'")" || fail "could not hash DCode config before rejected mutation"
+[[ "$config_sha_before" =~ ^[0-9a-f]{64}$ ]] || fail "invalid pre-mutation DCode config hash"
+set +e
+config_set_output="$("$CLI" "$SANDBOX_NAME" config set --key models.default --value "openai:$model_b" 2>&1)"
+config_set_status=$?
+set -e
+[ "$config_set_status" -ne 0 ] || fail "config set unexpectedly mutated image-baked DCode config"
+printf '%s\n' "$config_set_output" | grep -Fq "config is baked into the sandbox image at build time" || fail "config set rejection did not explain the image-baked boundary"
+printf '%s\n' "$config_set_output" | grep -Fq "re-onboard with the new selection" || fail "config set rejection did not provide re-onboard guidance"
+printf '%s\n' "$config_set_output" | grep -Fq -- "--fresh" || fail "config set rejection did not provide the fresh re-onboard command"
+config_sha_after="$(sandbox_exec "sha256sum /sandbox/.deepagents/config.toml | awk '{print \$1}'")" || fail "could not hash DCode config after rejected mutation"
+[ "$config_sha_after" = "$config_sha_before" ] || fail "rejected config set changed image-baked DCode config"
+pass "config set rejects image-baked DCode mutation without changing the file"
 
 if ! reonboard_output="$(
   COMPATIBLE_API_KEY="$COMPATIBLE_API_KEY" \
@@ -211,7 +282,34 @@ assert_identity "$identity_after" "$model_b" "fresh"
 printf '%s\n' "$identity_after" | grep -Fq "$model_a" && fail "fresh identity still contains model A"
 pass "live dcode identity reports model B"
 
-status_json="$("$CLI" "$SANDBOX_NAME" status --json 2>&1)" || fail "nemoclaw status failed after re-onboard"
+config_model_after_json="$("$CLI" "$SANDBOX_NAME" config get --key models.default 2>&1)" || fail "keyed config get failed after re-onboard: $config_model_after_json"
+CONFIG_MODEL_JSON="$config_model_after_json" MODEL_B="$model_b" node -e '
+if (JSON.parse(process.env.CONFIG_MODEL_JSON) !== "openai:" + process.env.MODEL_B) process.exit(1);
+' || fail "keyed config get did not return model B after re-onboard"
+pass "keyed config get reports model B after re-onboard"
+
+# Invalid state: OpenShell publishes the recreated sandbox as Ready before its
+#   in-sandbox inference route accepts health probes, so the first status call
+#   after a fresh re-onboard can report failureLabel=unreachable for a sandbox
+#   that becomes healthy moments later.
+# Source boundary: readiness is published by OpenShell's sandbox lifecycle and
+#   only consumed here (the Ready assertion above reads it from `list`). The
+#   probe is NemoClaw's own probeSandboxInferenceGatewayHealth in
+#   src/lib/actions/sandbox/inference-route-health.ts, which reports the route
+#   state at the instant it runs and documents that it must not wait.
+# Source-fix constraint: NemoClaw cannot make OpenShell delay Ready until the
+#   route serves, and making `status` retry internally would turn a
+#   point-in-time report into a wait, hiding real outages from every other
+#   caller. The retry therefore belongs to this check, the only consumer that
+#   knows a re-onboard just happened.
+# Regression: test/e2e/support/platform-parity-cloud-experimental.test.ts covers
+#   eventual status success and retry exhaustion.
+# Removal condition: delete this retry once OpenShell publishes Ready only after
+#   the in-sandbox inference route serves, or once NemoClaw exposes an explicit
+#   readiness-wait command this check can call instead.
+# Keep this bounded so persistent route failures still stop the target before
+# the remaining runtime checks.
+status_json="$(wait_for_status_after_reonboard)" || fail "nemoclaw status failed after bounded post-re-onboard readiness checks: ${status_json:-<no stdout>}"
 STATUS_JSON="$status_json" SANDBOX_NAME="$SANDBOX_NAME" MODEL_B="$model_b" node -e '
 const status = JSON.parse(process.env.STATUS_JSON);
 if (status.name !== process.env.SANDBOX_NAME ||
@@ -231,10 +329,12 @@ if (!entry || entry.agent !== "langchain-deepagents-code" ||
 ' || fail "host registry does not report the verified model B selection"
 pass "status and registry report model B"
 
-verify_source="$(verify_config_source | encode_source)"
-verify_command="printf '%s' ${verify_source@Q} | base64 -d | /opt/venv/bin/python3 -I - ${model_a@Q} ${model_b@Q}"
-verify_output="$(sandbox_exec "$verify_command")" || fail "live DCode config does not preserve the managed restore boundary"
+verify_source="$(verify_config_source)"
+verify_output="$(
+  openshell sandbox exec --name "$SANDBOX_NAME" -- \
+    /opt/venv/bin/python3 -I -c "$verify_source" "$model_a" "$model_b" 2>&1
+)" || fail "live DCode config does not preserve the managed restore boundary"
 printf '%s\n' "$verify_output" | grep -Fq "NEMOCLAW_DCODE_FRESH_CONFIG_VERIFIED" || fail "fresh config verification marker is missing"
 pass "config keeps model B and only the allowlisted preferences"
 
-printf '%s: 6 passed, 0 failed\n' "$PREFIX"
+printf '%s: 11 passed, 0 failed\n' "$PREFIX"

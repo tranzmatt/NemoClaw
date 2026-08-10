@@ -10,9 +10,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const dockerMocks = vi.hoisted(() => ({
   infoFormat: vi.fn(),
 }));
+const sourceMocks = vi.hoisted(() => ({
+  nearestTags: vi.fn(),
+}));
 
 vi.mock("../adapters/docker", () => ({
   dockerInfoFormat: dockerMocks.infoFormat,
+}));
+
+vi.mock("./source-identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./source-identity")>()),
+  getNearestVersionedBaseImageTags: sourceMocks.nearestTags,
 }));
 
 import { createSandboxBaseImageResolutionKey } from "./resolution-key";
@@ -45,6 +53,7 @@ afterEach(() => {
 beforeEach(() => {
   vi.clearAllMocks();
   dockerMocks.infoFormat.mockReturnValue("linux/amd64\n");
+  sourceMocks.nearestTags.mockReturnValue([]);
 });
 
 describe("sandbox base-image resolution key", () => {
@@ -52,6 +61,33 @@ describe("sandbox base-image resolution key", () => {
     const root = fixture();
     const before = createSandboxBaseImageResolutionKey(options(root));
     fs.writeFileSync(path.join(root, "Dockerfile.base"), "FROM node:22\nRUN echo changed\n");
+    expect(createSandboxBaseImageResolutionKey(options(root))).not.toBe(before);
+  });
+
+  it("isolates build args without exposing their values (#8119)", () => {
+    const root = fixture();
+    const base = options(root);
+    const first = createSandboxBaseImageResolutionKey({
+      ...base,
+      buildArgs: { NEMOCLAW_CORPORATE_CA_B64: "first-public-ca" },
+    });
+    const second = createSandboxBaseImageResolutionKey({
+      ...base,
+      buildArgs: { NEMOCLAW_CORPORATE_CA_B64: "second-public-ca" },
+    });
+
+    expect(second).not.toBe(first);
+  });
+
+  it("changes when a Dockerfile-copied runtime helper changes", () => {
+    const root = fixture();
+    const helper = path.join(root, "scripts", "lib", "sandbox-rlimits.sh");
+    fs.mkdirSync(path.dirname(helper), { recursive: true });
+    fs.writeFileSync(helper, "ulimit -n 1024\n");
+    const before = createSandboxBaseImageResolutionKey(options(root));
+
+    fs.writeFileSync(helper, "ulimit -n 2048\n");
+
     expect(createSandboxBaseImageResolutionKey(options(root))).not.toBe(before);
   });
 
@@ -133,6 +169,14 @@ describe("sandbox base-image resolution key", () => {
     expect(createSandboxBaseImageResolutionKey({ ...base, preferPinnedRemoteRef: false })).toBe(
       createSandboxBaseImageResolutionKey(base),
     );
+  });
+
+  it("isolates nearest release-tag candidates so warm hints do not mask new tags (#6456)", () => {
+    const root = fixture();
+    const before = createSandboxBaseImageResolutionKey(options(root));
+    sourceMocks.nearestTags.mockReturnValue(["v0.0.79"]);
+
+    expect(createSandboxBaseImageResolutionKey(options(root))).not.toBe(before);
   });
 
   it("bounds Docker platform detection before using the host fallback (#4680)", () => {

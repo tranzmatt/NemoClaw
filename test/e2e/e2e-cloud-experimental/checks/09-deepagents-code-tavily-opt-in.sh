@@ -28,6 +28,32 @@ sandbox_exec() {
   openshell sandbox exec --name "$SANDBOX_NAME" -- bash -c "$1" 2>&1
 }
 
+sandbox_exec_argv() {
+  openshell sandbox exec --name "$SANDBOX_NAME" -- "$@" 2>&1
+}
+
+observability_marker_value() {
+  # Expansion is intentionally deferred to the sandbox shell.
+  # shellcheck disable=SC2016
+  openshell sandbox exec --name "$SANDBOX_NAME" -- \
+    sh -c 'marker=/sandbox/.deepagents/.nemoclaw-observability-enabled; if test -f "$marker" && ! test -L "$marker"; then cat "$marker"; else printf "absent"; fi' \
+    2>/dev/null
+}
+
+observability_registry_state() {
+  SANDBOX_NAME="$SANDBOX_NAME" node - <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const registry = JSON.parse(
+  fs.readFileSync(path.join(process.env.HOME, ".nemoclaw", "sandboxes.json"), "utf8"),
+);
+const entry = registry.sandboxes?.[process.env.SANDBOX_NAME];
+if (!entry || entry.agent !== "langchain-deepagents-code" ||
+    typeof entry.observabilityEnabled !== "boolean") process.exit(1);
+process.stdout.write(entry.observabilityEnabled ? "enabled" : "disabled");
+NODE
+}
+
 nemoclaw_cli() {
   if [ -f "$CLI" ]; then
     node "$CLI" "$@"
@@ -103,34 +129,92 @@ PY
 python_probe() {
   local url="$1"
   local python_bin="${2:-python3}"
-  local encoded remote_cmd
+  local source
   if [ -n "${NEMOCLAW_E2E_TAVILY_PROBE_FIXTURE+x}" ]; then
     printf '%s\n' "$NEMOCLAW_E2E_TAVILY_PROBE_FIXTURE"
     return 0
   fi
-  encoded="$(python_probe_source | base64 | tr -d '\n')"
-  remote_cmd="${python_bin@Q} -c \"\$(printf '%s' ${encoded@Q} | base64 -d)\" ${url@Q}"
-  sandbox_exec "$remote_cmd"
+  source="$(python_probe_source)"
+  sandbox_exec_argv "$python_bin" -c "$source" "$url"
+}
+
+verify_observability_state() {
+  local phase="$1" marker_state registry_state
+  if ! registry_state="$(observability_registry_state 2>&1)"; then
+    fail_test "could not read authoritative host observability intent $phase: ${registry_state:-no diagnostic}"
+    return 1
+  fi
+  marker_state="$(observability_marker_value || true)"
+  if [ "$registry_state" != "enabled" ] || [ "$marker_state" != "1" ]; then
+    fail_test "observability state drifted $phase (registry=${registry_state:-unreadable}, marker=${marker_state:-unreadable})"
+    return 1
+  fi
+  pass "host registry and persistent marker preserve enabled observability $phase"
+}
+
+restore_tavily_denial() {
+  local cleanup_status=0 remove_output post_remove_probe_output
+  if ! remove_output="$(nemoclaw_cli "$SANDBOX_NAME" policy-remove tavily --yes 2>&1)"; then
+    fail_test "policy-remove tavily failed after the opt-in proof: $remove_output"
+    cleanup_status=1
+  else
+    sleep "${NEMOCLAW_E2E_POLICY_SETTLE_SECONDS:-5}"
+    post_remove_probe_output="$(python_probe "https://api.tavily.com/search" || true)"
+    if [[ "$post_remove_probe_output" == *"BLOCKED:"* &&
+      "$post_remove_probe_output" != *"REACHED:"* ]]; then
+      pass "managed Deep Agents Code python returns to the default Tavily denial"
+    else
+      fail_test "policy-remove did not restore the default Tavily denial: $post_remove_probe_output"
+      cleanup_status=1
+    fi
+  fi
+
+  verify_observability_state "after policy-remove" || cleanup_status=1
+  return "$cleanup_status"
 }
 
 PASSED=0
 FAILED=0
 
 if [ "${NEMOCLAW_E2E_TAVILY_SELF_TEST:-}" = "probe-command-shape" ]; then
-  sandbox_exec() {
-    case "$1" in
-      *$'\n'*)
-        printf '%s\n' "NEWLINE_IN_COMMAND"
-        return 1
-        ;;
-      *)
-        printf '%s\n' "NO_NEWLINE_IN_COMMAND"
+  sandbox_exec_argv() {
+    local argument
+    for argument in "$@"; do
+      if [[ "$argument" == *$'\n'* ]]; then
+        printf '%s\n' "NATIVE_MULTILINE_ARGV"
         return 0
-        ;;
-    esac
+      fi
+    done
+    printf '%s\n' "MISSING_MULTILINE_ARGV"
+    return 1
   }
   python_probe "https://api.tavily.com/search"
   exit 0
+fi
+
+if [ "${NEMOCLAW_E2E_TAVILY_SELF_TEST:-}" = "restore-denial" ]; then
+  OBSERVABILITY_MARKER_FIXTURE="$(mktemp)"
+  printf '%s\n' "1" >"$OBSERVABILITY_MARKER_FIXTURE"
+  trap 'rm -f "$OBSERVABILITY_MARKER_FIXTURE"' EXIT
+  observability_marker_value() {
+    cat "$OBSERVABILITY_MARKER_FIXTURE"
+  }
+  observability_registry_state() {
+    printf '%s' "${NEMOCLAW_E2E_OBSERVABILITY_REGISTRY_FIXTURE:-enabled}"
+  }
+  nemoclaw_cli() {
+    [[ "$*" == "$SANDBOX_NAME policy-remove tavily --yes" ]] || return 1
+    case "${NEMOCLAW_E2E_TAVILY_REMOVE_FIXTURE:-ok}" in
+      ok) ;;
+      clear-marker) printf '%s\n' "absent" >"$OBSERVABILITY_MARKER_FIXTURE" ;;
+      *) return 1 ;;
+    esac
+  }
+  verify_observability_state "before Tavily policy mutation" || exit 1
+  cleanup_status=0
+  NEMOCLAW_E2E_POLICY_SETTLE_SECONDS=0 restore_tavily_denial || cleanup_status=$?
+  [ "$(cat "$OBSERVABILITY_MARKER_FIXTURE")" = "1" ]
+  exit "$cleanup_status"
 fi
 
 if ! sandbox_exec "test -d /sandbox/.deepagents && command -v dcode >/dev/null 2>&1" >/dev/null; then
@@ -139,6 +223,8 @@ if ! sandbox_exec "test -d /sandbox/.deepagents && command -v dcode >/dev/null 2
 fi
 
 info "Running Deep Agents Code Tavily opt-in check in sandbox: $SANDBOX_NAME"
+
+verify_observability_state "before Tavily policy mutation" || exit 1
 
 # shellcheck disable=SC2016 # command substitution must run inside the sandbox.
 PYTHON_REAL="$(sandbox_exec 'readlink -f "$(command -v python3)"' || true)"
@@ -164,6 +250,7 @@ APPLY_OUTPUT="$(nemoclaw_cli "$SANDBOX_NAME" policy-add tavily --yes 2>&1)" || {
   printf '%s\n' "${PREFIX}: $PASSED passed, $FAILED failed"
   exit 1
 }
+trap restore_tavily_denial EXIT
 pass "tavily policy preset applies"
 
 sleep "${NEMOCLAW_E2E_POLICY_SETTLE_SECONDS:-5}"
@@ -199,6 +286,10 @@ if echo "$PROJECT_OUT" | grep -Fxq "$PROJECT_PYTHON"; then
 else
   fail_test "project venv under /sandbox did not expose a usable python3 executable: $PROJECT_OUT"
 fi
+
+# Do not leak this check's durable opt-in into later sequential checks.
+restore_tavily_denial || true
+trap - EXIT
 
 printf '%s\n' "${PREFIX}: $PASSED passed, $FAILED failed"
 [ "$FAILED" -eq 0 ] || exit 1

@@ -66,7 +66,18 @@ resolve_installer_version() {
     printf "%s" "${NEMOCLAW_INSTALL_REF#v}"
     return
   fi
-  # Prefer git tags (works in dev clones and CI)
+  # Prefer the .version file stamped during install: it records the exact
+  # requested tag, while describe on a shallow clone can resolve a different
+  # nearby tag.
+  if [[ -f "${repo_root}/.version" ]]; then
+    local file_ver
+    file_ver="$(cat "${repo_root}/.version")"
+    if [[ -n "$file_ver" ]]; then
+      printf "%s" "$file_ver"
+      return
+    fi
+  fi
+  # Fall back to git tags (dev clones and CI have no .version)
   if command -v git &>/dev/null && [[ -e "${repo_root}/.git" ]]; then
     local git_ver=""
     if git_ver="$(git -C "$repo_root" describe --tags --match 'v*' 2>/dev/null)"; then
@@ -75,15 +86,6 @@ resolve_installer_version() {
         printf "%s" "$git_ver"
         return
       fi
-    fi
-  fi
-  # Fall back to .version file (stamped during install)
-  if [[ -f "${repo_root}/.version" ]]; then
-    local file_ver
-    file_ver="$(cat "${repo_root}/.version")"
-    if [[ -n "$file_ver" ]]; then
-      printf "%s" "$file_ver"
-      return
     fi
   fi
   # Last resort: package.json
@@ -151,15 +153,32 @@ resolve_release_tag() {
   printf "%s" "${NEMOCLAW_INSTALL_TAG:-$DEFAULT_INSTALL_REF}"
 }
 
+# Map an install ref to the version string to stamp into .version. Prints the
+# semver for an immutable version tag; prints nothing for mutable (lkg/latest)
+# or non-version refs so callers fall back to git describe.
+resolve_stamped_version() {
+  local ref="${1:-}" version=""
+  case "$ref" in
+    refs/tags/*) version="${ref#refs/tags/}" ;;
+    *) version="$ref" ;;
+  esac
+  version="${version#v}"
+  if is_mutable_install_ref "$ref" \
+    || ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    return 0
+  fi
+  printf "%s" "$version"
+}
+
 clone_nemoclaw_ref() {
   local ref="$1" dest="$2"
 
   git init --quiet "$dest"
   git -C "$dest" remote add origin https://github.com/NVIDIA/NemoClaw.git
-  if ! git -C "$dest" fetch --quiet --depth 1 origin "$ref"; then
+  if ! git -C "$dest" fetch --quiet --depth 1 origin "+${ref}:refs/nemoclaw-install/target"; then
     error "Requested install ref '$ref' is not available from https://github.com/NVIDIA/NemoClaw.git. Check NEMOCLAW_INSTALL_TAG/NEMOCLAW_INSTALL_REF and try again."
   fi
-  git -C "$dest" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
+  git -C "$dest" -c advice.detachedHead=false checkout --quiet --detach refs/nemoclaw-install/target
 }
 
 # ---------------------------------------------------------------------------
@@ -192,6 +211,130 @@ error() {
   exit 1
 }
 ok() { printf "  ${C_GREEN}✓${C_RESET}  %s\n" "$*"; }
+
+resolve_nemoclaw_gateway_port() {
+  local port="${NEMOCLAW_GATEWAY_PORT:-8080}"
+  port="${port#"${port%%[![:space:]]*}"}"
+  port="${port%"${port##*[![:space:]]}"}"
+  if [[ ! "$port" =~ ^0*([0-9]{1,5})$ ]]; then
+    error "NEMOCLAW_GATEWAY_PORT must be an integer between 1024 and 65535."
+  fi
+  port="$((10#${BASH_REMATCH[1]}))"
+  if [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ]; then
+    error "NEMOCLAW_GATEWAY_PORT must be an integer between 1024 and 65535."
+  fi
+  if [ "$port" -ge 18789 ] && [ "$port" -le 18799 ]; then
+    error "NEMOCLAW_GATEWAY_PORT must not overlap the 18789-18799 dashboard port range."
+  fi
+  case "$port" in
+    8000 | 8081 | 11434 | 11435 | 11436 | 11437)
+      error "NEMOCLAW_GATEWAY_PORT must not overlap a reserved inference or runtime-adapter port ($port)."
+      ;;
+  esac
+  local -a configured_names=(
+    NEMOCLAW_DASHBOARD_PORT
+    NEMOCLAW_VLLM_PORT
+    NEMOCLAW_OLLAMA_PORT
+    NEMOCLAW_OLLAMA_PROXY_PORT
+    NEMOCLAW_BEDROCK_RUNTIME_ADAPTER_PORT
+    NEMOCLAW_OPENROUTER_RUNTIME_ADAPTER_PORT
+    NEMOCLAW_HTTPS_PIN_RUNTIME_ADAPTER_PORT
+  )
+  local -a configured_ports=(
+    "${NEMOCLAW_DASHBOARD_PORT:-18789}"
+    "${NEMOCLAW_VLLM_PORT:-8000}"
+    "${NEMOCLAW_OLLAMA_PORT:-11434}"
+    "${NEMOCLAW_OLLAMA_PROXY_PORT:-11435}"
+    "${NEMOCLAW_BEDROCK_RUNTIME_ADAPTER_PORT:-11436}"
+    "${NEMOCLAW_OPENROUTER_RUNTIME_ADAPTER_PORT:-11437}"
+    "${NEMOCLAW_HTTPS_PIN_RUNTIME_ADAPTER_PORT:-11438}"
+  )
+  local i configured_port
+  for i in "${!configured_ports[@]}"; do
+    configured_port="${configured_ports[$i]}"
+    configured_port="${configured_port#"${configured_port%%[![:space:]]*}"}"
+    configured_port="${configured_port%"${configured_port##*[![:space:]]}"}"
+    if [[ "$configured_port" =~ ^0*8081$ ]]; then
+      error "${configured_names[$i]} must not overlap the fixed llama.cpp inference port (8081)."
+    fi
+    if [[ "$configured_port" =~ ^[0-9]+$ ]] && [ "$port" -eq "$configured_port" ]; then
+      error "NEMOCLAW_GATEWAY_PORT conflicts with ${configured_names[$i]} ($configured_port)."
+    fi
+  done
+  printf "%s" "$port"
+}
+
+nemoclaw_state_root() {
+  local home="${HOME%/}"
+  [ -n "$home" ] || home="/"
+  if [ "$home" = "/" ]; then
+    printf "/.nemoclaw"
+  else
+    printf "%s/.nemoclaw" "$home"
+  fi
+}
+
+nemoclaw_state_dir() {
+  local port root
+  port="$(resolve_nemoclaw_gateway_port)" || return 1
+  root="$(nemoclaw_state_root)" || return 1
+  if [ "$port" -eq 8080 ]; then
+    printf "%s" "$root"
+  else
+    printf "%s/gateways/%s" "$root" "$port"
+  fi
+}
+
+assert_nemoclaw_state_path_safe() {
+  local target="$1" root current relative component
+  root="$(nemoclaw_state_root)" || return 1
+  case "$target" in
+    "$root" | "$root"/*) ;;
+    *) error "Refusing NemoClaw state path outside ${root}: ${target}" ;;
+  esac
+
+  current="$root"
+  if [ -L "$current" ]; then
+    error "Refusing symbolic link in NemoClaw state path: ${current}"
+  fi
+  relative="${target#"$root"}"
+  relative="${relative#/}"
+  while [ -n "$relative" ]; do
+    component="${relative%%/*}"
+    current="${current}/${component}"
+    if [ -L "$current" ]; then
+      error "Refusing symbolic link in NemoClaw state path: ${current}"
+    fi
+    if [ "$relative" = "$component" ]; then break; fi
+    relative="${relative#*/}"
+  done
+}
+
+ensure_nemoclaw_state_dir() {
+  local state_dir root gateways_dir
+  state_dir="$(nemoclaw_state_dir)" || return 1
+  root="$(nemoclaw_state_root)" || return 1
+  gateways_dir="${root}/gateways"
+  assert_nemoclaw_state_path_safe "$state_dir"
+  (umask 077 && mkdir -p "$state_dir") || error "Could not create NemoClaw state directory: ${state_dir}"
+  assert_nemoclaw_state_path_safe "$state_dir"
+  chmod 700 "$root" || error "Could not secure NemoClaw state directory: ${root}"
+  if [ "$state_dir" != "$root" ]; then
+    chmod 700 "$gateways_dir" "$state_dir" \
+      || error "Could not secure gateway-scoped NemoClaw state directory: ${state_dir}"
+  fi
+  printf "%s" "$state_dir"
+}
+
+nemoclaw_gateway_name() {
+  local port
+  port="$(resolve_nemoclaw_gateway_port)" || return 1
+  if [ "$port" -eq 8080 ]; then
+    printf "nemoclaw"
+  else
+    printf "nemoclaw-%s" "$port"
+  fi
+}
 
 # Common TTY-required error message for the third-party software notice.
 # Used by both show_usage_notice() and preflight_usage_notice_prompt() so
@@ -243,13 +386,15 @@ verify_downloaded_script() {
 }
 
 resolve_default_sandbox_name() {
-  local registry_file="${HOME}/.nemoclaw/sandboxes.json"
+  local state_dir registry_file
+  state_dir="$(nemoclaw_state_dir)"
+  registry_file="${state_dir}/sandboxes.json"
   local sandbox_name=""
 
   # Prefer the sandbox name from the current onboard session — it reflects
   # the sandbox just created, whereas sandboxes.json may hold a stale default
   # from a previous gateway that no longer exists (#1839).
-  local session_file="${HOME}/.nemoclaw/onboard-session.json"
+  local session_file="${state_dir}/onboard-session.json"
   if [[ -f "$session_file" ]] && command_exists node; then
     sandbox_name="$(
       node -e '
@@ -302,7 +447,8 @@ resolve_default_sandbox_name() {
 }
 
 resolve_onboarded_agent() {
-  local session_file="${HOME}/.nemoclaw/onboard-session.json"
+  local session_file
+  session_file="$(nemoclaw_state_dir)/onboard-session.json"
   if [[ -f "$session_file" ]] && command_exists node; then
     node -e '
       const fs = require("fs");
@@ -317,7 +463,7 @@ resolve_onboarded_agent() {
 }
 
 restore_onboard_forward_after_post_checks() {
-  local sandbox_name agent_name agent_display port openshell_bin attempt state_dir pid_file watcher_script watcher_pid
+  local sandbox_name agent_name agent_display port openshell_bin openshell_dir attempt selected_state_dir state_dir pid_file watcher_script watcher_pid
   sandbox_name="$(resolve_default_sandbox_name)"
   agent_name="$(resolve_onboarded_agent)"
   agent_display="$(agent_display_name "$agent_name")"
@@ -334,9 +480,21 @@ restore_onboard_forward_after_post_checks() {
   else
     return 0
   fi
+  if [[ "$openshell_bin" != /* ]]; then
+    openshell_dir="${openshell_bin%/*}"
+    [[ "$openshell_dir" == "$openshell_bin" ]] && openshell_dir="."
+    openshell_dir="$(cd -- "$openshell_dir" && pwd -P)" || return 1
+    openshell_bin="${openshell_dir}/${openshell_bin##*/}"
+  fi
 
-  state_dir="${HOME}/.nemoclaw/state"
-  mkdir -p "$state_dir" 2>/dev/null || true
+  selected_state_dir="$(ensure_nemoclaw_state_dir)" || return 1
+  state_dir="${selected_state_dir}/state"
+  assert_nemoclaw_state_path_safe "$state_dir"
+  (umask 077 && mkdir -p "$state_dir") \
+    || error "Could not create gateway-scoped runtime state directory: ${state_dir}"
+  assert_nemoclaw_state_path_safe "$state_dir"
+  chmod 700 "$state_dir" \
+    || error "Could not secure gateway-scoped runtime state directory: ${state_dir}"
   pid_file="${state_dir}/${agent_name}-${sandbox_name}-${port}.forward.pid"
   if [[ -f "$pid_file" ]]; then
     local old_pid expected_watcher_script current_uid old_uid old_args
@@ -536,7 +694,12 @@ print_done() {
   # #5735: do not claim a clean install when the automatic upgrade of a
   # pre-existing sandbox failed (it may have been destroyed before its recreate
   # failed). Surface an explicit incomplete/recovery status instead.
+  # #6520: same when recovery exited 0 but recorded sandboxes were not found
+  # on their own recorded gateway — they were not recovered, so the install is
+  # not clean either.
   if [[ "${_UPGRADE_SANDBOXES_FAILED:-false}" == true ]]; then
+    warn "=== Installation completed with warnings ==="
+  elif [[ "${_PREEXISTING_SANDBOX_ORPHANED:-false}" == true ]]; then
     warn "=== Installation completed with warnings ==="
   else
     info "=== Installation complete ==="
@@ -545,14 +708,27 @@ print_done() {
   printf "  ${C_GREEN}${C_BOLD}%s${C_RESET}  ${C_DIM}(%ss)${C_RESET}\n" "$_CLI_DISPLAY" "$elapsed"
   printf "\n"
   if [[ "${_PREEXISTING_SANDBOX_RECOVERY_RAN:-false}" == true ]]; then
-    printf "  ${C_GREEN}Existing sandboxes were recovered and upgraded.${C_RESET}\n"
+    if [[ "${_PREEXISTING_SANDBOX_ORPHANED:-false}" == true ]]; then
+      # #6520: recovery exited 0 but recorded sandboxes were not found on
+      # their own recorded gateway; do not report them as recovered, and give
+      # a concrete remediation path instead.
+      printf "  ${C_YELLOW}Some recorded sandboxes were not found on their recorded gateway and were not recovered.${C_RESET}\n"
+      printf "  ${C_YELLOW}Their gateway registration or Docker image may have been removed (see the recovery notes above).${C_RESET}\n"
+      printf "  ${C_DIM}Clear a stranded sandbox with '%s <name> destroy', then rebuild it with '%s onboard'.${C_RESET}\n" "$_CLI_BIN" "$_CLI_BIN"
+    else
+      printf "  ${C_GREEN}Existing sandboxes were recovered and upgraded.${C_RESET}\n"
+    fi
     if [[ "$_needs_cli_refresh" == true ]]; then
       printf "  ${C_YELLOW}%s installed, but this shell needs PATH refresh before '%s' will run.${C_RESET}\n" "$_CLI_DISPLAY" "$_CLI_BIN"
       printf "\n"
       printf "  ${C_GREEN}For this terminal:${C_RESET}\n"
       print_cli_path_refresh_actions
     fi
-    printf "  ${C_DIM}No new sandbox onboarding was needed.${C_RESET}\n"
+    if [[ "${_PREEXISTING_SANDBOX_ORPHANED:-false}" == true ]]; then
+      printf "  ${C_DIM}Generic onboarding was skipped because recorded sandboxes exist.${C_RESET}\n"
+    else
+      printf "  ${C_DIM}No new sandbox onboarding was needed.${C_RESET}\n"
+    fi
   elif [[ "$ONBOARD_RAN" == true ]]; then
     local agent_name
     agent_name="$(resolve_onboarded_agent)"
@@ -617,6 +793,8 @@ usage() {
   printf "    --non-interactive    Skip prompts (uses env vars / defaults)\n"
   printf "    --yes-i-accept-third-party-software Accept the third-party software notice without prompting\n"
   printf "    --fresh              Discard any failed/interrupted onboarding session and start over\n"
+  printf "    --station-deepseek   Use DeepSeek V4 Flash for DGX Station express install (interactive terminal required)\n"
+  printf "    --force-station-install Bypass only the DGX release-metadata allowlist for Station GB300 express install\n"
   printf "    --version, -v        Print installer version and exit\n"
   printf "    --help, -h           Show this help message and exit\n\n"
   printf "  ${C_DIM}Environment:${C_RESET}\n"
@@ -627,6 +805,9 @@ usage() {
   printf "    NEMOCLAW_FRESH=1              Same as --fresh\n"
   printf "    NEMOCLAW_NO_EXPRESS=1         Skip express install prompt on supported platforms\n"
   printf "    NEMOCLAW_SANDBOX_NAME         Sandbox name to create/use\n"
+  printf "    HF_TOKEN                      Optional Hugging Face read token for managed-vLLM downloads\n"
+  printf "                                  Create one at https://huggingface.co/settings/tokens and export it before curl | bash.\n"
+  printf "    HUGGING_FACE_HUB_TOKEN        Compatibility alias for HF_TOKEN\n"
   printf "    NEMOCLAW_SINGLE_SESSION=1     Abort if active sandbox sessions exist\n"
   printf "    NEMOCLAW_ACCEPT_EXPERIMENTAL_OPENSHELL_UPGRADE=1\n"
   printf "                                  Allow automatic pre-0.0.37 OpenShell gateway upgrade\n"
@@ -639,9 +820,9 @@ usage() {
   printf "                                  In curl pipes, set this on bash or export it first.\n"
   printf "                                  Example: curl -fsSL https://www.nvidia.com/nemoclaw.sh | NEMOCLAW_INSTALL_TAG=%s bash\n" "$INSTALL_TAG_EXAMPLE"
   printf "    NEMOCLAW_INSTALL_REF          Exact Git ref/SHA to install\n"
-  printf "    NEMOCLAW_PROVIDER             build | openai | anthropic | anthropicCompatible\n"
+  printf "    NEMOCLAW_PROVIDER             build | openrouter | openai | anthropic | anthropicCompatible\n"
   printf "                                  | gemini | ollama | custom | nim-local | vllm | routed\n"
-  printf "                                  | hermes-provider\n"
+  printf "                                  | hermes-provider | llama-cpp | install-llama-cpp\n"
   printf "                                  (aliases: cloud -> build, nim -> nim-local)\n"
   printf "    NEMOCLAW_MODEL                Inference model to configure\n"
   printf "    NEMOCLAW_POLICY_MODE          suggested | custom | skip\n"
@@ -707,26 +888,43 @@ json_string_field() {
 }
 
 usage_notice_state_file() {
-  printf "%s/.nemoclaw/usage-notice.json" "${HOME}"
+  local state_dir
+  state_dir="$(nemoclaw_state_dir)" || return 1
+  printf "%s/usage-notice.json" "$state_dir"
 }
 
 usage_notice_accepted_shell() {
   local version="$1" state_file saved_version
-  state_file="$(usage_notice_state_file)"
+  state_file="$(usage_notice_state_file)" || return 1
+  assert_nemoclaw_state_path_safe "$state_file"
   [[ -n "$version" && -f "$state_file" ]] || return 1
   saved_version="$(sed -nE 's/.*"acceptedVersion"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' "$state_file" | head -n 1)"
   [[ "$saved_version" == "$version" ]]
 }
 
 save_usage_notice_acceptance_shell() {
-  local version="$1" state_file state_dir accepted_at
-  state_file="$(usage_notice_state_file)"
-  state_dir="$(dirname "$state_file")"
+  local version="$1" state_file state_dir accepted_at temp_file
+  state_file="$(usage_notice_state_file)" || return 1
+  state_dir="$(ensure_nemoclaw_state_dir)" || return 1
+  assert_nemoclaw_state_path_safe "$state_file"
   accepted_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date)"
-  mkdir -p "$state_dir"
-  chmod 700 "$state_dir" 2>/dev/null || true
-  printf '{\n  "acceptedVersion": "%s",\n  "acceptedAt": "%s"\n}\n' "$version" "$accepted_at" >"$state_file"
-  chmod 600 "$state_file" 2>/dev/null || true
+  temp_file="$(mktemp "${state_file}.tmp.XXXXXX")" \
+    || error "Could not create temporary usage-notice state under ${state_dir}."
+  chmod 600 "$temp_file" || {
+    rm -f "$temp_file"
+    error "Could not secure temporary usage-notice state under ${state_dir}."
+  }
+  if ! printf '{\n  "acceptedVersion": "%s",\n  "acceptedAt": "%s"\n}\n' \
+    "$version" "$accepted_at" >"$temp_file"; then
+    rm -f "$temp_file"
+    error "Could not write usage-notice state under ${state_dir}."
+  fi
+  assert_nemoclaw_state_path_safe "$state_file"
+  if ! mv -f "$temp_file" "$state_file"; then
+    rm -f "$temp_file"
+    error "Could not publish usage-notice state under ${state_dir}."
+  fi
+  assert_nemoclaw_state_path_safe "$state_file"
 }
 
 print_usage_notice_body_shell() {
@@ -747,7 +945,7 @@ print_usage_notice_body_shell() {
 }
 
 show_usage_notice_shell() {
-  local notice_json version title prompt notice_body answer answer_lc
+  local notice_json version title prompt notice_body answer answer_lc answer_trimmed
   notice_json="$(usage_notice_config_path)"
   if [[ ! -f "$notice_json" ]]; then
     error "Third-party software notice configuration not found."
@@ -773,16 +971,24 @@ show_usage_notice_shell() {
   printf "  ──────────────────────────────────────────────────\n"
   printf "%s\n" "$notice_body"
   printf "\n"
-  printf "  %s" "${prompt:-Type 'yes' to accept the NemoClaw license and third-party software notice and continue [no]: }"
-  if ! IFS= read -r answer; then
-    printf "\n  Installation cancelled\n" >&2
-    return 1
-  fi
-  answer_lc="$(printf "%s" "$answer" | tr '[:upper:]' '[:lower:]')"
-  if [[ "$answer_lc" != "yes" ]]; then
+  while true; do
+    printf "  %s" "${prompt:-Type 'yes' to accept the NemoClaw license and third-party software notice and continue [no]: }"
+    if ! IFS= read -r answer; then
+      printf "\n  Installation cancelled\n" >&2
+      return 1
+    fi
+    answer_lc="$(printf "%s" "$answer" | tr '[:upper:]' '[:lower:]')"
+    if [[ "$answer_lc" == "yes" ]]; then
+      break
+    fi
+    answer_trimmed="$(printf "%s" "$answer_lc" | tr -d '[:space:]')"
+    if [[ "$answer_trimmed" == y* ]]; then
+      printf "  Did you mean 'yes'? Type the full word 'yes' to accept.\n" >&2
+      continue
+    fi
     printf "  Installation cancelled\n" >&2
     return 1
-  fi
+  done
 
   save_usage_notice_acceptance_shell "$version"
   return 0
@@ -882,7 +1088,7 @@ spin() {
 
 command_exists() { command -v "$1" &>/dev/null; }
 
-MIN_NODE_VERSION="22.16.0"
+MIN_NODE_VERSION="22.19.0"
 MIN_NPM_MAJOR=10
 
 # ── Agent branding — adapt user-visible names to the active agent ──
@@ -923,16 +1129,28 @@ ONBOARD_RAN=false
 # invoke the CLI directly so a stale PATH cache does not silently skip
 # auto-onboarding (#3276).
 _CLI_PATH=""
+_NEMOCLAW_CLI_INSTALL_PREPARED=false
+_NEMOCLAW_CLI_INSTALL_MODE=""
 _PREEXISTING_SANDBOX_COUNT=0
 _PREEXISTING_SANDBOX_RECOVERY_RAN=false
+# #6520: set when the automatic recovery pass exited 0 but skipped recorded
+# sandboxes it could not observe on the selected gateway (e.g. their gateway
+# and Docker image were removed by a prior uninstall while sandboxes.json was
+# preserved). The final summary must not claim those sandboxes were recovered.
+_PREEXISTING_SANDBOX_ORPHANED=false
 _LEGACY_MANAGED_RECOVERY_NAMES_JSON="[]"
+# OpenShell v0.0.101 routes sandbox and workspace identities through labels
+# capped at 19 characters. Keep this installer-only raw-registry preflight in
+# sync with NAME_MAX_LENGTH in nemoclaw/src/shared/sandbox-name.cts. The
+# current CLI cannot be prepared safely until legacy names are checked.
+_OPENSHELL_SANDBOX_NAME_MAX_LENGTH=19
 # #5735: set when automatic recovery/upgrade of pre-existing sandboxes
 # reported a failure. A failed/destructive rebuild must not be reported as a
 # clean install, so print_done downgrades the final banner when this is true.
 _UPGRADE_SANDBOXES_FAILED=false
 
 # Compare two semver strings (major.minor.patch). Returns 0 if $1 >= $2.
-# Rejects prerelease suffixes (e.g. "22.16.0-rc.1") to avoid arithmetic errors.
+# Rejects prerelease suffixes (e.g. "22.19.0-rc.1") to avoid arithmetic errors.
 version_gte() {
   [[ "$1" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || return 1
   [[ "$2" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || return 1
@@ -1096,6 +1314,261 @@ prefer_user_local_openshell() {
   fi
 }
 
+NEMOCLAW_GATEWAY_SERVICE_MARKER="NEMOCLAW_MANAGED_OPENSHELL_GATEWAY=1"
+NEMOCLAW_GATEWAY_SERVICE_MARKER_LINE="# ${NEMOCLAW_GATEWAY_SERVICE_MARKER}"
+NEMOCLAW_GATEWAY_SERVICE_NAME="nemoclaw-openshell-gateway"
+
+upstream_openshell_gateway_user_service_installed() {
+  [[ "$(uname -s)" == "Linux" ]] || return 1
+  [[ -f /usr/local/lib/systemd/user/openshell-gateway.service ]] \
+    || [[ -f /usr/lib/systemd/user/openshell-gateway.service ]] \
+    || [[ -f /lib/systemd/user/openshell-gateway.service ]]
+}
+
+resolve_upstream_openshell_gateway_bin_for_service() {
+  local exec_start gateway_bin
+  local -a gateway_bins=()
+  exec_start="$(systemctl --user show openshell-gateway.service --property=ExecStart --value 2>/dev/null)" \
+    || return 1
+  while IFS= read -r gateway_bin; do
+    gateway_bins+=("$gateway_bin")
+  done < <(
+    printf '%s\n' "$exec_start" \
+      | grep -oE 'path=[^ ;}]+' \
+      | sed 's/^path=//' \
+      | sort -u
+  )
+  [[ "${#gateway_bins[@]}" -eq 1 ]] || return 1
+  gateway_bin="${gateway_bins[0]}"
+  [[ "$gateway_bin" == /*/openshell-gateway && -x "$gateway_bin" ]] || return 1
+  printf '%s\n' "$gateway_bin"
+}
+
+openshell_binary_version() {
+  local binary="${1:-}" version_output
+  [[ -x "$binary" ]] || return 1
+  version_output="$("$binary" --version 2>/dev/null)" || return 1
+  printf '%s\n' "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+require_compatible_upstream_openshell_gateway_service() {
+  local nemoclaw_gateway_bin upstream_gateway_bin nemoclaw_version upstream_version
+  nemoclaw_gateway_bin="$(resolve_openshell_gateway_bin_for_service)" \
+    || error "Could not locate the NemoClaw OpenShell gateway binary before checking the existing upstream service."
+  if ! trusted_openshell_gateway_bin_for_service "$nemoclaw_gateway_bin"; then
+    error "OpenShell gateway user service binary path is not a trusted install path: $nemoclaw_gateway_bin"
+  fi
+  upstream_gateway_bin="$(resolve_upstream_openshell_gateway_bin_for_service)" \
+    || error "Could not locate the gateway binary used by the existing upstream OpenShell user service. Remove or repair that OpenShell installation, then rerun the installer."
+  nemoclaw_version="$(openshell_binary_version "$nemoclaw_gateway_bin")" \
+    || error "Could not determine the NemoClaw OpenShell gateway version at $nemoclaw_gateway_bin."
+  upstream_version="$(openshell_binary_version "$upstream_gateway_bin")" \
+    || error "Could not determine the existing upstream OpenShell gateway version at $upstream_gateway_bin."
+  if [[ "$nemoclaw_version" != "$upstream_version" ]]; then
+    error "OpenShell gateway version mismatch: NemoClaw installed ${nemoclaw_version} at ${nemoclaw_gateway_bin}, but the existing upstream user service uses ${upstream_version} at ${upstream_gateway_bin}. Align or remove the upstream OpenShell package (for apt installs: sudo apt remove openshell), then rerun the installer."
+  fi
+}
+
+macos_openshell_homebrew_gateway_service_installed() {
+  [[ "$(uname -s)" == "Darwin" ]] || return 1
+  command -v brew >/dev/null 2>&1 || return 1
+  brew list --formula openshell >/dev/null 2>&1 || return 1
+  brew info --json=v2 openshell 2>/dev/null \
+    | grep -Eq '"tap"[[:space:]]*:[[:space:]]*"nvidia/openshell"'
+}
+
+resolve_openshell_gateway_bin_for_service() {
+  local gateway_bin="${NEMOCLAW_OPENSHELL_GATEWAY_BIN:-}"
+  if [[ -n "$gateway_bin" && -x "$gateway_bin" ]]; then
+    printf "%s\n" "$gateway_bin"
+    return 0
+  fi
+
+  gateway_bin="$(command -v openshell-gateway 2>/dev/null || true)"
+  [[ -n "$gateway_bin" && -x "$gateway_bin" ]] || return 1
+  printf "%s\n" "$gateway_bin"
+}
+
+trusted_openshell_gateway_bin_for_service() {
+  local gateway_bin="${1:-}"
+  local user_bin_home="${XDG_BIN_HOME:-${HOME}/.local/bin}"
+  if [[ "$user_bin_home" != /* ]]; then
+    user_bin_home="${HOME}/.local/bin"
+  fi
+  user_bin_home="${user_bin_home%/}"
+  case "$gateway_bin" in
+    "${user_bin_home}/openshell-gateway" | /usr/local/bin/openshell-gateway | /usr/bin/openshell-gateway)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_nemoclaw_openshell_gateway_user_service() {
+  local service_path="${1:-}"
+  [[ -f "$service_path" ]] || return 1
+  grep -Fxq "$NEMOCLAW_GATEWAY_SERVICE_MARKER_LINE" "$service_path"
+}
+
+openshell_user_config_home() {
+  if [[ -n "${XDG_CONFIG_HOME:-}" && "$XDG_CONFIG_HOME" == /* ]]; then
+    printf '%s\n' "$XDG_CONFIG_HOME"
+  else
+    printf '%s\n' "${HOME}/.config"
+  fi
+}
+
+install_nemoclaw_openshell_gateway_user_service() {
+  [[ "$(uname -s)" == "Linux" ]] || return 0
+  [[ "$(resolve_nemoclaw_gateway_port)" -eq 8080 ]] || return 0
+
+  local service_dir
+  service_dir="$(openshell_user_config_home)/systemd/user"
+  local service_path="${service_dir}/${NEMOCLAW_GATEWAY_SERVICE_NAME}.service"
+  local service_template="${NEMOCLAW_SOURCE_ROOT}/scripts/lib/openshell-gateway.service.in"
+
+  if [[ -L "$service_path" ]]; then
+    error "Refusing to replace symlinked OpenShell gateway user service: $service_path"
+  fi
+
+  if upstream_openshell_gateway_user_service_installed; then
+    if [[ -f "$service_path" ]] && ! is_nemoclaw_openshell_gateway_user_service "$service_path"; then
+      error "Refusing to replace non-NemoClaw OpenShell gateway user service: $service_path"
+    fi
+    require_compatible_upstream_openshell_gateway_service
+    info "OpenShell upstream gateway user service is staged; onboarding will select and start it."
+    return 0
+  fi
+
+  local gateway_bin
+  if ! gateway_bin="$(resolve_openshell_gateway_bin_for_service)"; then
+    warn "OpenShell gateway binary was not found; the default managed user service was not staged."
+    return 0
+  fi
+
+  case "$gateway_bin" in
+    *[[:space:]]*)
+      error "OpenShell gateway user service binary path contains whitespace: $gateway_bin"
+      ;;
+    /*) ;;
+    *)
+      error "OpenShell gateway user service binary path is not absolute: $gateway_bin"
+      ;;
+  esac
+  if ! trusted_openshell_gateway_bin_for_service "$gateway_bin"; then
+    error "OpenShell gateway user service binary path is not a trusted install path: $gateway_bin"
+  fi
+
+  if [[ -f "$service_path" ]] && ! is_nemoclaw_openshell_gateway_user_service "$service_path"; then
+    error "Refusing to replace non-NemoClaw OpenShell gateway user service: $service_path"
+  fi
+  if [[ ! -f "$service_template" || -L "$service_template" ]]; then
+    error "OpenShell gateway user service template is unavailable: $service_template"
+  fi
+
+  if ! {
+    mkdir -p "$service_dir" \
+      && chmod 700 "$service_dir" \
+      && node - "$service_path" "$service_template" "$gateway_bin" "$NEMOCLAW_GATEWAY_SERVICE_MARKER_LINE" <<'NODE'
+const fs = require("node:fs");
+
+const [servicePath, templatePath, gatewayBin, managedMarker] = process.argv.slice(2);
+const noFollow = fs.constants.O_NOFOLLOW;
+const nonblock = typeof fs.constants.O_NONBLOCK === "number" ? fs.constants.O_NONBLOCK : 0;
+
+if (typeof noFollow !== "number") {
+  console.error("O_NOFOLLOW is unavailable");
+  process.exit(1);
+}
+
+function errnoCode(error) {
+  return error && typeof error === "object" && "code" in error ? String(error.code) : null;
+}
+
+function fail(message) {
+  throw new Error(message);
+}
+
+function openServiceFile() {
+  try {
+    return fs.openSync(servicePath, fs.constants.O_RDWR | noFollow | nonblock);
+  } catch (error) {
+    if (errnoCode(error) === "ELOOP") {
+      fail(`Refusing to replace symlinked OpenShell gateway user service: ${servicePath}`);
+    }
+    if (errnoCode(error) !== "ENOENT") throw error;
+  }
+
+  try {
+    return fs.openSync(
+      servicePath,
+      fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | noFollow | nonblock,
+      0o600,
+    );
+  } catch (error) {
+    if (errnoCode(error) === "ELOOP" || errnoCode(error) === "EEXIST") {
+      fail(
+        `Refusing to replace OpenShell gateway user service because it changed during validation: ${servicePath}`,
+      );
+    }
+    throw error;
+  }
+}
+
+function assertServiceIdentity(descriptor) {
+  const opened = fs.fstatSync(descriptor);
+  const current = fs.lstatSync(servicePath);
+  if (
+    !opened.isFile() ||
+    opened.nlink !== 1 ||
+    current.isSymbolicLink() ||
+    !current.isFile() ||
+    current.nlink !== 1 ||
+    opened.dev !== current.dev ||
+    opened.ino !== current.ino
+  ) {
+    fail(
+      `Refusing to replace OpenShell gateway user service because it changed during validation: ${servicePath}`,
+    );
+  }
+}
+
+let descriptor;
+try {
+  descriptor = openServiceFile();
+  assertServiceIdentity(descriptor);
+  const existing = fs.readFileSync(descriptor, "utf8");
+  if (existing && !existing.split(/\r?\n/u).includes(managedMarker)) {
+    fail(`Refusing to replace non-NemoClaw OpenShell gateway user service: ${servicePath}`);
+  }
+  const contents = fs
+    .readFileSync(templatePath, "utf8")
+    .replaceAll("@OPENSHELL_GATEWAY_BIN@", gatewayBin);
+  assertServiceIdentity(descriptor);
+  const bytes = Buffer.from(contents, "utf8");
+  const written = fs.writeSync(descriptor, bytes, 0, bytes.length, 0);
+  if (written !== bytes.length) {
+    fail("Short write while installing OpenShell gateway user service");
+  }
+  fs.ftruncateSync(descriptor, bytes.length);
+  fs.fchmodSync(descriptor, 0o600);
+  assertServiceIdentity(descriptor);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
+} finally {
+  if (descriptor !== undefined) fs.closeSync(descriptor);
+}
+NODE
+  }; then
+    error "Could not install OpenShell gateway user service at $service_path"
+  fi
+
+  info "Installed OpenShell gateway user service at $service_path"
+}
+
 # Run scripts/install-openshell.sh during install_nemoclaw when appropriate.
 # - mode=force:      always invoke (GitHub-clone branch — fresh install path)
 # - mode=if-missing: invoke only when openshell is absent from PATH
@@ -1105,15 +1578,32 @@ prefer_user_local_openshell() {
 # backup flow can run before any version bump.
 maybe_install_openshell_during_install() {
   local mode="${1:-force}"
+  local explicit_openshell_bin="${NEMOCLAW_OPENSHELL_BIN:-}"
   if truthy_env "${NEMOCLAW_DEFER_OPENSHELL_INSTALL:-}"; then
     info "Deferring OpenShell CLI installation until after pre-upgrade backup."
     return 0
   fi
   if [[ "$mode" == "if-missing" ]] && command_exists openshell; then
-    return 0
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1 \
+      && ! macos_openshell_homebrew_gateway_service_installed; then
+      info "OpenShell CLI exists but the macOS Homebrew gateway service is missing."
+    else
+      if [[ "$(uname -s)" == "Darwin" ]] && ! command -v brew >/dev/null 2>&1; then
+        warn "Homebrew is not installed; using the standalone OpenShell gateway without reboot persistence."
+      fi
+      prefer_user_local_openshell
+      # Service discovery still uses the user-local PATH, but a source-checkout
+      # caller's executable selection remains authoritative for onboarding.
+      if [[ "$explicit_openshell_bin" == /* && -f "$explicit_openshell_bin" && -x "$explicit_openshell_bin" ]]; then
+        export NEMOCLAW_OPENSHELL_BIN="$explicit_openshell_bin"
+      fi
+      install_nemoclaw_openshell_gateway_user_service
+      return 0
+    fi
   fi
   spin "Installing OpenShell CLI" bash "${NEMOCLAW_SOURCE_ROOT}/scripts/install-openshell.sh"
   prefer_user_local_openshell
+  install_nemoclaw_openshell_gateway_user_service
 }
 
 ensure_cli_shim() {
@@ -1497,6 +1987,101 @@ is_source_checkout() {
   return 1
 }
 
+installer_payload_revision() {
+  local revision=""
+  revision="$(git -C "${SCRIPT_DIR}/.." rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || return 1
+  [[ "$revision" =~ ^[0-9a-f]{40,64}$ ]] || return 1
+  printf '%s' "$revision"
+}
+
+path_resolves_within() {
+  local parent="$1" candidate="$2"
+  node -e '
+    const fs = require("fs");
+    const path = require("path");
+    try {
+      const parent = fs.realpathSync(process.argv[1]);
+      const candidate = fs.realpathSync(process.argv[2]);
+      const relative = path.relative(parent, candidate);
+      process.exit(
+        relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative)) ? 0 : 1,
+      );
+    } catch {
+      process.exit(1);
+    }
+  ' "$parent" "$candidate"
+}
+
+resolve_cli_runner_within_source() {
+  local source_root="$1" candidate="" npm_bin=""
+  if command_exists "$_CLI_BIN"; then
+    candidate="$(command -v "$_CLI_BIN")"
+    if is_real_nemoclaw_cli "$candidate" "$_CLI_BIN" \
+      && path_resolves_within "$source_root" "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  fi
+
+  npm_bin="$(resolve_npm_bin)" || true
+  candidate="${npm_bin:+${npm_bin}/${_CLI_BIN}}"
+  if [[ -n "$candidate" && -x "$candidate" ]] \
+    && is_real_nemoclaw_cli "$candidate" "$_CLI_BIN" \
+    && path_resolves_within "$source_root" "$candidate"; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+is_reusable_managed_nemoclaw_install() {
+  local source_root="$1" expected_revision current_revision identity_file identity_revision
+  local identity_version cli_runner version_output
+
+  [[ "${NEMOCLAW_BOOTSTRAP_PAYLOAD:-}" == "1" ]] || return 1
+  ! truthy_env "${NEMOCLAW_REINSTALL_CLI:-}" || return 1
+  [[ -d "$source_root" && ! -L "$source_root" && -O "$source_root" ]] || return 1
+  [[ -d "${source_root}/.git" && ! -L "${source_root}/.git" ]] || return 1
+  grep -q '"name"[[:space:]]*:[[:space:]]*"nemoclaw"' "${source_root}/package.json" 2>/dev/null || return 1
+
+  expected_revision="$(installer_payload_revision)" || return 1
+  current_revision="$(git -C "$source_root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" || return 1
+  [[ "$current_revision" == "$expected_revision" ]] || return 1
+  git -C "$source_root" diff --quiet --ignore-submodules -- || return 1
+  git -C "$source_root" diff --cached --quiet --ignore-submodules -- || return 1
+  [[ -d "${source_root}/node_modules" && -d "${source_root}/nemoclaw/node_modules" ]] || return 1
+
+  identity_file="${source_root}/dist/build-identity.json"
+  [[ -f "$identity_file" && -s "${source_root}/dist/lib/onboard/preflight.js" ]] || return 1
+  [[ -s "${source_root}/nemoclaw/dist/index.js" ]] || return 1
+  identity_revision="$(json_string_field "$identity_file" sourceRevision)"
+  identity_version="$(json_string_field "$identity_file" nemoclawVersion)"
+  [[ "$identity_revision" == "$expected_revision" ]] || return 1
+  [[ "$identity_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?([+][0-9A-Za-z.-]+)?$ ]] || return 1
+
+  cli_runner="$(resolve_cli_runner_within_source "$source_root")" || return 1
+  version_output="$("$cli_runner" --version 2>/dev/null)" || return 1
+  [[ "$version_output" == "${_CLI_BIN} v${identity_version}" ]]
+}
+
+restore_managed_source_lockfile() {
+  local source_root="$1"
+  [[ -d "${source_root}/.git" && ! -L "${source_root}/.git" ]] || return 0
+  git -C "$source_root" checkout -- package-lock.json 2>/dev/null
+}
+
+finish_nemoclaw_install() {
+  # A backup-preparation pass defers OpenShell but still prepares the CLI. The
+  # later install pass completes only the OpenShell policy for that source mode.
+  case "${_NEMOCLAW_CLI_INSTALL_MODE:-}" in
+    source) maybe_install_openshell_during_install if-missing ;;
+    managed) maybe_install_openshell_during_install force ;;
+    *) error "The prepared ${_CLI_DISPLAY} CLI has no installation mode." ;;
+  esac
+  refresh_path
+  ensure_nemoclaw_shim || true
+}
+
 install_nemoclaw() {
   command_exists git || error "git was not found on PATH."
   local repo_root package_json
@@ -1504,6 +2089,13 @@ install_nemoclaw() {
   package_json="${repo_root}/package.json"
   # Tell prepare not to run npm link — the installer handles linking explicitly.
   export NEMOCLAW_INSTALLING=1
+
+  if [[ "${_NEMOCLAW_CLI_INSTALL_PREPARED:-false}" == true ]]; then
+    info "${_CLI_DISPLAY} CLI was already prepared during this installer run — reusing it."
+    unset NEMOCLAW_REINSTALL_CLI
+    finish_nemoclaw_install
+    return 0
+  fi
 
   if is_source_checkout "$repo_root"; then
     info "${_CLI_DISPLAY} package.json found in the selected source checkout — installing from source…"
@@ -1514,18 +2106,10 @@ install_nemoclaw() {
     fi
     spin "Installing ${_CLI_DISPLAY} dependencies" bash -c "cd \"$NEMOCLAW_SOURCE_ROOT\" && npm install --ignore-scripts"
     spin "Building ${_CLI_DISPLAY} CLI modules" bash -c "cd \"$NEMOCLAW_SOURCE_ROOT\" && npm run --if-present build:cli"
-    spin "Building ${_CLI_DISPLAY} plugin" bash -c "cd \"$NEMOCLAW_SOURCE_ROOT\"/nemoclaw && npm install --ignore-scripts && npm run build"
-    spin "Linking ${_CLI_DISPLAY} CLI" bash -c "cd \"$NEMOCLAW_SOURCE_ROOT\" && npm link"
+    spin "Building ${_CLI_DISPLAY} plugin" bash -c "cd \"$NEMOCLAW_SOURCE_ROOT\"/nemoclaw && npm ci --ignore-scripts && npm run build"
+    spin "Linking ${_CLI_DISPLAY} CLI" bash -c "cd \"$NEMOCLAW_SOURCE_ROOT\" && npm link --ignore-scripts"
 
-    # Bootstrap OpenShell when the source checkout is being used as a fresh
-    # install entrypoint (e.g. `git clone … && bash install.sh`) and the host
-    # has no openshell on PATH. Skipping here previously left the user at a
-    # circular preflight error ("Run the NemoClaw installer or
-    # scripts/install-openshell.sh") even though they were running the
-    # installer. A developer who already has a managed openshell on PATH
-    # keeps their existing binary — install-openshell.sh is only invoked
-    # when openshell is genuinely missing. See #3989.
-    maybe_install_openshell_during_install if-missing
+    _NEMOCLAW_CLI_INSTALL_MODE=source
   else
     if [[ -f "$package_json" ]]; then
       info "Installer payload is not a persistent source checkout — installing from GitHub…"
@@ -1539,40 +2123,44 @@ install_nemoclaw() {
     # npm install -g git+https://... does this internally but we can't hook
     # into its extraction pipeline, so we do it ourselves.
     local nemoclaw_src="${HOME}/.nemoclaw/source"
-    rm -rf "$nemoclaw_src"
-    mkdir -p "$(dirname "$nemoclaw_src")"
     NEMOCLAW_SOURCE_ROOT="$nemoclaw_src"
-    spin "Cloning ${_CLI_DISPLAY} source" clone_nemoclaw_ref "$release_ref" "$nemoclaw_src"
-    # Fetch version tags into the shallow clone so `git describe --tags
-    # --match "v*"` works at runtime (the shallow clone only has the
-    # single ref we asked for).
-    git -C "$nemoclaw_src" fetch --depth=1 origin 'refs/tags/v*:refs/tags/v*' 2>/dev/null || true
-    # Also stamp .version as a fallback for environments where git is
-    # unavailable or tags are pruned later.
-    git -C "$nemoclaw_src" describe --tags --match 'v*' 2>/dev/null \
-      | sed 's/^v//' >"$nemoclaw_src/.version" || true
-    if [[ -z "${NEMOCLAW_AGENT:-}" || "${NEMOCLAW_AGENT}" == "openclaw" ]]; then
-      spin "Preparing OpenClaw package" bash -c "$(declare -f info warn resolve_openclaw_version pre_extract_openclaw); pre_extract_openclaw \"\$1\"" _ "$nemoclaw_src" \
-        || warn "Pre-extraction failed — npm install may fail if openclaw tarball is broken"
+    if is_reusable_managed_nemoclaw_install "$nemoclaw_src"; then
+      info "Reusing the installed ${_CLI_DISPLAY} CLI at the selected revision."
+    else
+      rm -rf "$nemoclaw_src"
+      mkdir -p "$(dirname "$nemoclaw_src")"
+      spin "Cloning ${_CLI_DISPLAY} source" clone_nemoclaw_ref "$release_ref" "$nemoclaw_src"
+      # Fetch version tags into the shallow clone so `git describe --tags
+      # --match "v*"` works at runtime (the shallow clone only has the
+      # single ref we asked for).
+      git -C "$nemoclaw_src" fetch --depth=1 origin 'refs/tags/v*:refs/tags/v*' 2>/dev/null || true
+      # Stamp .version from the requested ref so the recorded version matches the
+      # installed tag, even when a shallow clone cannot name it via describe.
+      local stamped_version
+      stamped_version="$(resolve_stamped_version "$release_ref")"
+      if [[ -n "$stamped_version" ]]; then
+        printf '%s' "$stamped_version" >"$nemoclaw_src/.version"
+      else
+        git -C "$nemoclaw_src" describe --tags --match 'v*' 2>/dev/null \
+          | sed 's/^v//' >"$nemoclaw_src/.version" || true
+      fi
+      if [[ -z "${NEMOCLAW_AGENT:-}" || "${NEMOCLAW_AGENT}" == "openclaw" ]]; then
+        spin "Preparing OpenClaw package" bash -c "$(declare -f info warn resolve_openclaw_version pre_extract_openclaw); pre_extract_openclaw \"\$1\"" _ "$nemoclaw_src" \
+          || warn "Pre-extraction failed — npm install may fail if openclaw tarball is broken"
+      fi
+      spin "Installing ${_CLI_DISPLAY} dependencies" bash -c "cd \"$nemoclaw_src\" && npm install --ignore-scripts"
+      spin "Building ${_CLI_DISPLAY} CLI modules" bash -c "cd \"$nemoclaw_src\" && npm run --if-present build:cli"
+      spin "Building ${_CLI_DISPLAY} plugin" bash -c "cd \"$nemoclaw_src\"/nemoclaw && npm ci --ignore-scripts && npm run build"
+      spin "Linking ${_CLI_DISPLAY} CLI" bash -c "cd \"$nemoclaw_src\" && npm link --ignore-scripts"
+      restore_managed_source_lockfile "$nemoclaw_src" \
+        || warn "Could not restore package-lock.json in ${nemoclaw_src} — the next install re-clones that checkout instead of reusing it."
     fi
-    spin "Installing ${_CLI_DISPLAY} dependencies" bash -c "cd \"$nemoclaw_src\" && npm install --ignore-scripts"
-    spin "Building ${_CLI_DISPLAY} CLI modules" bash -c "cd \"$nemoclaw_src\" && npm run --if-present build:cli"
-    spin "Building ${_CLI_DISPLAY} plugin" bash -c "cd \"$nemoclaw_src\"/nemoclaw && npm install --ignore-scripts && npm run build"
-    spin "Linking ${_CLI_DISPLAY} CLI" bash -c "cd \"$nemoclaw_src\" && npm link"
-
-    # Install/upgrade the OpenShell CLI on the GitHub-clone path (curl|bash).
-    # Without this, install.sh defers the openshell version gate entirely to
-    # onboard, so any later skip of onboard (preflight blocking,
-    # interrupted session) leaves openshell stale below blueprint's
-    # min_openshell_version even though the new NemoClaw declared a higher
-    # floor. The source-checkout branch invokes the same helper in
-    # `if-missing` mode so developers keep autonomy when openshell is already
-    # on PATH. The script is idempotent on the happy path. See #2272, #3989.
-    maybe_install_openshell_during_install force
+    _NEMOCLAW_CLI_INSTALL_MODE=managed
   fi
 
-  refresh_path
-  ensure_nemoclaw_shim || true
+  _NEMOCLAW_CLI_INSTALL_PREPARED=true
+  unset NEMOCLAW_REINSTALL_CLI
+  finish_nemoclaw_install
 }
 
 # ---------------------------------------------------------------------------
@@ -1658,6 +2246,31 @@ verify_nemoclaw() {
     fi
   fi
 
+  # The active npm prefix can differ from the CLI installation prefix. The
+  # user-local shim can remain executable when the active prefix has no CLI.
+  # Probe the shim before reporting that installation failed (#8311).
+  if [[ -x "$NEMOCLAW_SHIM_DIR/$_CLI_BIN" ]] \
+    && is_real_nemoclaw_cli "$NEMOCLAW_SHIM_DIR/$_CLI_BIN" "$_CLI_BIN"; then
+    _CLI_PATH="$NEMOCLAW_SHIM_DIR/$_CLI_BIN"
+    record_cli_resolution_state "$_CLI_PATH" "$npm_bin"
+
+    # record_cli_resolution_state clears the refresh flag when the shim
+    # directory is on the initial PATH. A different command can resolve first.
+    # In that case, NEMOCLAW_READY_NOW must remain false.
+    if [[ "$(command -v "$_CLI_BIN" 2>/dev/null)" -ef "$_CLI_PATH" ]]; then
+      NEMOCLAW_READY_NOW=true
+      info "Verified: ${_CLI_BIN} is available at $_CLI_PATH"
+      return 0
+    fi
+
+    NEMOCLAW_CURRENT_SHELL_NEEDS_PATH_REFRESH=true
+    NEMOCLAW_RECOVERY_EXPORT_DIR="${NEMOCLAW_RECOVERY_EXPORT_DIR:-$NEMOCLAW_SHIM_DIR}"
+    NEMOCLAW_RECOVERY_PROFILE="${NEMOCLAW_RECOVERY_PROFILE:-$(detect_shell_profile)}"
+    warn "Found ${_CLI_BIN} at $_CLI_PATH but this shell's PATH does not yet resolve it."
+    warn "Running onboarding via the absolute path; refresh your shell PATH afterwards (commands below)."
+    return 0
+  fi
+
   # Single warn header, then plain printf for each bullet. warn() prefixes
   # every line with "[warn]" + colour codes, which would render the bulleted
   # diagnostic table as six separate warnings rather than one structured block.
@@ -1680,11 +2293,12 @@ verify_nemoclaw() {
 }
 
 inspect_sandbox_registry_for_upgrade() {
-  local reg_file="$1" field="$2"
-  node - "$reg_file" "$field" <<'NODE'
+  local reg_file="$1" field="$2" scope="${3:-legacy}" gateway_port
+  gateway_port="$(resolve_nemoclaw_gateway_port)"
+  node - "$reg_file" "$field" "$gateway_port" "$scope" "$_OPENSHELL_SANDBOX_NAME_MAX_LENGTH" <<'NODE'
 const fs = require("node:fs");
 
-function isRecord(value) {
+function isObjectRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -1694,20 +2308,72 @@ try {
 } catch {
   process.exit(1);
 }
-if (!isRecord(registry) || !isRecord(registry.sandboxes)) process.exit(1);
+if (!isObjectRecord(registry) || !isObjectRecord(registry.sandboxes)) process.exit(1);
 
-const entries = Object.entries(registry.sandboxes);
-if (entries.some(([name, entry]) => !name || !isRecord(entry) || entry.name !== name)) {
+const allEntries = Object.entries(registry.sandboxes);
+if (allEntries.some(([name, entry]) => !name.trim() || !isObjectRecord(entry) || entry.name !== name)) {
   process.exit(1);
 }
+const selectedPort = Number(process.argv[4]);
+const canonicalName = (port) => port === 8080 ? "nemoclaw" : `nemoclaw-${port}`;
+const portFromName = (name) => {
+  if (name === "nemoclaw") return 8080;
+  const match = /^nemoclaw-([0-9]+)$/.exec(name);
+  if (!match) return null;
+  const port = Number(match[1]);
+  return Number.isInteger(port) && port >= 1 && port <= 65535 && canonicalName(port) === name
+    ? port
+    : null;
+};
+const entryPort = (entry) => {
+  const hasPort = entry.gatewayPort !== undefined && entry.gatewayPort !== null;
+  const hasName = entry.gatewayName !== undefined && entry.gatewayName !== null;
+  if (hasPort && (!Number.isInteger(entry.gatewayPort) || entry.gatewayPort < 1 || entry.gatewayPort > 65535)) {
+    throw new Error("invalid gatewayPort");
+  }
+  if (hasName && typeof entry.gatewayName !== "string") throw new Error("invalid gatewayName");
+  const namedPort = hasName ? portFromName(entry.gatewayName) : null;
+  if (hasName && namedPort === null) throw new Error("invalid gatewayName");
+  if (hasPort && hasName && canonicalName(entry.gatewayPort) !== entry.gatewayName) {
+    throw new Error("conflicting gateway identity");
+  }
+  return hasPort ? entry.gatewayPort : namedPort ?? 8080;
+};
+
+let entries;
+try {
+  entries = allEntries.filter(([, entry]) => entryPort(entry) === selectedPort);
+} catch {
+  process.exit(1);
+}
+if (process.argv[5] === "selected" && entries.length !== allEntries.length) process.exit(1);
+const maxNameLength = Number(process.argv[6]);
+if (!Number.isInteger(maxNameLength) || maxNameLength < 1) process.exit(1);
+// Keep this raw-registry predicate in sync with isRouteOnlySandboxReservation()
+// in src/lib/state/registry.ts.
+const sandboxes = entries.filter(
+  ([, entry]) => !(entry.pendingRouteReservation === true && entry.createdAt === undefined),
+);
 
 if (process.argv[3] === "count") {
-  process.stdout.write(String(entries.length));
+  process.stdout.write(String(sandboxes.length));
+  process.exit(0);
+}
+if (process.argv[3] === "incompatible-names") {
+  const compatiblePattern = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
+  const incompatible = sandboxes
+    .map(([name]) => name)
+    .filter(
+      (name) =>
+        name.length > maxNameLength || !compatiblePattern.test(name) || name.includes("--"),
+    )
+    .sort();
+  process.stdout.write(JSON.stringify(incompatible));
   process.exit(0);
 }
 if (process.argv[3] !== "ambiguous-names") process.exit(1);
 
-const ambiguous = entries
+const ambiguous = sandboxes
   .filter(([, entry]) => {
     const version = entry.nemoclawVersion;
     const hasFingerprint = typeof version === "string" && version.trim().length > 0;
@@ -1722,12 +2388,19 @@ NODE
 }
 
 registered_sandbox_count() {
-  local reg_file="${HOME}/.nemoclaw/sandboxes.json"
+  local reg_file scope="selected"
+  reg_file="$(nemoclaw_state_dir)/sandboxes.json"
+  if [ "$(resolve_nemoclaw_gateway_port)" -eq 8080 ]; then scope="legacy"; fi
+  if [ ! -f "$reg_file" ] && [ "$(resolve_nemoclaw_gateway_port)" -ne 8080 ]; then
+    # Pre-segregation releases stored every gateway's rows in the shared file.
+    reg_file="${HOME}/.nemoclaw/sandboxes.json"
+    scope="legacy"
+  fi
   if [ ! -f "$reg_file" ]; then
     printf "0"
     return
   fi
-  inspect_sandbox_registry_for_upgrade "$reg_file" count
+  inspect_sandbox_registry_for_upgrade "$reg_file" count "$scope"
 }
 
 resolve_existing_cli_runner() {
@@ -1788,9 +2461,20 @@ run_preupgrade_backup() {
   NEMOCLAW_REQUIRE_ALL_SANDBOX_BACKUPS=1 "$current_cli_runner" backup-all 2>&1
 }
 
+# Return nonzero when OpenShell is absent or its version command fails.
 installed_openshell_version() {
   command_exists openshell || return 1
-  openshell --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+  local version_output
+  version_output="$(openshell --version 2>/dev/null)" || return 1
+  printf "%s\n" "$version_output" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1
+}
+
+# Fail closed when OpenShell is present but cannot report its version. An absent
+# binary is valid because OpenShell installation can be deferred.
+require_reportable_openshell_version() {
+  command_exists openshell || return 0
+  [ -n "$(installed_openshell_version 2>/dev/null || true)" ] && return 0
+  error "OpenShell is present on PATH but could not report its version. Refusing to start onboarding with an undeterminable OpenShell version — reinstall a supported OpenShell (run scripts/install-openshell.sh) or remove the broken binary, then rerun the installer."
 }
 
 truthy_env() {
@@ -1805,13 +2489,94 @@ legacy_openshell_gateway_upgrade_needed() {
   [[ -n "$version" ]] && ! version_gte "$version" "0.0.37"
 }
 
+resolve_current_openshell_version_range() {
+  local source_root="${NEMOCLAW_SOURCE_ROOT:-$(resolve_repo_root)}"
+  local blueprint="${source_root}/nemoclaw-blueprint/blueprint.yaml"
+  local min_version="" max_version=""
+  [ -f "$blueprint" ] || return 1
+  min_version="$(sed -nE 's/^min_openshell_version:[[:space:]]*["'"'"']([0-9]+\.[0-9]+\.[0-9]+)["'"'"'][[:space:]]*$/\1/p' "$blueprint")"
+  max_version="$(sed -nE 's/^max_openshell_version:[[:space:]]*["'"'"']([0-9]+\.[0-9]+\.[0-9]+)["'"'"'][[:space:]]*$/\1/p' "$blueprint")"
+  [[ "$min_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  [[ "$max_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  version_gte "$max_version" "$min_version" || return 1
+  printf '%s %s\n' "$min_version" "$max_version"
+}
+
 installer_non_interactive() {
   [[ "${NON_INTERACTIVE:-}" == "1" || "${NEMOCLAW_NON_INTERACTIVE:-}" == "1" ]]
 }
 
 legacy_ambiguous_sandbox_names_json() {
   local reg_file="$1"
-  inspect_sandbox_registry_for_upgrade "$reg_file" ambiguous-names
+  local scope="legacy"
+  if [ "$(resolve_nemoclaw_gateway_port)" -ne 8080 ] \
+    && [ "$reg_file" = "$(nemoclaw_state_dir)/sandboxes.json" ]; then
+    scope="selected"
+  fi
+  inspect_sandbox_registry_for_upgrade "$reg_file" ambiguous-names "$scope"
+}
+
+openshell_incompatible_sandbox_names_json() {
+  local reg_file="$1"
+  local scope="legacy"
+  if [ "$(resolve_nemoclaw_gateway_port)" -ne 8080 ] \
+    && [ "$reg_file" = "$(nemoclaw_state_dir)/sandboxes.json" ]; then
+    scope="selected"
+  fi
+  inspect_sandbox_registry_for_upgrade "$reg_file" incompatible-names "$scope"
+}
+
+require_openshell_compatible_sandbox_names() {
+  local reg_file="$1" incompatible_json="" incompatible_count="0"
+  if ! incompatible_json="$(openshell_incompatible_sandbox_names_json "$reg_file")"; then
+    error "Could not validate existing sandbox names for the OpenShell upgrade. Existing gateway and sandboxes were left unchanged."
+  fi
+  incompatible_count="$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).length))' "$incompatible_json")"
+  if [ "$incompatible_count" -eq 0 ] 2>/dev/null; then
+    return 0
+  fi
+
+  cat <<EOF
+
+  ${incompatible_count} existing sandbox name(s) cannot be recreated by OpenShell 0.0.101:
+EOF
+  while IFS= read -r sandbox_name; do
+    [[ -n "$sandbox_name" ]] && printf "    %s\n" "$sandbox_name"
+  done < <(node -e '
+    const preview = (value) => {
+      const raw = String(value);
+      const prefix = raw.slice(0, 80);
+      let escaped = "\"";
+      for (let index = 0; index < prefix.length; index += 1) {
+        const codeUnit = prefix.charCodeAt(index);
+        if (codeUnit === 0x22) escaped += "\\\"";
+        else if (codeUnit === 0x5c) escaped += "\\\\";
+        else if (codeUnit >= 0x20 && codeUnit <= 0x7e) escaped += prefix[index];
+        else escaped += "\\u" + codeUnit.toString(16).padStart(4, "0");
+      }
+      return escaped + (raw.length > 80 ? "...\"" : "\"");
+    };
+    for (const name of JSON.parse(process.argv[1])) console.log(preview(name));
+  ' "$incompatible_json")
+  cat <<EOF
+
+  OpenShell 0.0.101 caps routed sandbox names at
+  ${_OPENSHELL_SANDBOX_NAME_MAX_LENGTH} characters and rejects consecutive
+  hyphens. Current NemoClaw names must use 1-${_OPENSHELL_SANDBOX_NAME_MAX_LENGTH}
+  lowercase letters, numbers, and single internal hyphens, starting with a
+  letter and ending with a letter or number. NemoClaw does not rename durable
+  sandbox identity automatically.
+
+  The installer stopped before preparing the current CLI, starting a new
+  backup, retiring the gateway, installing OpenShell, or recreating a sandbox.
+  Use the currently installed NemoClaw and OpenShell runtime to transfer the
+  required state into a replacement sandbox with a compatible name. After you
+  verify the replacement, destroy each incompatible sandbox and rerun the
+  installer. If you already retired the gateway manually, restore the prior
+  OpenShell runtime and gateway before migrating the sandbox state.
+
+EOF
+  error "OpenShell 0.0.101 upgrade blocked by incompatible existing sandbox names."
 }
 
 normalize_legacy_managed_confirmation_json() {
@@ -1902,13 +2667,18 @@ EOF
 }
 
 print_openshell_upgrade_manual_commands() {
+  local gateway_port gateway_name gateway_port_env=""
+  gateway_port="$(resolve_nemoclaw_gateway_port)" || return 1
+  gateway_name="$(nemoclaw_gateway_name)" || return 1
+  if [ "$gateway_port" -ne 8080 ]; then
+    gateway_port_env="NEMOCLAW_GATEWAY_PORT=${gateway_port} "
+  fi
   cat <<EOF
   Manual upgrade path (after installing the current CLI with OpenShell deferred):
-    NEMOCLAW_REQUIRE_ALL_SANDBOX_BACKUPS=1 ${_CLI_BIN} backup-all
-    openshell gateway remove nemoclaw || openshell gateway destroy -g nemoclaw || openshell gateway destroy
-    sudo pkill -f openshell-gateway  # if a privileged host gateway process remains
-    curl -fsSL https://www.nvidia.com/nemoclaw.sh | NEMOCLAW_OPENSHELL_UPGRADE_PREPARED=1 bash
-    ${_CLI_BIN} upgrade-sandboxes --check
+    ${gateway_port_env}NEMOCLAW_REQUIRE_ALL_SANDBOX_BACKUPS=1 ${_CLI_BIN} backup-all
+    openshell gateway remove ${gateway_name} || openshell gateway destroy -g ${gateway_name}
+    curl -fsSL https://www.nvidia.com/nemoclaw.sh | ${gateway_port_env}NEMOCLAW_OPENSHELL_UPGRADE_PREPARED=1 bash
+    ${gateway_port_env}${_CLI_BIN} upgrade-sandboxes --check
 
   The prepared installer rerun lists pre-fingerprint sandboxes and asks you to
   confirm their managed-image provenance. For a non-interactive rerun, set
@@ -1977,9 +2747,63 @@ EOF
   esac
 }
 
+stop_legacy_openshell_gateway_process() {
+  [ "$(uname -s)" = "Linux" ] || return 1
+
+  local gateway_port runtime_dir pid_file pid gateway_exe attempt
+  gateway_port="$(resolve_nemoclaw_gateway_port)" || return 2
+  if [ -n "${NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR:-}" ]; then
+    runtime_dir="${NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR}"
+  elif [ "$gateway_port" -eq 8080 ]; then
+    runtime_dir="${HOME}/.local/state/nemoclaw/openshell-docker-gateway"
+  else
+    runtime_dir="${HOME}/.local/state/nemoclaw/openshell-docker-gateway-${gateway_port}"
+  fi
+  pid_file="${runtime_dir}/openshell-gateway.pid"
+  [ -f "$pid_file" ] || return 1
+  if [ -L "$pid_file" ] || ! [ -O "$pid_file" ]; then
+    error "Refusing to retire the legacy OpenShell gateway from an untrusted PID file: ${pid_file}"
+  fi
+
+  IFS= read -r pid <"$pid_file" || return 2
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] \
+    || error "Refusing to retire the legacy OpenShell gateway from an invalid PID file: ${pid_file}"
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$pid_file"
+    return 0
+  fi
+
+  gateway_exe="$(readlink "/proc/${pid}/exe" 2>/dev/null || true)"
+  [ "${gateway_exe##*/}" = "openshell-gateway" ] \
+    || error "Refusing to stop PID ${pid}: the recorded process is not openshell-gateway."
+
+  kill "$pid" 2>/dev/null \
+    || error "Could not stop the recorded legacy OpenShell gateway process ${pid}."
+  for attempt in {1..50}; do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.2
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null \
+      || error "Could not terminate the recorded legacy OpenShell gateway process ${pid}."
+    for attempt in {1..10}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+  fi
+  kill -0 "$pid" 2>/dev/null \
+    && error "The recorded legacy OpenShell gateway process ${pid} did not stop."
+  rm -f "$pid_file"
+}
+
 preinstall_backup_and_retire_legacy_gateway() {
-  local reg_file="${HOME}/.nemoclaw/sandboxes.json"
+  local reg_file gateway_name
+  reg_file="$(nemoclaw_state_dir)/sandboxes.json"
+  if [ ! -f "$reg_file" ] && [ "$(resolve_nemoclaw_gateway_port)" -ne 8080 ]; then
+    reg_file="${HOME}/.nemoclaw/sandboxes.json"
+  fi
   [ -f "$reg_file" ] || return 0
+  gateway_name="$(nemoclaw_gateway_name)"
 
   local sandbox_count
   if ! sandbox_count="$(registered_sandbox_count)"; then
@@ -1987,6 +2811,14 @@ preinstall_backup_and_retire_legacy_gateway() {
   fi
   _PREEXISTING_SANDBOX_COUNT="$sandbox_count"
   [ "$sandbox_count" -gt 0 ] 2>/dev/null || return 0
+  require_openshell_compatible_sandbox_names "$reg_file"
+  if ! command_exists openshell; then
+    # NemoClaw v0.0.55's OpenShell 0.0.44 layout could install this binary
+    # without persisting ~/.local/bin on PATH. Retain this fallback while direct
+    # v0.0.55 upgrades are supported; remove it only after support for that
+    # source version and its regression fixture are retired together.
+    prefer_user_local_openshell
+  fi
   command_exists openshell || return 0
 
   if [[ "${NEMOCLAW_SINGLE_SESSION:-}" == "1" ]]; then
@@ -2014,18 +2846,40 @@ preinstall_backup_and_retire_legacy_gateway() {
     if legacy_openshell_gateway_upgrade_needed "$old_openshell_version"; then
       error "Pre-upgrade backup failed. Aborting before retiring the legacy OpenShell gateway."
     fi
-    error "Pre-upgrade backup failed. Resolve every reported sandbox backup failure and rerun the installer."
+    error "Pre-upgrade backup stopped the installer. Resolve every reported sandbox backup failure or skipped sandbox using the CLI output above, then rerun the installer."
   fi
+  # The replacement gateway may report legacy rows as Ready even when their
+  # state is no longer inspectable. Reuse this validated backup for every stale
+  # or non-Ready recreate instead of attempting a second live backup.
   export NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE=1
 
-  # Current OpenShell builds are not compatible with pre-0.0.37 gateway state,
-  # and those CLIs no longer have lifecycle verbs for destroying that old gateway.
-  # Retire the old gateway while the old CLI can still do it, after backup.
-  if [[ -n "$old_openshell_version" ]] && ! version_gte "$old_openshell_version" "0.0.37"; then
+  # Retire a backed-up gateway before install-openshell replaces an out-of-range
+  # component set. Leaving the old gateway process alive makes the new CLI's
+  # schema preflight fail before sandbox recovery can recreate it.
+  local supported_range="" min_openshell_version="" max_openshell_version=""
+  if ! supported_range="$(resolve_current_openshell_version_range)"; then
+    error "Could not resolve the current OpenShell version range. Existing gateway and sandbox state were left unchanged after backup."
+  fi
+  read -r min_openshell_version max_openshell_version <<<"$supported_range"
+  [ -n "$old_openshell_version" ] \
+    || error "Could not determine the installed OpenShell version. The installer stopped after backup without retiring the gateway."
+  if ! version_gte "$old_openshell_version" "$min_openshell_version" \
+    || ! version_gte "$max_openshell_version" "$old_openshell_version"; then
     info "Retiring OpenShell ${old_openshell_version} gateway before installing current OpenShell…"
-    openshell gateway destroy -g nemoclaw >/dev/null 2>&1 \
-      || openshell gateway destroy >/dev/null 2>&1 \
-      || warn "Could not destroy the legacy OpenShell gateway before upgrade; onboarding will clean up stale runtime state."
+    if [ "$gateway_name" = "nemoclaw" ]; then
+      openshell gateway destroy -g "$gateway_name" >/dev/null 2>&1 \
+        || openshell gateway destroy >/dev/null 2>&1 \
+        || { stop_legacy_openshell_gateway_process \
+          && { openshell gateway remove "$gateway_name" >/dev/null 2>&1 \
+            || warn "The legacy gateway process stopped, but its OpenShell registration could not be removed; onboarding will replace the stale registration."; }; } \
+        || error "Could not retire the legacy OpenShell gateway after backup. The installer stopped with the sandbox backups preserved."
+    else
+      openshell gateway destroy -g "$gateway_name" >/dev/null 2>&1 \
+        || { stop_legacy_openshell_gateway_process \
+          && { openshell gateway remove "$gateway_name" >/dev/null 2>&1 \
+            || warn "Legacy gateway ${gateway_name} stopped, but its OpenShell registration could not be removed; onboarding will replace only that stale registration."; }; } \
+        || error "Could not retire legacy gateway ${gateway_name} after backup. The installer stopped with the sandbox backups preserved."
+    fi
   fi
 }
 
@@ -2176,7 +3030,12 @@ repair_installer_nvidia_cdi_spec() {
 
 run_installer_host_preflight() {
   local preflight_module="${NEMOCLAW_SOURCE_ROOT}/dist/lib/onboard/preflight.js"
-  if ! command_exists node || [[ ! -f "$preflight_module" ]]; then
+  local host_readiness_module="${NEMOCLAW_SOURCE_ROOT}/dist/lib/readiness/host.js"
+  local onboard_admission_module="${NEMOCLAW_SOURCE_ROOT}/dist/lib/readiness/onboard-admission.js"
+  if ! command_exists node \
+    || [[ ! -f "$preflight_module" ]] \
+    || [[ ! -f "$host_readiness_module" ]] \
+    || [[ ! -f "$onboard_admission_module" ]]; then
     return 0
   fi
 
@@ -2187,17 +3046,35 @@ run_installer_host_preflight() {
     # shellcheck disable=SC2016
     node -e '
       const preflightPath = process.argv[1];
+      const hostReadinessPath = process.argv[2];
+      const onboardAdmissionPath = process.argv[3];
       try {
-        const { assessHost, planHostRemediation } = require(preflightPath);
+        const { assessHost, planHostAdvisories } = require(preflightPath);
+        const { createHostReadinessReport } = require(hostReadinessPath);
+        const { evaluateOnboardReadinessAdmission } = require(onboardAdmissionPath);
         const host = assessHost();
-        const actions = planHostRemediation(host);
-        const blockingActions = actions.filter((action) => action && action.blocking);
+        const actions = planHostAdvisories(host);
+        const readiness = createHostReadinessReport(
+          { nemoclawVersion: "installer", sourceRevision: "installer" },
+          {
+            assess: () => host,
+            detectGpu: () => null,
+            detectHostGpuPlatform: () => host.hostGpuPlatform,
+            detectNvidiaDriverVersion: () => host.nvidiaDriverVersion,
+            collectPlatformIdentity: () => ({}),
+          }
+        );
+        const admission = evaluateOnboardReadinessAdmission(readiness, {
+          explicitlyOptedOutGpuPassthrough: false,
+          allowUnsupportedRuntime: false,
+          allowStorageRemediation: false,
+        });
         const infoLines = [];
         const actionLines = [];
         if (host.runtime && host.runtime !== "unknown") {
           infoLines.push(`Detected container runtime: ${host.runtime}`);
         }
-        if (host.notes && host.notes.includes("Running under WSL")) {
+        if (host.isWsl) {
           infoLines.push("Running under WSL");
         }
         for (const action of actions) {
@@ -2212,11 +3089,11 @@ run_installer_host_preflight() {
         if (actionLines.length > 0) {
           process.stdout.write(`__ACTIONS__\n${actionLines.join("\n")}`);
         }
-        process.exit(blockingActions.length > 0 ? 10 : 0);
+        process.exit(admission.admitted ? 0 : 10);
       } catch {
         process.exit(0);
       }
-    ' "$preflight_module"
+    ' "$preflight_module" "$host_readiness_module" "$onboard_admission_module"
   )"; then
     status=0
   else
@@ -2262,12 +3139,60 @@ recover_preexisting_sandboxes_before_onboard() {
   # pre-upgrade backup signal is present, the CLI also recovers registered
   # non-Ready sandboxes from their validated latest backup. It attempts every
   # eligible sandbox before returning non-zero for any failure.
-  if NEMOCLAW_CONFIRMED_LEGACY_MANAGED_SANDBOXES="${_LEGACY_MANAGED_RECOVERY_NAMES_JSON:-[]}" \
-    "$cli_runner" upgrade-sandboxes --auto 2>&1; then
+  #
+  # #6520: mirror the CLI output into a temp log (while still streaming it) so
+  # the installer can tell "recovered" apart from "exited 0 but recorded
+  # sandboxes are unrecoverable" — e.g. after `nemoclaw uninstall` removed the
+  # gateway and Docker image a preserved sandboxes.json still references. The
+  # CLI emits a dedicated orphan marker only for sandboxes absent from their
+  # own recorded gateway (never for sandboxes bound to another live gateway or
+  # ones that reconnect mid-run); keep the grep in sync with the "recorded
+  # sandbox(es) were not found on their recorded gateway" line in
+  # src/lib/actions/upgrade-sandboxes.ts.
+  local recovery_log=""
+  recovery_log="$(mktemp "${TMPDIR:-/tmp}/nemoclaw-recovery-XXXXXX" 2>/dev/null)" || recovery_log=""
+  local recovery_status=0 recovery_pass=1
+  if [ -n "$recovery_log" ]; then
+    _cleanup_files+=("$recovery_log")
+  fi
+  while [ "$recovery_pass" -le 2 ]; do
+    recovery_status=0
+    if [ -n "$recovery_log" ]; then
+      if NEMOCLAW_CONFIRMED_LEGACY_MANAGED_SANDBOXES="${_LEGACY_MANAGED_RECOVERY_NAMES_JSON:-[]}" \
+        "$cli_runner" upgrade-sandboxes --auto 2>&1 | tee "$recovery_log"; then
+        recovery_status=0
+      else
+        # pipefail: take the CLI's own status, not tee's — a log-write failure
+        # (e.g. ENOSPC on TMPDIR) must not convert a successful recovery into
+        # the #5735 failure path.
+        recovery_status=${PIPESTATUS[0]}
+      fi
+    else
+      NEMOCLAW_CONFIRMED_LEGACY_MANAGED_SANDBOXES="${_LEGACY_MANAGED_RECOVERY_NAMES_JSON:-[]}" \
+        "$cli_runner" upgrade-sandboxes --auto 2>&1 || recovery_status=$?
+    fi
+    [ "$recovery_status" -eq 0 ] || break
+    if [ "$recovery_pass" -eq 1 ]; then
+      # #7091: the replaced gateway can briefly retain the old supervisor's
+      # Ready row before that sandbox exits. Recheck beyond the observed
+      # eight-second failure window so the validated backup recovery path sees
+      # the real phase instead of letting the installer report false success.
+      info "Verifying pre-existing sandboxes remain healthy…"
+      sleep 10
+    fi
+    recovery_pass=$((recovery_pass + 1))
+  done
+  if [ "$recovery_status" -eq 0 ]; then
     _PREEXISTING_SANDBOX_RECOVERY_RAN=true
+    if [ -n "$recovery_log" ] \
+      && grep -Fq "recorded sandbox(es) were not found on their recorded gateway" "$recovery_log"; then
+      _PREEXISTING_SANDBOX_ORPHANED=true
+    fi
+    rm -f "$recovery_log" 2>/dev/null || true
     return 0
   fi
 
+  rm -f "$recovery_log" 2>/dev/null || true
   _UPGRADE_SANDBOXES_FAILED=true
   warn "One or more existing sandboxes could not be recovered automatically."
   warn "Generic onboarding will not run; review the affected sandbox and preserved backup diagnostics above."
@@ -2278,7 +3203,12 @@ run_onboard() {
   show_usage_notice
   info "Running ${_CLI_BIN} onboard…"
   local -a onboard_cmd=(onboard)
-  local session_file="${HOME}/.nemoclaw/onboard-session.json"
+  if [[ "${NEMOCLAW_EXPERIMENTAL_PROFILE:-}" == "portable" ]]; then
+    onboard_cmd+=(--experimental-profile portable)
+  fi
+  local installer_auto_fresh_receipt_generation=""
+  local session_file
+  session_file="$(nemoclaw_state_dir)/onboard-session.json"
   # --fresh takes precedence over any session state. We forward --fresh to
   # the active CLI's onboard command so it clears the existing session file before
   # creating a new one — the install.sh classifier is bypassed entirely.
@@ -2288,8 +3218,9 @@ run_onboard() {
   elif command_exists node && [[ -f "$session_file" ]]; then
     # Classify the session: "resume" (auto-attach --resume), "fresh-recover"
     # (interrupted before sandbox creation — nothing to resume, start over),
-    # "failed" (last run reported a step failure — user must choose), "skip"
-    # (complete / missing / unreadable — nothing to resume), or "corrupt".
+    # "failed" (last run reported a step failure — user must choose), "complete"
+    # (durably finished; the CLI may still have Station receipt retirement to
+    # reconcile), "skip" (missing / non-resumable), or "corrupt".
     local session_state
     session_state="$(
       node -e '
@@ -2297,7 +3228,9 @@ run_onboard() {
         let out = "skip";
         try {
           const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-          if (!data || data.resumable === false || data.status === "complete") {
+          if (data && data.status === "complete" && data.resumable === false) {
+            out = "complete";
+          } else if (!data || data.resumable === false) {
             out = "skip";
           } else if (data.status === "failed" || data.failure) {
             out = "failed";
@@ -2314,7 +3247,30 @@ run_onboard() {
               data.steps &&
               data.steps.sandbox &&
               data.steps.sandbox.status === "complete";
-            out = sandboxCreated ? "resume" : "fresh-recover";
+            const installerGeneration =
+              process.env.NEMOCLAW_STATION_EXPRESS_RECEIPT_GENERATION || "";
+            const stationIntentHasGeneration =
+              data.stationExpressIntent &&
+              Object.prototype.hasOwnProperty.call(
+                data.stationExpressIntent,
+                "receiptGeneration",
+              );
+            const exactStationAttempt =
+              /^[0-9a-f]{32}$/.test(installerGeneration) &&
+              stationIntentHasGeneration &&
+              data.stationExpressIntent.receiptGeneration === installerGeneration;
+            const conflictingStationAttempt =
+              /^[0-9a-f]{32}$/.test(installerGeneration) &&
+              stationIntentHasGeneration &&
+              !exactStationAttempt;
+            // A Station session carries its sandbox name in the correlated
+            // intent, so it can safely resume even before sandbox creation.
+            // Using --fresh here would discard the still-needed receipt.
+            out = conflictingStationAttempt
+              ? "station-mismatch"
+              : sandboxCreated || exactStationAttempt
+                ? "resume"
+                : "fresh-recover";
           } else {
             // Unknown or missing status — do not auto-resume a file we
             // cannot classify against what onboard-session.ts actually
@@ -2328,6 +3284,10 @@ run_onboard() {
       ' "$session_file" 2>/dev/null || printf "corrupt"
     )"
     case "$session_state" in
+      complete) ;;
+      station-mismatch)
+        error "DGX Station Express resume state belongs to a different installer receipt. Refusing to discard either attempt automatically. Run '${_CLI_BIN} onboard --fresh' only if you intend to discard the saved Station recovery state."
+        ;;
       resume)
         info "Found an interrupted onboarding session — resuming it."
         onboard_cmd+=(--resume)
@@ -2336,26 +3296,42 @@ run_onboard() {
         # #5626: interrupted before sandbox creation; nothing to resume.
         info "Found an interrupted onboarding session with no sandbox yet — starting fresh."
         onboard_cmd+=(--fresh)
+        # Bind this automatic reset to the loaded Station receipt so the CLI
+        # clears only the unrelated session, not the accepted reboot choice.
+        # An explicit user --fresh never sets this internal child marker.
+        installer_auto_fresh_receipt_generation="${NEMOCLAW_STATION_EXPRESS_RECEIPT_GENERATION:-}"
         ;;
       failed)
         # #2430: a previous run failed. The user's provider/inference
         # choice may be the cause, so auto-resuming would just loop.
         # Refuse in non-interactive mode (no safe default); prompt in
         # interactive mode so the user can pick resume vs. fresh.
+        local _fresh_install_cmd
+        case "${NEMOCLAW_AGENT:-openclaw}" in
+          hermes)
+            _fresh_install_cmd="curl -fsSL https://www.nvidia.com/nemoclaw.sh | NEMOCLAW_AGENT=hermes bash -s -- --fresh"
+            ;;
+          langchain-deepagents-code)
+            _fresh_install_cmd="curl -fsSL https://www.nvidia.com/nemoclaw.sh | NEMOCLAW_AGENT=langchain-deepagents-code bash -s -- --fresh"
+            ;;
+          *)
+            _fresh_install_cmd="curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash -s -- --fresh"
+            ;;
+        esac
         if [ "${NON_INTERACTIVE:-}" = "1" ]; then
-          error "Previous onboarding session failed. Re-run with --fresh to discard it, or run '${_CLI_BIN} onboard --resume' to retry the same session."
+          error "Previous onboarding session failed. To discard it and start over, run '${_fresh_install_cmd}'. To retry the same session, run '${_CLI_BIN} onboard --resume'."
         fi
         local _prompt_stdin="/dev/tty"
         if [ -t 0 ]; then _prompt_stdin="/dev/stdin"; fi
         if [ ! -r "$_prompt_stdin" ]; then
-          error "Previous onboarding session failed, and no TTY is available to prompt. Re-run with --fresh or run '${_CLI_BIN} onboard --resume'."
+          error "Previous onboarding session failed, and no TTY is available to prompt. To discard it and start over, run '${_fresh_install_cmd}'. To retry the same session, run '${_CLI_BIN} onboard --resume'."
         fi
         info "Previous onboarding session failed."
         local _resume_answer=""
         while :; do
           printf "  Resume the failed session, or start fresh? [R/f]: " >&2
           if ! IFS= read -r _resume_answer <"$_prompt_stdin"; then
-            error "Could not read response from TTY. Re-run with --fresh or run '${_CLI_BIN} onboard --resume'."
+            error "Could not read response from TTY. To discard the failed session and start over, run '${_fresh_install_cmd}'. To retry the same session, run '${_CLI_BIN} onboard --resume'."
           fi
           # Use tr to lowercase the answer rather than the bash 4 case
           # expansion form (lowercase via the comma-comma operator), which
@@ -2398,17 +3374,42 @@ run_onboard() {
     # forward --yes so the Ollama size-confirmation gate does not abort
     # the unattended download (the size is still printed to logs).
     onboard_cmd+=(--yes)
-    "$cli_invoke" "${onboard_cmd[@]}" || status=$?
+    NEMOCLAW_INSTALLER_AUTO_FRESH_RECEIPT_GENERATION="$installer_auto_fresh_receipt_generation" \
+      "$cli_invoke" "${onboard_cmd[@]}" || status=$?
   elif [ -t 0 ]; then
-    "$cli_invoke" "${onboard_cmd[@]}" || status=$?
+    NEMOCLAW_INSTALLER_AUTO_FRESH_RECEIPT_GENERATION="$installer_auto_fresh_receipt_generation" \
+      "$cli_invoke" "${onboard_cmd[@]}" || status=$?
   elif { exec 3</dev/tty; } 2>/dev/null; then
     info "Installer stdin is piped; attaching onboarding to /dev/tty…"
-    "$cli_invoke" "${onboard_cmd[@]}" <&3 || status=$?
+    NEMOCLAW_INSTALLER_AUTO_FRESH_RECEIPT_GENERATION="$installer_auto_fresh_receipt_generation" \
+      "$cli_invoke" "${onboard_cmd[@]}" <&3 || status=$?
     exec 3<&-
   else
     error "Interactive onboarding requires a TTY. Re-run in a terminal or set NEMOCLAW_NON_INTERACTIVE=1 with --yes-i-accept-third-party-software."
   fi
   return "$status"
+}
+
+station_express_receipt_retirement_pending() {
+  command_exists node || return 1
+  local session_file
+  session_file="$(nemoclaw_state_dir)/onboard-session.json"
+  [[ -f "$session_file" ]] || return 1
+  node -e '
+    const fs = require("fs");
+    try {
+      const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.exit(
+        data &&
+          Object.prototype.hasOwnProperty.call(data, "stationExpressReceiptRetirement") &&
+          data.stationExpressReceiptRetirement !== null
+          ? 0
+          : 1,
+      );
+    } catch {
+      process.exit(1);
+    }
+  ' "$session_file" >/dev/null 2>&1
 }
 
 # Make sure Docker is installed and the current user can run it without
@@ -2552,13 +3553,48 @@ ensure_docker() {
     printf "\n"
     info "Docker group membership is not active in this shell yet. To finish:"
     info "  1) Run: newgrp docker   (or log out and log back in)"
-    info "  2) Re-run: curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash"
+    if [[ "${_STATION_LOCAL_VLLM_SELECTED:-}" == "1" ]]; then
+      info "  2) Re-run: $(station_local_vllm_resume_command)"
+    else
+      info "  2) Re-run: curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash"
+    fi
     exit 0
   fi
 
   if ! docker info >/dev/null 2>&1; then
     error "Docker is installed but not reachable. Try: sudo systemctl start docker"
   fi
+}
+
+# Select the rootless Podman API socket reported for the current user. This
+# must run before ensure_docker and the installer host preflight: both use
+# the Docker CLI, with DOCKER_HOST overriding its daemon to Podman's user
+# socket. The CLI's portable host preparation later applies the networking and
+# local-registry configuration required by the OpenShell Podman driver.
+prepare_portable_experimental_runtime_override() {
+  [[ "${NEMOCLAW_EXPERIMENTAL_PROFILE:-}" == "portable" ]] || return 0
+  [[ "$(uname -s)" == "Linux" ]] \
+    || error "The portable experimental profile requires Linux."
+  command_exists podman \
+    || error "The portable experimental profile requires rootless Podman on PATH."
+  command_exists docker \
+    || error "The portable experimental profile requires the Docker CLI on PATH."
+  command_exists systemctl \
+    || error "The portable experimental profile requires systemctl --user to manage the rootless Podman socket."
+
+  systemctl --user enable --now podman.socket >/dev/null \
+    || error "Could not start the rootless Podman API socket with 'systemctl --user enable --now podman.socket'."
+
+  local podman_socket=""
+  podman_socket="$(podman info --format '{{.Host.RemoteSocket.Path}}' 2>/dev/null)" \
+    || error "Could not resolve the rootless Podman API socket with 'podman info'."
+  case "$podman_socket" in
+    unix:///*) export DOCKER_HOST="$podman_socket" ;;
+    /*) export DOCKER_HOST="unix://${podman_socket}" ;;
+    *) error "Podman reported an invalid rootless API socket path: ${podman_socket:-empty}" ;;
+  esac
+
+  info "Portable profile selected rootless Podman through DOCKER_HOST=${DOCKER_HOST}."
 }
 
 is_wsl_host() {
@@ -2580,8 +3616,20 @@ is_wsl_host() {
 # and Windows WSL from the host environment. Echoes "DGX Spark",
 # "DGX Station", "Windows WSL", or empty. Used to gate the express install
 # prompt; only platforms with a known sensible default are offered.
+is_station_gb300_product() {
+  local product=${1:-}
+  [[ "$product" =~ (^|[^[:alnum:]])[Ss][Tt][Aa][Tt][Ii][Oo][Nn]([^[:alnum:]]|$) &&
+    "$product" =~ (^|[^[:alnum:]])[Gg][Bb]300([^[:alnum:]]|$) ]]
+}
+
+classify_dgx_station_release() {
+  local helper="${SCRIPT_DIR}/prepare-dgx-station-host.sh"
+  [[ -f "$helper" ]] || error "DGX Station host preparation helper is missing: ${helper}"
+  bash "$helper" --classify-dgx-release
+}
+
 detect_express_platform() {
-  local model=""
+  local model="" release_state=""
   if is_wsl_host; then
     printf "Windows WSL"
     return
@@ -2593,10 +3641,1257 @@ detect_express_platform() {
     model="$(tr -d '\0' </sys/firmware/devicetree/base/model 2>/dev/null || true)"
   fi
   case "$model" in
-    *DGX*Spark*) printf "DGX Spark" ;;
-    *DGX*Station*) printf "DGX Station" ;;
+    *DGX*Spark*)
+      printf "DGX Spark"
+      return
+      ;;
+  esac
+  if is_station_gb300_product "$model"; then
+    release_state="$(classify_dgx_station_release)"
+    case "$release_state" in
+      generic-ubuntu | supported-dgx-os | supported-colossus-baseos | supported-ai-developer-tools)
+        printf "DGX Station"
+        ;;
+      *)
+        if [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
+          printf "DGX Station"
+        else
+          printf "Unsupported DGX Station OS"
+        fi
+        ;;
+    esac
+    return
+  fi
+  case "$model" in
+    *DGX*Station*) printf "Unsupported DGX Station generation" ;;
     *) ;;
   esac
+}
+
+validate_express_platform_boundary() {
+  case "${1:-}" in
+    "Unsupported DGX Station OS")
+      if [ "${NEMOCLAW_NO_EXPRESS:-}" = "1" ] || [ -n "${NEMOCLAW_PROVIDER:-}" ]; then return 0; fi
+      error "This DGX Station OS image is outside the recognized Station Express release-metadata boundary. Station Express accepts generic Ubuntu 24.04 ARM64, OTA-form DGX OS 7.2.0, 7.4.0, or 7.5.0, an explicitly qualified Station factory image, or the no-OTA DGX OS 7.6.x NVIDIA DGX GB300WS profile."
+      ;;
+    "Unsupported DGX Station generation")
+      if [ "${NEMOCLAW_NO_EXPRESS:-}" = "1" ] || [ -n "${NEMOCLAW_PROVIDER:-}" ]; then return 0; fi
+      error "This DGX Station generation is outside the validated Station GB300 express boundary."
+      ;;
+  esac
+}
+
+STATION_ULTRA_VLLM_MODEL="nemotron-3-ultra-550b-a55b"
+STATION_ULTRA_SERVED_MODEL="nvidia/nemotron-3-ultra-550b-a55b"
+STATION_ULTRA_DUAL_SERVED_MODEL="nemotron-ultra"
+STATION_ULTRA_LEGACY_VLLM_IMAGE="vllm/vllm-openai@sha256:0fec7ec5f3e6bc168e54899935fb0557da908a4832a1dbc88e2debcf2f889416"
+STATION_DEEPSEEK_VLLM_MODEL="deepseek-v4-flash"
+STATION_DEEPSEEK_SERVED_MODEL="deepseek-ai/DeepSeek-V4-Flash"
+_SELECTED_EXPRESS_PLATFORM=""
+_EXPRESS_WSL_PROVIDER_PENDING=""
+_STATION_EXPRESS_RESUME_REVISION=""
+_STATION_EXPRESS_MODEL_WAS_EXPLICIT=0
+_STATION_EXPRESS_DEFERRED_MANAGED_PAIR=0
+_STATION_EXPRESS_MIGRATING_LEGACY_HEAD=0
+_STATION_INSTALL_MODE=""
+_STATION_EXPRESS_RESUME_LOADED=""
+_STATION_EXPRESS_RESUME_GENERATION=""
+_STATION_EXPRESS_RESUME_GATEWAY_PORT=""
+_STATION_EXPRESS_RESUME_DASHBOARD_PORT=""
+_STATION_EXPRESS_RESUME_VLLM_PORT=""
+
+normalize_station_vllm_model() {
+  printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+# True when an interactive terminal is reachable for a prompt: stdin is a TTY,
+# or /dev/tty can be opened (the curl|bash case where stdin is the script pipe).
+# Mirrors how maybe_offer_express_install decides whether it can prompt.
+express_prompt_can_read_tty() {
+  [ -t 0 ] && return 0
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    exec 3<&-
+    return 0
+  fi
+  return 1
+}
+
+fail_station_deepseek_terminal_required() {
+  error "--station-deepseek selects the DGX Station express prompt, which needs an interactive terminal. Re-run from a terminal (for a curl|bash pipe, /dev/tty must be available), or omit --station-deepseek and configure the install non-interactively."
+}
+
+fail_force_station_terminal_required() {
+  error "--force-station-install selects the DGX Station express prompt, which needs an interactive terminal. Re-run from a terminal (for a curl|bash pipe, /dev/tty must be available), or omit --force-station-install."
+}
+
+validate_force_station_install_override() {
+  local platform="$1" release_state
+  if [ "${FORCE_STATION_INSTALL:-}" != "1" ]; then
+    return 0
+  fi
+  if [ "$platform" != "DGX Station" ]; then
+    error "--force-station-install requires DGX Station GB300 hardware (detected: ${platform:-unsupported platform})."
+  fi
+  release_state="$(classify_dgx_station_release)"
+  case "$release_state" in
+    generic-ubuntu | supported-dgx-os | supported-colossus-baseos | supported-ai-developer-tools)
+      error "--force-station-install is only for unrecognized DGX Station release metadata. This host is already supported (${release_state}); omit --force-station-install."
+      ;;
+  esac
+  if [ "${NEMOCLAW_NO_EXPRESS:-}" = "1" ]; then
+    error "--force-station-install cannot be combined with NEMOCLAW_NO_EXPRESS=1. Remove one override."
+  fi
+  if [ "${NON_INTERACTIVE:-}" = "1" ]; then
+    local trigger_note=""
+    if [ -n "${NON_INTERACTIVE_SOURCE:-}" ]; then
+      trigger_note=" (triggered by: ${NON_INTERACTIVE_SOURCE})"
+    fi
+    error "--force-station-install selects the DGX Station express prompt and cannot be combined with non-interactive mode${trigger_note}."
+  fi
+  if [ -n "${NEMOCLAW_PROVIDER:-}" ]; then
+    error "--force-station-install conflicts with NEMOCLAW_PROVIDER=${NEMOCLAW_PROVIDER}. Remove the provider override to use Station express install."
+  fi
+  if ! express_prompt_can_read_tty; then
+    fail_force_station_terminal_required
+  fi
+}
+
+validate_station_deepseek_override() {
+  local platform="$1"
+  if [ "${STATION_DEEPSEEK:-}" != "1" ]; then
+    return 0
+  fi
+  if [ "$platform" != "DGX Station" ]; then
+    error "--station-deepseek requires a detected DGX Station (detected: ${platform:-unsupported platform})."
+  fi
+  if [ "${NEMOCLAW_NO_EXPRESS:-}" = "1" ]; then
+    error "--station-deepseek cannot be combined with NEMOCLAW_NO_EXPRESS=1. Remove one override."
+  fi
+  if [ "${NON_INTERACTIVE:-}" = "1" ]; then
+    # #7009: name what actually put the run in non-interactive mode so the user
+    # can act on it. NON_INTERACTIVE_SOURCE is recorded in main() where the
+    # origin is still known (main exports NON_INTERACTIVE into
+    # NEMOCLAW_NON_INTERACTIVE, erasing the distinction here). Append the clause
+    # only when the origin is known, so direct callers that set NON_INTERACTIVE
+    # without going through main's flag parsing still get a clean message.
+    local trigger_note=""
+    if [ -n "${NON_INTERACTIVE_SOURCE:-}" ]; then
+      trigger_note=" (triggered by: ${NON_INTERACTIVE_SOURCE})"
+    fi
+    error "--station-deepseek selects the DGX Station express prompt and cannot be combined with non-interactive mode${trigger_note}."
+  fi
+  if [ -n "${NEMOCLAW_PROVIDER:-}" ]; then
+    error "--station-deepseek conflicts with NEMOCLAW_PROVIDER=${NEMOCLAW_PROVIDER}. Remove the provider override to use Station express install."
+  fi
+
+  local requested_model
+  requested_model="$(normalize_station_vllm_model "${NEMOCLAW_VLLM_MODEL:-}")"
+  case "$requested_model" in
+    "" | "$STATION_DEEPSEEK_VLLM_MODEL" | "deepseek-ai/deepseek-v4-flash") ;;
+    *)
+      error "--station-deepseek conflicts with NEMOCLAW_VLLM_MODEL='${NEMOCLAW_VLLM_MODEL}'. Remove one override or set NEMOCLAW_VLLM_MODEL=${STATION_DEEPSEEK_VLLM_MODEL}."
+      ;;
+  esac
+
+  # #7014: --station-deepseek selects the interactive DGX Station express prompt,
+  # so it needs a terminal. Without one, maybe_offer_express_install would just
+  # log "Skipping express prompt (no TTY)" and continue, silently ignoring the
+  # flag and installing a different configuration. Fail fast here (before Docker
+  # / build deps) with a clear message instead, mirroring the --non-interactive
+  # rejection above. Checked last so a genuine config conflict (provider/model)
+  # is still reported first.
+  if ! express_prompt_can_read_tty; then
+    fail_station_deepseek_terminal_required
+  fi
+}
+
+preflight_explicit_express_flags() {
+  local platform
+  platform="$(detect_express_platform)"
+  validate_express_platform_boundary "$platform"
+  validate_force_station_install_override "$platform"
+  validate_station_deepseek_override "$platform"
+}
+
+configure_station_express_model() {
+  local selected_model
+  selected_model="$(normalize_station_vllm_model "${NEMOCLAW_VLLM_MODEL:-}")"
+  _STATION_EXPRESS_MODEL_WAS_EXPLICIT=0
+  if [ "${STATION_DEEPSEEK:-}" = "1" ]; then
+    _STATION_EXPRESS_MODEL_WAS_EXPLICIT=1
+    NEMOCLAW_VLLM_MODEL="$STATION_DEEPSEEK_VLLM_MODEL"
+    NEMOCLAW_MODEL="$STATION_DEEPSEEK_SERVED_MODEL"
+  elif [ -z "$selected_model" ]; then
+    if [ "${_STATION_INSTALL_MODE:-}" = "express" ] || [ -n "${NEMOCLAW_DGX_STATION_PEER:-}" ]; then
+      # Station Express keeps its single-host Ultra default. Pair qualification
+      # changes only the serving topology. An explicit peer also selects Ultra
+      # for a provider-driven, non-interactive pair setup.
+      NEMOCLAW_VLLM_MODEL="$STATION_ULTRA_VLLM_MODEL"
+      NEMOCLAW_MODEL="$STATION_ULTRA_SERVED_MODEL"
+    else
+      # A direct provider selection outside Express keeps the Station profile
+      # default unless the operator selects a model or peer.
+      unset NEMOCLAW_VLLM_MODEL
+    fi
+  else
+    [ "$selected_model" != "auto" ] \
+      || error "NEMOCLAW_VLLM_MODEL=auto is reserved for DGX Station reboot-resume state. Unset NEMOCLAW_VLLM_MODEL to request automatic selection."
+    _STATION_EXPRESS_MODEL_WAS_EXPLICIT=1
+    case "$selected_model" in
+      "$STATION_ULTRA_VLLM_MODEL" | "nvidia/nvidia-nemotron-3-ultra-550b-a55b-nvfp4")
+        NEMOCLAW_MODEL="$STATION_ULTRA_SERVED_MODEL"
+        ;;
+      "$STATION_ULTRA_SERVED_MODEL" | "$STATION_ULTRA_DUAL_SERVED_MODEL")
+        # The served alias is useful in route output but is not a Hugging Face
+        # repository ID. Normalize it to the registered model slug before the
+        # existing managed-vLLM selector consumes it.
+        NEMOCLAW_VLLM_MODEL="$STATION_ULTRA_VLLM_MODEL"
+        NEMOCLAW_MODEL="$STATION_ULTRA_SERVED_MODEL"
+        ;;
+      "$STATION_DEEPSEEK_VLLM_MODEL" | "deepseek-ai/deepseek-v4-flash")
+        NEMOCLAW_MODEL="$STATION_DEEPSEEK_SERVED_MODEL"
+        ;;
+    esac
+  fi
+  if [ -n "${NEMOCLAW_VLLM_MODEL:-}" ]; then
+    export NEMOCLAW_VLLM_MODEL
+  fi
+  if [ -n "${NEMOCLAW_MODEL:-}" ]; then
+    export NEMOCLAW_MODEL
+  fi
+}
+
+station_dual_model_requested() {
+  local selected_model
+  selected_model="$(normalize_station_vllm_model "${NEMOCLAW_VLLM_MODEL:-}")"
+  case "$selected_model" in
+    "$STATION_ULTRA_VLLM_MODEL" | "$STATION_ULTRA_SERVED_MODEL" | "$STATION_ULTRA_DUAL_SERVED_MODEL" | "nvidia/nvidia-nemotron-3-ultra-550b-a55b-nvfp4")
+      return 0
+      ;;
+    "")
+      [ "${_STATION_INSTALL_MODE:-}" = "express" ] || [ -n "${NEMOCLAW_DGX_STATION_PEER:-}" ]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+station_express_resume_file() {
+  local state_dir
+  state_dir="$(nemoclaw_state_dir)" || return 1
+  printf '%s/station-express-resume' "$state_dir"
+}
+
+validate_station_express_resume_model() {
+  local model="${1:-}"
+  [[ ${#model} -le 255 && "$model" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]
+}
+
+validate_station_express_resume_agent() {
+  case "${1:-}" in
+    openclaw | hermes | langchain-deepagents-code) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_station_express_resume_sandbox() {
+  local sandbox="${1:-}"
+  [[ ${#sandbox} -le $_OPENSHELL_SANDBOX_NAME_MAX_LENGTH ]] \
+    && [[ "$sandbox" != *--* ]] \
+    && { [[ "$sandbox" =~ ^[a-z]$ ]] || [[ "$sandbox" =~ ^[a-z][a-z0-9-]*[a-z0-9]$ ]]; }
+}
+
+validate_station_express_resume_policy_tier() {
+  case "${1:-}" in
+    restricted | balanced | open | personal) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_station_express_resume_revision() {
+  [[ "${1:-}" =~ ^[0-9a-f]{40}$ ]]
+}
+
+validate_station_install_mode() {
+  [[ "${1:-}" == "express" || "${1:-}" == "provider" ]]
+}
+
+validate_station_express_resume_generation() {
+  [[ "${1:-}" =~ ^[0-9a-f]{32}$ ]]
+}
+
+validate_station_express_resume_port() {
+  local port="${1:-}"
+  [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]
+}
+
+station_express_resume_port_value() {
+  local env_name="$1" fallback="$2" port
+  case "$env_name" in
+    NEMOCLAW_GATEWAY_PORT | NEMOCLAW_DASHBOARD_PORT | NEMOCLAW_VLLM_PORT) ;;
+    *) error "Unsupported DGX Station express resume port field: ${env_name}" ;;
+  esac
+  port="${!env_name:-$fallback}"
+  port="${port#"${port%%[![:space:]]*}"}"
+  port="${port%"${port##*[![:space:]]}"}"
+  validate_station_express_resume_port "$port" \
+    || error "${env_name} must be an integer between 1024 and 65535."
+  printf '%s' "$((10#$port))"
+}
+
+validate_station_express_resume_ports_distinct() {
+  local gateway_port="$1" dashboard_port="$2" vllm_port="$3"
+  gateway_port="$((10#$gateway_port))"
+  dashboard_port="$((10#$dashboard_port))"
+  vllm_port="$((10#$vllm_port))"
+  [[ "$gateway_port" != "$dashboard_port" ]] \
+    || error "NEMOCLAW_GATEWAY_PORT conflicts with NEMOCLAW_DASHBOARD_PORT (${gateway_port})."
+  [[ "$gateway_port" != "$vllm_port" ]] \
+    || error "NEMOCLAW_GATEWAY_PORT conflicts with NEMOCLAW_VLLM_PORT (${gateway_port})."
+  [[ "$dashboard_port" != "$vllm_port" ]] \
+    || error "NEMOCLAW_DASHBOARD_PORT conflicts with NEMOCLAW_VLLM_PORT (${dashboard_port})."
+}
+
+station_express_resume_generation() {
+  local generation
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    IFS= read -r generation </proc/sys/kernel/random/uuid \
+      || error "Could not generate a DGX Station express resume receipt identity."
+  elif command_exists uuidgen; then
+    generation="$(uuidgen)" \
+      || error "Could not generate a DGX Station express resume receipt identity."
+  elif command_exists openssl; then
+    generation="$(openssl rand -hex 16)" \
+      || error "Could not generate a DGX Station express resume receipt identity."
+  else
+    error "Could not generate a DGX Station express resume receipt identity."
+  fi
+  generation="${generation//-/}"
+  generation="$(printf '%s' "$generation" | tr '[:upper:]' '[:lower:]')"
+  validate_station_express_resume_generation "$generation" \
+    || error "Generated DGX Station express resume receipt identity is invalid."
+  printf '%s' "$generation"
+}
+
+station_installer_revision() {
+  local revision
+  revision="$(git -C "${SCRIPT_DIR}/.." rev-parse --verify 'HEAD^{commit}' 2>/dev/null)" \
+    || error "Could not resolve the exact NemoClaw revision for DGX Station reboot resume."
+  validate_station_express_resume_revision "$revision" \
+    || error "Resolved NemoClaw revision is invalid: ${revision}"
+  printf '%s' "$revision"
+}
+
+portable_file_mode() {
+  stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
+assert_station_express_resume_file_safe() {
+  local state_file=$1 state_dir mode
+  state_dir="$(dirname "$state_file")"
+  assert_station_express_resume_directory_safe "$state_dir"
+  [[ -f "$state_file" && -O "$state_file" ]] \
+    || error "DGX Station express resume state must be a regular file owned by the current user: ${state_file}"
+  mode="$(portable_file_mode "$state_file")" \
+    || error "Could not inspect DGX Station express resume state permissions: ${state_file}"
+  [[ "$mode" == "600" ]] || error "DGX Station express resume state must have mode 0600: ${state_file}"
+}
+
+assert_station_express_resume_directory_safe() {
+  local state_dir=$1 root current relative component mode
+  root="$(nemoclaw_state_root)" || return 1
+  assert_nemoclaw_state_path_safe "$state_dir"
+  current="$root"
+  relative="${state_dir#"$root"}"
+  relative="${relative#/}"
+  while :; do
+    [[ -d "$current" && ! -L "$current" && -O "$current" ]] \
+      || error "DGX Station express resume directory is not owned by the current user: ${current}"
+    mode="$(portable_file_mode "$current")" \
+      || error "Could not inspect DGX Station express resume directory permissions: ${current}"
+    (((8#$mode & 0077) == 0)) \
+      || error "DGX Station express resume directory must not be accessible by group or other users: ${current}"
+    [[ -n "$relative" ]] || break
+    component="${relative%%/*}"
+    current="${current}/${component}"
+    if [[ "$relative" == "$component" ]]; then
+      relative=''
+    else
+      relative="${relative#*/}"
+    fi
+  done
+}
+
+load_station_express_resume() {
+  local state_file revision_line model_line generation_line agent_line sandbox_line policy_tier_line
+  local gateway_port_line dashboard_port_line vllm_port_line mode_line
+  local line_count saved_revision saved_model saved_mode current_revision
+  local saved_agent saved_sandbox saved_policy_tier current_agent
+  local saved_gateway_port saved_dashboard_port saved_vllm_port current_gateway_port
+  local requested_model="${NEMOCLAW_VLLM_MODEL:-}" requested_mode="${_STATION_INSTALL_MODE:-}"
+  state_file="$(station_express_resume_file)" || return 1
+  assert_nemoclaw_state_path_safe "$state_file"
+  [[ -e "$state_file" || -L "$state_file" ]] || return 1
+  assert_station_express_resume_file_safe "$state_file"
+  line_count="$(wc -l <"$state_file" | tr -d '[:space:]')"
+  revision_line="$(sed -n '1p' "$state_file")"
+  model_line="$(sed -n '2p' "$state_file")"
+  generation_line="$(sed -n '3p' "$state_file")"
+  agent_line="$(sed -n '4p' "$state_file")"
+  sandbox_line="$(sed -n '5p' "$state_file")"
+  policy_tier_line="$(sed -n '6p' "$state_file")"
+  gateway_port_line="$(sed -n '7p' "$state_file")"
+  dashboard_port_line="$(sed -n '8p' "$state_file")"
+  vllm_port_line="$(sed -n '9p' "$state_file")"
+  mode_line="$(sed -n '10p' "$state_file")"
+  saved_revision="${revision_line#revision=}"
+  saved_model="${model_line#model=}"
+  if [[ "$line_count" == "3" && "$generation_line" == mode=* ]]; then
+    # Compatibility with the pre-receipt dual-Station draft state.
+    saved_mode="${generation_line#mode=}"
+    _STATION_EXPRESS_RESUME_GENERATION="$(station_express_resume_generation)"
+    saved_agent=openclaw
+    saved_sandbox=my-assistant
+    saved_policy_tier=balanced
+  elif [[ "$line_count" == "3" ]]; then
+    _STATION_EXPRESS_RESUME_GENERATION="${generation_line#generation=}"
+    saved_mode=express
+    saved_agent=openclaw
+    saved_sandbox=my-assistant
+    saved_policy_tier=balanced
+  elif [[ "$line_count" == "6" ]]; then
+    _STATION_EXPRESS_RESUME_GENERATION="${generation_line#generation=}"
+    saved_mode=express
+    saved_agent="${agent_line#agent=}"
+    saved_sandbox="${sandbox_line#sandbox=}"
+    saved_policy_tier="${policy_tier_line#policy_tier=}"
+  elif [[ "$line_count" == "9" || "$line_count" == "10" ]]; then
+    _STATION_EXPRESS_RESUME_GENERATION="${generation_line#generation=}"
+    saved_mode=express
+    saved_agent="${agent_line#agent=}"
+    saved_sandbox="${sandbox_line#sandbox=}"
+    saved_policy_tier="${policy_tier_line#policy_tier=}"
+    saved_gateway_port="${gateway_port_line#gateway_port=}"
+    saved_dashboard_port="${dashboard_port_line#dashboard_port=}"
+    saved_vllm_port="${vllm_port_line#vllm_port=}"
+    if [[ "$line_count" == "10" ]]; then
+      saved_mode="${mode_line#mode=}"
+    fi
+  else
+    error "DGX Station express resume state is invalid. Remove ${state_file} and rerun the installer."
+  fi
+  if [[ "$revision_line" != "revision=${saved_revision}" || "$model_line" != "model=${saved_model}" ]] \
+    || { [[ "$generation_line" != mode=* ]] && [[ "$generation_line" != "generation=${_STATION_EXPRESS_RESUME_GENERATION}" ]]; } \
+    || { [[ "$line_count" != "3" ]] && [[ "$agent_line" != "agent=${saved_agent}" || "$sandbox_line" != "sandbox=${saved_sandbox}" || "$policy_tier_line" != "policy_tier=${saved_policy_tier}" ]]; } \
+    || { [[ "$line_count" == "9" || "$line_count" == "10" ]] && [[ "$gateway_port_line" != "gateway_port=${saved_gateway_port}" || "$dashboard_port_line" != "dashboard_port=${saved_dashboard_port}" || "$vllm_port_line" != "vllm_port=${saved_vllm_port}" ]]; } \
+    || { [[ "$line_count" == "10" ]] && [[ "$mode_line" != "mode=${saved_mode}" ]]; } \
+    || ! validate_station_express_resume_revision "$saved_revision" \
+    || ! validate_station_express_resume_model "$saved_model" \
+    || ! validate_station_express_resume_generation "$_STATION_EXPRESS_RESUME_GENERATION" \
+    || ! validate_station_express_resume_agent "$saved_agent" \
+    || ! validate_station_express_resume_sandbox "$saved_sandbox" \
+    || ! validate_station_express_resume_policy_tier "$saved_policy_tier" \
+    || ! validate_station_install_mode "$saved_mode" \
+    || { [[ "$line_count" == "9" || "$line_count" == "10" ]] && { ! validate_station_express_resume_port "$saved_gateway_port" || ! validate_station_express_resume_port "$saved_dashboard_port" || ! validate_station_express_resume_port "$saved_vllm_port"; }; }; then
+    error "DGX Station express resume state is invalid. Remove ${state_file} and rerun the installer."
+  fi
+  current_gateway_port="$(resolve_nemoclaw_gateway_port)"
+  if [[ "$line_count" != "9" && "$line_count" != "10" ]]; then
+    saved_gateway_port="$current_gateway_port"
+    saved_dashboard_port="$(station_express_resume_port_value NEMOCLAW_DASHBOARD_PORT 18789)"
+    saved_vllm_port="$(station_express_resume_port_value NEMOCLAW_VLLM_PORT 8000)"
+  fi
+  validate_station_express_resume_ports_distinct \
+    "$saved_gateway_port" "$saved_dashboard_port" "$saved_vllm_port"
+  _STATION_EXPRESS_RESUME_REVISION="$saved_revision"
+  _STATION_EXPRESS_RESUME_AGENT="$saved_agent"
+  _STATION_EXPRESS_RESUME_SANDBOX="$saved_sandbox"
+  _STATION_EXPRESS_RESUME_POLICY_TIER="$saved_policy_tier"
+  _STATION_EXPRESS_RESUME_GATEWAY_PORT="$saved_gateway_port"
+  _STATION_EXPRESS_RESUME_DASHBOARD_PORT="$saved_dashboard_port"
+  _STATION_EXPRESS_RESUME_VLLM_PORT="$saved_vllm_port"
+  current_revision="$(station_installer_revision)"
+  if [[ "$current_revision" != "$saved_revision" ]]; then
+    error "DGX Station Express resume requires NemoClaw revision ${saved_revision}, but this installer is ${current_revision}. Rerun with: $(station_express_resume_command)"
+  fi
+  if [ -n "$requested_mode" ] && [ "$requested_mode" != "$saved_mode" ]; then
+    error "DGX Station resume state was accepted in ${saved_mode} mode; refusing to resume it in ${requested_mode} mode. Rerun the exact accepted installer command."
+  fi
+  _STATION_INSTALL_MODE="$saved_mode"
+  current_agent="${NEMOCLAW_AGENT:-openclaw}"
+  if [[ "$current_agent" != "$saved_agent" ]]; then
+    error "DGX Station express resume requires NEMOCLAW_AGENT=${saved_agent}. Rerun the exact command printed after host preparation."
+  fi
+  if [[ "$line_count" == "9" || "$line_count" == "10" ]]; then
+    if [[ "$current_gateway_port" != "$saved_gateway_port" ]]; then
+      error "DGX Station express resume requires NEMOCLAW_GATEWAY_PORT=${saved_gateway_port}. Rerun the exact command printed after host preparation."
+    fi
+    if [[ -n "${NEMOCLAW_DASHBOARD_PORT:-}" ]] \
+      && [[ "$(station_express_resume_port_value NEMOCLAW_DASHBOARD_PORT 18789)" != "$saved_dashboard_port" ]]; then
+      error "DGX Station express resume requires NEMOCLAW_DASHBOARD_PORT=${saved_dashboard_port}. Rerun the exact command printed after host preparation."
+    fi
+    if [[ -n "${NEMOCLAW_VLLM_PORT:-}" ]] \
+      && [[ "$(station_express_resume_port_value NEMOCLAW_VLLM_PORT 8000)" != "$saved_vllm_port" ]]; then
+      error "DGX Station express resume requires NEMOCLAW_VLLM_PORT=${saved_vllm_port}. Rerun the exact command printed after host preparation."
+    fi
+  fi
+  NEMOCLAW_SANDBOX_NAME="$saved_sandbox"
+  NEMOCLAW_POLICY_TIER="$saved_policy_tier"
+  NEMOCLAW_GATEWAY_PORT="$saved_gateway_port"
+  NEMOCLAW_DASHBOARD_PORT="$saved_dashboard_port"
+  NEMOCLAW_VLLM_PORT="$saved_vllm_port"
+  _STATION_EXPRESS_RESUME_LOADED=1
+  export NEMOCLAW_SANDBOX_NAME
+  export NEMOCLAW_POLICY_TIER
+  export NEMOCLAW_GATEWAY_PORT
+  export NEMOCLAW_DASHBOARD_PORT
+  export NEMOCLAW_VLLM_PORT
+  export NEMOCLAW_STATION_EXPRESS_RECEIPT_GENERATION="$_STATION_EXPRESS_RESUME_GENERATION"
+  if [ -n "$(normalize_station_vllm_model "$requested_model")" ]; then
+    NEMOCLAW_VLLM_MODEL="$requested_model"
+    export NEMOCLAW_VLLM_MODEL
+    if station_dual_pair_resume_pending && ! station_dual_model_requested; then
+      error "A dual-DGX Station pair resume is pending; refusing to replace its model with '${requested_model}' before the exact pair is revalidated. Rerun with the accepted dual-Station model or remove the override."
+    fi
+  elif [ "$saved_model" = "auto" ]; then
+    unset NEMOCLAW_VLLM_MODEL
+  else
+    NEMOCLAW_VLLM_MODEL="$saved_model"
+    export NEMOCLAW_VLLM_MODEL
+  fi
+}
+
+save_station_express_resume() {
+  local state_file state_dir temp_file revision generation
+  local model="${NEMOCLAW_VLLM_MODEL:-auto}" agent="${NEMOCLAW_AGENT:-openclaw}"
+  local sandbox="${NEMOCLAW_SANDBOX_NAME:-my-assistant}" policy_tier="${NEMOCLAW_POLICY_TIER:-balanced}"
+  local gateway_port dashboard_port vllm_port mode="${_STATION_INSTALL_MODE:-express}"
+  validate_station_express_resume_model "$model" || error "Cannot save an invalid DGX Station express model selector."
+  validate_station_express_resume_agent "$agent" || error "Cannot save an invalid DGX Station express agent."
+  validate_station_express_resume_sandbox "$sandbox" || error "Cannot save an invalid DGX Station express sandbox name."
+  validate_station_express_resume_policy_tier "$policy_tier" || error "Cannot save an invalid DGX Station express policy tier."
+  validate_station_install_mode "$mode" || error "Cannot save an invalid DGX Station installer resume mode."
+  gateway_port="$(resolve_nemoclaw_gateway_port)"
+  dashboard_port="$(station_express_resume_port_value NEMOCLAW_DASHBOARD_PORT 18789)"
+  vllm_port="$(station_express_resume_port_value NEMOCLAW_VLLM_PORT 8000)"
+  validate_station_express_resume_ports_distinct "$gateway_port" "$dashboard_port" "$vllm_port"
+  NEMOCLAW_GATEWAY_PORT="$gateway_port"
+  NEMOCLAW_DASHBOARD_PORT="$dashboard_port"
+  NEMOCLAW_VLLM_PORT="$vllm_port"
+  export NEMOCLAW_GATEWAY_PORT
+  export NEMOCLAW_DASHBOARD_PORT
+  export NEMOCLAW_VLLM_PORT
+  revision="$(station_installer_revision)"
+  state_file="$(station_express_resume_file)" || error "Could not resolve NemoClaw state for DGX Station express resume."
+  state_dir="$(ensure_nemoclaw_state_dir)" || error "Could not prepare NemoClaw state for DGX Station express resume."
+  assert_nemoclaw_state_path_safe "$state_file"
+  generation="${_STATION_EXPRESS_RESUME_GENERATION:-}"
+  if ! validate_station_express_resume_generation "$generation"; then
+    generation="$(station_express_resume_generation)"
+  fi
+  temp_file="$(mktemp "${state_file}.tmp.XXXXXX")" || error "Could not create DGX Station express resume state under ${state_dir}."
+  chmod 600 "$temp_file" || {
+    rm -f "$temp_file"
+    error "Could not secure DGX Station express resume state under ${state_dir}."
+  }
+  if ! printf 'revision=%s\nmodel=%s\ngeneration=%s\nagent=%s\nsandbox=%s\npolicy_tier=%s\ngateway_port=%s\ndashboard_port=%s\nvllm_port=%s\nmode=%s\n' \
+    "$revision" "$model" "$generation" "$agent" "$sandbox" "$policy_tier" \
+    "$gateway_port" "$dashboard_port" "$vllm_port" "$mode" >"$temp_file"; then
+    rm -f "$temp_file"
+    error "Could not write DGX Station express resume state under ${state_dir}."
+  fi
+  if ! mv -f "$temp_file" "$state_file"; then
+    rm -f "$temp_file"
+    error "Could not publish DGX Station express resume state under ${state_dir}."
+  fi
+  assert_station_express_resume_file_safe "$state_file"
+  _STATION_EXPRESS_RESUME_REVISION="$revision"
+  _STATION_EXPRESS_RESUME_GENERATION="$generation"
+  _STATION_EXPRESS_RESUME_AGENT="$agent"
+  _STATION_EXPRESS_RESUME_SANDBOX="$sandbox"
+  _STATION_EXPRESS_RESUME_POLICY_TIER="$policy_tier"
+  _STATION_EXPRESS_RESUME_GATEWAY_PORT="$gateway_port"
+  _STATION_EXPRESS_RESUME_DASHBOARD_PORT="$dashboard_port"
+  _STATION_EXPRESS_RESUME_VLLM_PORT="$vllm_port"
+  _STATION_INSTALL_MODE="$mode"
+}
+
+station_express_resume_command() {
+  local provider_assignment=""
+  if [ "${_STATION_INSTALL_MODE:-express}" = "provider" ]; then
+    provider_assignment="NEMOCLAW_PROVIDER=install-vllm "
+  fi
+  printf 'curl -fsSL https://www.nvidia.com/nemoclaw.sh | %sNEMOCLAW_INSTALL_TAG=%s NEMOCLAW_AGENT=%s NEMOCLAW_SANDBOX_NAME=%s NEMOCLAW_POLICY_TIER=%s NEMOCLAW_GATEWAY_PORT=%s NEMOCLAW_DASHBOARD_PORT=%s NEMOCLAW_VLLM_PORT=%s bash' \
+    "$provider_assignment" "$_STATION_EXPRESS_RESUME_REVISION" "$_STATION_EXPRESS_RESUME_AGENT" \
+    "$_STATION_EXPRESS_RESUME_SANDBOX" "$_STATION_EXPRESS_RESUME_POLICY_TIER" \
+    "$_STATION_EXPRESS_RESUME_GATEWAY_PORT" "$_STATION_EXPRESS_RESUME_DASHBOARD_PORT" \
+    "$_STATION_EXPRESS_RESUME_VLLM_PORT"
+  if [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
+    printf ' -s -- --force-station-install'
+  fi
+}
+
+load_station_vllm_conflict_helpers() {
+  declare -F handle_station_vllm_conflict >/dev/null 2>&1 && return 0
+  local helper="${SCRIPT_DIR}/lib/station-vllm-conflict.sh"
+  [[ -f "$helper" ]] || error "Station vLLM conflict helper is missing: ${helper}"
+  # shellcheck source=lib/station-vllm-conflict.sh
+  . "$helper"
+}
+
+clear_station_express_resume() {
+  local state_file state_dir claim claim_name claim_mode entry entry_mode unexpected_entry
+  state_file="$(station_express_resume_file)" || return 0
+  assert_nemoclaw_state_path_safe "$state_file"
+  state_dir="$(dirname "$state_file")"
+  [[ -e "$state_dir" || -L "$state_dir" ]] || return 0
+  assert_station_express_resume_directory_safe "$state_dir"
+  if [[ -e "$state_file" || -L "$state_file" ]]; then
+    assert_station_express_resume_file_safe "$state_file"
+    rm -f "$state_file"
+  fi
+  for claim in "${state_file}.retiring-"*; do
+    [[ -e "$claim" || -L "$claim" ]] || continue
+    assert_nemoclaw_state_path_safe "$claim"
+    claim_name="${claim##*/}"
+    [[ "$claim_name" =~ ^station-express-resume\.retiring-[0-9a-f]{32}-[A-Za-z0-9]+$ ]] \
+      || error "DGX Station express receipt retirement claim is malformed: ${claim_name}"
+    [[ -d "$claim" && ! -L "$claim" && -O "$claim" ]] \
+      || error "Refusing invalid DGX Station express receipt retirement claim: ${claim}"
+    claim_mode="$(portable_file_mode "$claim")" \
+      || error "Could not inspect DGX Station express receipt retirement claim permissions: ${claim}"
+    (((8#$claim_mode & 0077) == 0)) \
+      || error "DGX Station express receipt retirement claim must be owner-only: ${claim}"
+    unexpected_entry="$(find "$claim" -mindepth 1 -maxdepth 1 ! -name receipt ! -name retired -print -quit)" \
+      || error "Could not inspect DGX Station express receipt retirement claim: ${claim}"
+    [[ -z "$unexpected_entry" ]] \
+      || error "DGX Station express receipt retirement claim contains unexpected state: ${claim}"
+    for entry in "$claim/receipt" "$claim/retired"; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      assert_nemoclaw_state_path_safe "$entry"
+      [[ -f "$entry" && ! -L "$entry" && -O "$entry" ]] \
+        || error "Refusing invalid DGX Station express receipt retirement claim entry: ${entry}"
+      entry_mode="$(portable_file_mode "$entry")" \
+        || error "Could not inspect DGX Station express receipt retirement claim entry permissions: ${entry}"
+      [[ "$entry_mode" == "600" ]] \
+        || error "DGX Station express receipt retirement claim entry must have mode 0600: ${entry}"
+    done
+    for entry in "$claim/receipt" "$claim/retired"; do
+      [[ -e "$entry" || -L "$entry" ]] || continue
+      rm -f "$entry"
+    done
+    rmdir "$claim" \
+      || error "DGX Station express receipt retirement claim contains unexpected state: ${claim}"
+  done
+}
+
+# Report the container runtime's operating-system string (e.g. "Docker Desktop"
+# or "Ubuntu 24.04.4 LTS"). Bounded with a hard timeout so a wedged,
+# misconfigured, or dead-DOCKER_HOST daemon cannot hang the interactive express
+# prompt: this runs from describe_express_install before ensure_docker, and WSL
+# skips ensure_docker entirely. Empty on timeout or error.
+express_wsl_docker_operating_system() {
+  timeout 10 docker info --format '{{.OperatingSystem}}' 2>/dev/null
+}
+
+# Resolve Docker's effective context name: the DOCKER_CONTEXT override if set,
+# otherwise the persisted currentContext from Docker's config (what
+# `docker context use` writes). A missing config or a config with no
+# currentContext uses Docker's "default"; an unreadable or unparseable config
+# fails closed as non-local.
+express_wsl_docker_active_context() {
+  if [ -n "${DOCKER_CONTEXT:-}" ]; then
+    printf '%s' "${DOCKER_CONTEXT}"
+    return 0
+  fi
+  local cfg="${DOCKER_CONFIG:-${HOME:-}/.docker}/config.json"
+  local ctx="" parse_status=0
+  if [ ! -e "$cfg" ]; then
+    printf '%s' "default"
+    return 0
+  fi
+  if [ -e "$cfg" ] && [ ! -r "$cfg" ]; then
+    printf '%s' "__unknown__"
+    return 0
+  fi
+  if command -v node >/dev/null 2>&1; then
+    ctx="$(
+      node - "$cfg" <<'NODE'
+const fs = require("node:fs");
+
+let config;
+try {
+  config = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+} catch {
+  process.exit(1);
+}
+if (config === null || typeof config !== "object" || Array.isArray(config)) process.exit(1);
+if (!Object.prototype.hasOwnProperty.call(config, "currentContext")) process.exit(2);
+if (typeof config.currentContext !== "string") process.exit(1);
+process.stdout.write(config.currentContext);
+NODE
+    )" || parse_status=$?
+    if [ "$parse_status" -eq 0 ]; then
+      printf '%s' "$ctx"
+      return 0
+    fi
+    if [ "$parse_status" -eq 2 ]; then
+      printf '%s' "default"
+      return 0
+    fi
+    printf '%s' "__unknown__"
+    return 0
+  fi
+  printf '%s' "__unknown__"
+}
+
+# True only when the Docker CLI targets the LOCAL default daemon: the active
+# context is "default" and no DOCKER_HOST override is set. A DOCKER_HOST, a
+# DOCKER_CONTEXT override, or a persisted currentContext other than "default"
+# (a context name like desktop-linux is not proof of a local endpoint — it can be
+# pointed at a remote daemon) can reach a remote Docker Desktop whose sandbox
+# containers cannot reach this machine's Windows-host Ollama (PRA-1). Fails closed
+# (non-local) on any non-default, unreadable, or unparseable context.
+express_wsl_docker_target_is_local() {
+  [ -z "${DOCKER_HOST:-}" ] || return 1
+  [ "$(express_wsl_docker_active_context)" = "default" ]
+}
+
+# Windows-host Ollama only works through LOCAL Docker Desktop WSL integration
+# (host.docker.internal routes to the Windows host). Native Docker Engine (#3695),
+# a remote/unknown target, or a failed probe can't reach it, so use WSL-local
+# Ollama instead; the onboard provider setup fronts that loopback daemon with
+# the sandbox auth proxy when containers cannot reach host loopback (#7318).
+express_wsl_can_use_windows_host_ollama() {
+  express_wsl_docker_target_is_local || return 1
+  express_wsl_docker_operating_system | grep -qi 'docker desktop'
+}
+
+# True when a readable Docker configuration decides the context but no Node.js can
+# parse it yet. The express prompt runs before install_nodejs, so treating that
+# window as non-local pinned WSL-local Ollama on hosts whose Docker Desktop
+# topology supports Windows-host Ollama, and onboarding then rejected the
+# preselected provider (#8199). Selection waits for the runtime instead.
+express_wsl_docker_context_needs_node() {
+  [ -z "${DOCKER_HOST:-}" ] || return 1
+  [ -z "${DOCKER_CONTEXT:-}" ] || return 1
+  local cfg="${DOCKER_CONFIG:-${HOME:-}/.docker}/config.json"
+  [ -e "$cfg" ] && [ -r "$cfg" ] || return 1
+  ! command_exists node
+}
+
+# Choose between Windows-host and WSL-local Ollama, or defer when only the
+# missing Node.js runtime blocks the decision.
+select_express_wsl_ollama_provider() {
+  _EXPRESS_WSL_PROVIDER_PENDING=""
+  if express_wsl_can_use_windows_host_ollama; then
+    export NEMOCLAW_PROVIDER=install-windows-ollama
+    return 0
+  fi
+  if express_wsl_docker_context_needs_node; then
+    _EXPRESS_WSL_PROVIDER_PENDING=1
+    return 0
+  fi
+  export NEMOCLAW_PROVIDER=install-ollama
+}
+
+# Finish a deferred Windows WSL selection once install_nodejs has provided the
+# runtime that reads the Docker configuration.
+resolve_pending_express_wsl_provider() {
+  [ "${_EXPRESS_WSL_PROVIDER_PENDING:-}" = "1" ] || return 0
+  _EXPRESS_WSL_PROVIDER_PENDING=""
+  if express_wsl_can_use_windows_host_ollama; then
+    export NEMOCLAW_PROVIDER=install-windows-ollama
+    info "Express install will configure Windows-host Ollama through host.docker.internal."
+  else
+    export NEMOCLAW_PROVIDER=install-ollama
+    info "Express install will configure WSL-local Ollama."
+  fi
+}
+
+select_spark_express_inference() {
+  local input_fd="${1:-0}"
+  local reply=""
+
+  unset _SPARK_EXPRESS_INFERENCE_SELECTION
+  if [ -n "${NEMOCLAW_MODEL:-}" ] || [ -n "${NEMOCLAW_VLLM_MODEL:-}" ]; then
+    return 0
+  fi
+
+  printf "  Choose the DGX Spark inference setup:\n"
+  printf "    1) Managed vLLM with automatic serving-profile selection (default)\n"
+  printf "    2) Qwen3.6 35B-A3B NVFP4 with the fixed catalog-backed vLLM profile\n"
+  while true; do
+    printf "  Choose 1 or 2 [1]: "
+    if ! IFS= read -r -u "$input_fd" reply; then
+      return 1
+    fi
+    reply="$(printf "%s" "$reply" | tr '[:upper:]' '[:lower:]')"
+    case "$reply" in
+      "" | 1)
+        _SPARK_EXPRESS_INFERENCE_SELECTION="managed-vllm"
+        return 0
+        ;;
+      2)
+        _SPARK_EXPRESS_INFERENCE_SELECTION="fixed-vllm"
+        return 0
+        ;;
+      *)
+        warn "Choose 1 or 2."
+        ;;
+    esac
+  done
+}
+
+activate_express_install() {
+  local platform="$1"
+  _SELECTED_EXPRESS_PLATFORM="$platform"
+  if [ "$platform" = "DGX Station" ]; then
+    _STATION_INSTALL_MODE="express"
+  fi
+  NON_INTERACTIVE=1
+  export NEMOCLAW_NON_INTERACTIVE=1
+  export NEMOCLAW_NON_INTERACTIVE_SUDO_MODE=prompt
+  export NEMOCLAW_YES=1
+  export NEMOCLAW_POLICY_MODE=suggested
+  unset NEMOCLAW_STATION_EXPRESS
+  case "$platform" in
+    "DGX Spark")
+      export NEMOCLAW_SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-my-assistant}"
+      if [ "${_SPARK_EXPRESS_INFERENCE_SELECTION:-managed-vllm}" = "fixed-vllm" ]; then
+        if [ -n "${NEMOCLAW_PROVIDER:-}" ] || [ -n "${NEMOCLAW_MODEL:-}" ] \
+          || [ -n "${NEMOCLAW_VLLM_MODEL:-}" ] || [ -n "${NEMOCLAW_VLLM_PORT:-}" ] \
+          || [ -n "${NEMOCLAW_VLLM_EXTRA_ARGS_JSON:-}" ]; then
+          error "The fixed DGX Spark vLLM profile does not accept provider, model, port, or serve-argument overrides."
+        fi
+        unset NEMOCLAW_PROVIDER
+        export NEMOCLAW_ENABLE_LOCAL_MODEL_PROFILE=1
+        export NEMOCLAW_LOCAL_MODEL_RUNTIME=vllm
+      else
+        unset NEMOCLAW_ENABLE_LOCAL_MODEL_PROFILE NEMOCLAW_LOCAL_MODEL_RUNTIME
+        export NEMOCLAW_PROVIDER=install-vllm
+        if [ -n "${NEMOCLAW_VLLM_MODEL:-}" ]; then
+          export NEMOCLAW_VLLM_MODEL
+        fi
+      fi
+      ;;
+    "DGX Station")
+      export NEMOCLAW_STATION_EXPRESS=1
+      if [ -n "${_STATION_EXPRESS_RESUME_GENERATION:-}" ]; then
+        export NEMOCLAW_STATION_EXPRESS_RECEIPT_GENERATION="$_STATION_EXPRESS_RESUME_GENERATION"
+      else
+        unset NEMOCLAW_STATION_EXPRESS_RECEIPT_GENERATION
+      fi
+      export NEMOCLAW_SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-my-assistant}"
+      export NEMOCLAW_PROVIDER=install-vllm
+      configure_station_express_model
+      ;;
+    "Windows WSL")
+      select_express_wsl_ollama_provider
+      ;;
+  esac
+}
+
+resume_loaded_station_install() {
+  local platform="$1"
+  if [ "$_STATION_INSTALL_MODE" = "provider" ]; then
+    _SELECTED_EXPRESS_PLATFORM="$platform"
+    export NEMOCLAW_PROVIDER=install-vllm
+    configure_station_express_model
+    info "Detected DGX Station. Resuming the accepted managed-vLLM provider setup after host preparation."
+  else
+    info "Detected DGX Station. Resuming the accepted express install after host preparation."
+    activate_express_install "$platform"
+  fi
+}
+
+run_station_host_preparation() {
+  # Public curl|bash starts in the root bootstrap, which clones the complete
+  # selected ref before executing this payload. Keep the sibling lookup and
+  # fail-closed check so Station preparation cannot drift from that ref.
+  local helper="${SCRIPT_DIR}/prepare-dgx-station-host.sh"
+  local -a helper_args=(--apply)
+  [[ -f "$helper" ]] || error "DGX Station host preparation helper is missing: ${helper}"
+  if [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
+    helper_args+=(--force-station-install)
+  fi
+  bash "$helper" "${helper_args[@]}" 2>&1 | filter_station_host_preparation_output
+}
+
+filter_station_host_preparation_output() {
+  local line detail
+  while IFS= read -r line; do
+    case "$line" in
+      *" version="*" log="*)
+        info "DGX Station host preparation log: ${line##* log=}"
+        ;;
+      *" WARNING: "*)
+        detail="${line#* WARNING: }"
+        warn "$detail"
+        ;;
+      *" ERROR: "*)
+        printf '%s\n' "$line" >&2
+        ;;
+    esac
+  done
+}
+
+station_local_default_docker() {
+  (
+    unset DOCKER_HOST DOCKER_CONTEXT
+    docker --context default "$@"
+  )
+}
+
+station_managed_dual_head_running() {
+  command_exists docker || return 1
+
+  local inspection name running managed role schema cluster launch_contract api_fingerprint transaction
+  inspection="$(
+    station_local_default_docker container inspect --format \
+      '{{.Name}} {{.State.Running}} {{index .Config.Labels "com.nvidia.nemoclaw.managed-vllm"}} {{index .Config.Labels "com.nvidia.nemoclaw.vllm-role"}} {{index .Config.Labels "com.nvidia.nemoclaw.vllm-launch-schema"}} {{index .Config.Labels "com.nvidia.nemoclaw.vllm-cluster"}} {{index .Config.Labels "com.nvidia.nemoclaw.vllm-launch-contract"}} {{index .Config.Labels "com.nvidia.nemoclaw.vllm-api-key-fingerprint"}} {{index .Config.Labels "com.nvidia.nemoclaw.vllm-transaction"}}' \
+      nemoclaw-vllm 2>/dev/null
+  )" || return 1
+  read -r name running managed role schema cluster launch_contract api_fingerprint transaction <<<"$inspection"
+  [[ "$name" == "/nemoclaw-vllm" &&
+    "$running" == "true" &&
+    "$managed" == "true" &&
+    "$role" == "head" &&
+    "$schema" == "2" &&
+    "$cluster" =~ ^[a-f0-9]{64}$ &&
+    "$launch_contract" =~ ^[a-f0-9]{64}$ &&
+    "$api_fingerprint" =~ ^[a-f0-9]{64}$ &&
+    "$transaction" =~ ^[a-f0-9]{32}$ ]]
+}
+
+station_migratable_legacy_single_head_running() {
+  command_exists docker || return 1
+
+  local inspection name running image managed role endpoint cluster gpu schema launch_contract api_fingerprint transaction
+  inspection="$(
+    station_local_default_docker container inspect --format \
+      '{{.Name}}|{{.State.Running}}|{{.Config.Image}}|{{with index .Config.Labels "com.nvidia.nemoclaw.managed-vllm"}}{{.}}{{else}}-{{end}}|{{with index .Config.Labels "com.nvidia.nemoclaw.vllm-role"}}{{.}}{{else}}-{{end}}|{{with index .Config.Labels "com.nvidia.nemoclaw.vllm-endpoint"}}{{.}}{{else}}-{{end}}|{{with index .Config.Labels "com.nvidia.nemoclaw.vllm-cluster"}}{{.}}{{else}}-{{end}}|{{with index .Config.Labels "com.nvidia.nemoclaw.vllm-gpu"}}{{.}}{{else}}-{{end}}|{{with index .Config.Labels "com.nvidia.nemoclaw.vllm-launch-schema"}}{{.}}{{else}}-{{end}}|{{with index .Config.Labels "com.nvidia.nemoclaw.vllm-launch-contract"}}{{.}}{{else}}-{{end}}|{{with index .Config.Labels "com.nvidia.nemoclaw.vllm-api-key-fingerprint"}}{{.}}{{else}}-{{end}}|{{with index .Config.Labels "com.nvidia.nemoclaw.vllm-transaction"}}{{.}}{{else}}-{{end}}' \
+      nemoclaw-vllm 2>/dev/null
+  )" || return 1
+  IFS='|' read -r name running image managed role endpoint cluster gpu schema launch_contract api_fingerprint transaction <<<"$inspection"
+  [[ "$name" == "/nemoclaw-vllm" &&
+    "$running" == "true" &&
+    "$image" == "$STATION_ULTRA_LEGACY_VLLM_IMAGE" &&
+    "$managed" == "true" &&
+    "$role" == "-" &&
+    "$endpoint" == "-" &&
+    "$cluster" == "-" &&
+    "$gpu" == "-" &&
+    "$schema" == "-" &&
+    "$launch_contract" == "-" &&
+    "$api_fingerprint" == "-" &&
+    "$transaction" == "-" ]]
+}
+
+ensure_station_express_host() {
+  [[ "${_SELECTED_EXPRESS_PLATFORM:-}" == "DGX Station" ]] || return 0
+
+  _STATION_EXPRESS_DEFERRED_MANAGED_PAIR=0
+  _STATION_EXPRESS_MIGRATING_LEGACY_HEAD=0
+  if station_dual_model_requested && station_managed_dual_head_running; then
+    # The host-preparation helper intentionally refuses active workloads. Only
+    # this complete dual-head ownership contract may defer local preparation;
+    # the post-Node coordinator revalidates the reciprocal physical pair before
+    # the existing lifecycle is allowed to reuse it.
+    _STATION_EXPRESS_DEFERRED_MANAGED_PAIR=1
+    info "Found a complete running NemoClaw-managed dual-Station head candidate; deferring host preparation until reciprocal pair and lifecycle validation."
+    return 0
+  fi
+  if station_dual_model_requested && station_migratable_legacy_single_head_running; then
+    # This exact frozen legacy head is the only single-host workload that the
+    # dual lifecycle can migrate. Bind its controller without running the
+    # workload-rejecting host probes, then prepare the newly qualified peer.
+    _STATION_EXPRESS_MIGRATING_LEGACY_HEAD=1
+    info "Found the exact running legacy single-Station Ultra head; deferring workload-safe controller binding and reciprocal peer preparation."
+    return 0
+  fi
+
+  # Publish the accepted, secret-free recipe before the helper can mutate the
+  # host. The same receipt then binds reboot/login continuation and onboarding
+  # recovery to this exact Express attempt.
+  save_station_express_resume
+
+  local release_state
+  release_state="$(classify_dgx_station_release)"
+  case "$release_state" in
+    supported-dgx-os | supported-ai-developer-tools)
+      info "Validating the Station factory GPU and local container runtime. Host packages and runtime configuration will not be changed."
+      ;;
+    supported-colossus-baseos)
+      info "Validating the pinned BaseOS package inventory and preparing Docker access and CDI. Host packages and the NVIDIA driver will not be changed."
+      ;;
+    *)
+      if [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
+        warn "Proceeding with explicit --force-station-install intent; only DGX release metadata qualification is bypassed. Station GB300 hardware, workload quiescence, and factory-runtime health checks remain required."
+        info "Validating the existing Station GPU and local container runtime. Host packages, the NVIDIA driver, and runtime configuration will not be changed."
+      else
+        info "Checking pinned DGX Station host prerequisites. Exact matches are reused."
+      fi
+      ;;
+  esac
+  local status=0
+  run_station_host_preparation || status=$?
+  case "$status" in
+    0)
+      ok "DGX Station host prerequisites are ready"
+      ;;
+    10)
+      warn "DGX Station host prerequisites were installed and require a reboot."
+      info "Run: sudo reboot"
+      info "After signing in again, rerun the accepted Station Express recipe:"
+      info "$(station_express_resume_command)"
+      exit 10
+      ;;
+    11)
+      warn "Docker access was granted and requires a new login session. A reboot is not required."
+      info "After signing in again, rerun the accepted Station Express recipe:"
+      info "$(station_express_resume_command)"
+      exit 11
+      ;;
+    12)
+      load_station_vllm_conflict_helpers
+      handle_station_vllm_conflict
+      ;;
+    *)
+      error "DGX Station host preparation failed. Review the station-bootstrap log above, correct the reported host state, and rerun the installer."
+      ;;
+  esac
+}
+
+station_dual_pair_resume_file() {
+  local state_dir
+  state_dir="$(nemoclaw_state_dir)" || return 1
+  printf '%s/station-dual-pair-resume.json' "$state_dir"
+}
+
+station_dual_pair_resume_pending() {
+  local state_file
+  state_file="$(station_dual_pair_resume_file)" || return 1
+  [[ -e "$state_file" || -L "$state_file" ]] || return 1
+  assert_nemoclaw_state_path_safe "$state_file"
+  return 0
+}
+
+validate_station_pair_selection() {
+  [[ "${_SELECTED_EXPRESS_PLATFORM:-}" == "DGX Station" ]] || return 0
+  station_dual_model_requested && return 0
+  [ -z "${NEMOCLAW_DGX_STATION_PEER:-}" ] \
+    || error "NEMOCLAW_DGX_STATION_PEER requires the DGX Station dual-serving model. Unset NEMOCLAW_VLLM_MODEL or select ${STATION_ULTRA_VLLM_MODEL}; the explicit model override remains authoritative."
+  station_dual_pair_resume_pending \
+    && error "A dual-DGX Station pair resume is pending; refusing to bypass exact pair revalidation with model '${NEMOCLAW_VLLM_MODEL:-}'."
+  return 0
+}
+
+parse_station_dual_pair_result() {
+  # The single-quoted payload is JavaScript, not shell interpolation.
+  # shellcheck disable=SC2016
+  node -e '
+    const fs = require("node:fs");
+    const net = require("node:net");
+    const path = require("node:path");
+    const fail = () => process.exit(2);
+    try {
+      const raw = fs.readFileSync(0, "utf8");
+      const value = JSON.parse(raw);
+      if (!value || typeof value !== "object" || Array.isArray(value)) fail();
+      if (value.kind === "single-station") {
+        if (typeof value.reason !== "string" || value.reason.length === 0 || value.reason.length > 4096) fail();
+        process.stdout.write("single-station\n");
+        process.exit(0);
+      }
+      if (value.kind !== "ready" && value.kind !== "reboot-required") fail();
+      const peer = value.peerTarget;
+      if (typeof peer !== "string" || peer.length === 0 || peer.length > 286 || peer !== peer.trim()) fail();
+      const parts = peer.split("@");
+      if (parts.length > 2) fail();
+      const user = parts.length === 2 ? parts[0] : "";
+      const host = parts[parts.length - 1];
+      const safeUser = /^[A-Za-z_][A-Za-z0-9._-]*$/;
+      const safeHost = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$/;
+      const numericHost = /^[0-9.]+$/.test(host);
+      if ((user && !safeUser.test(user)) || (net.isIP(host) !== 4 && (numericHost || !safeHost.test(host)))) fail();
+      const identity = value.identity;
+      if (!identity || typeof identity !== "object" || Array.isArray(identity)) fail();
+      if (identity.peerTarget !== peer || !/^[a-f0-9]{64}$/.test(identity.hostKeyDigest)) fail();
+      if (!/^GPU-[A-Za-z0-9-]+$/.test(identity.localGpuUuid) || !/^GPU-[A-Za-z0-9-]+$/.test(identity.peerGpuUuid)) fail();
+      if (!Array.isArray(identity.rails) || identity.rails.length !== 2) fail();
+      const mac = /^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/;
+      for (const rail of identity.rails) {
+        if (!rail || typeof rail !== "object" || Array.isArray(rail)) fail();
+        if (net.isIP(rail.localAddress) !== 4 || net.isIP(rail.peerAddress) !== 4) fail();
+        if (!mac.test(rail.localMac) || !mac.test(rail.peerMac)) fail();
+      }
+      const token = value.sshBinding;
+      if (typeof token !== "string" || token.length === 0 || token.length > 8192 || !/^[A-Za-z0-9_-]+$/.test(token)) fail();
+      let handoff;
+      try {
+        const decoded = Buffer.from(token, "base64url");
+        if (decoded.toString("base64url") !== token) fail();
+        handoff = JSON.parse(decoded.toString("utf8"));
+      } catch {
+        fail();
+      }
+      if (!handoff || typeof handoff !== "object" || Array.isArray(handoff)) fail();
+      if (JSON.stringify(Object.keys(handoff).sort()) !== JSON.stringify(["bindingFile", "hostKeyDigest"])) fail();
+      const bindingFile = handoff.bindingFile;
+      if (typeof bindingFile !== "string" || bindingFile.length === 0 || bindingFile.length > 4096 || bindingFile !== bindingFile.trim() || /[\u0000-\u001f\u007f]/.test(bindingFile)) fail();
+      if (!path.isAbsolute(bindingFile) || path.normalize(bindingFile) !== bindingFile) fail();
+      if (handoff.hostKeyDigest !== identity.hostKeyDigest) fail();
+      process.stdout.write(`${value.kind}\n${peer}\n${token}\n`);
+    } catch {
+      fail();
+    }
+  '
+}
+
+ensure_station_express_pair() {
+  [[ "${_SELECTED_EXPRESS_PLATFORM:-}" == "DGX Station" ]] || return 0
+  validate_station_pair_selection
+  if ! station_dual_model_requested; then
+    return 0
+  fi
+
+  local coordinator="${SCRIPT_DIR}/prepare-dual-dgx-station.mts"
+  local helper="${SCRIPT_DIR}/prepare-dgx-station-host.sh"
+  [[ -f "$coordinator" ]] || error "Dual DGX Station preparation coordinator is missing: ${coordinator}"
+  [[ -f "$helper" ]] || error "DGX Station host preparation helper is missing: ${helper}"
+
+  local state_dir state_file revision output parsed kind peer_target ssh_binding status=0
+  state_dir="$(ensure_nemoclaw_state_dir)" || error "Could not prepare owner-only NemoClaw state for dual DGX Station discovery."
+  state_file="${state_dir}/station-dual-pair-resume.json"
+  assert_nemoclaw_state_path_safe "$state_file"
+  revision="$(station_installer_revision)"
+
+  local -a pair_command=(
+    node --no-warnings --experimental-strip-types "$coordinator"
+    --helper "$helper"
+    --state "$state_file"
+    --revision "$revision"
+  )
+  if [ -n "${NEMOCLAW_DGX_STATION_PEER:-}" ]; then
+    pair_command+=(--explicit-peer "$NEMOCLAW_DGX_STATION_PEER")
+  fi
+  if [ "${_STATION_EXPRESS_DEFERRED_MANAGED_PAIR:-0}" = "1" ]; then
+    pair_command+=(--reuse-existing-managed-pair)
+  fi
+  if [ "${_STATION_EXPRESS_MIGRATING_LEGACY_HEAD:-0}" = "1" ]; then
+    pair_command+=(--migrate-legacy-single-head)
+  fi
+
+  info "Checking for one pretrusted reciprocal dual-DGX Station peer on the two direct /30 rail counterparts."
+  # Publish the companion mode/model state before the coordinator can persist
+  # pair identity and mutate the remote host. A crash, mismatch, or later
+  # onboarding failure must resume this exact accepted setup without returning
+  # to a prompt or silently falling back.
+  save_station_express_resume
+  output="$("${pair_command[@]}")" || status=$?
+  case "$status" in
+    0 | 10) ;;
+    *)
+      if ! station_dual_pair_resume_pending; then
+        clear_station_express_resume
+      fi
+      error "Dual DGX Station preparation failed. No serving-model or vLLM-image pull was started; review the station-pair diagnostics above and rerun the same revision."
+      ;;
+  esac
+  if ! parsed="$(printf '%s' "$output" | parse_station_dual_pair_result)"; then
+    if ! station_dual_pair_resume_pending; then
+      clear_station_express_resume
+    fi
+    error "Dual DGX Station preparation returned invalid result data; refusing to continue."
+  fi
+  kind="$(printf '%s\n' "$parsed" | sed -n '1p')"
+  peer_target="$(printf '%s\n' "$parsed" | sed -n '2p')"
+  ssh_binding="$(printf '%s\n' "$parsed" | sed -n '3p')"
+
+  case "$kind" in
+    single-station)
+      [ "$status" -eq 0 ] \
+        || error "Dual DGX Station preparation returned an inconsistent reboot result; refusing to continue."
+      [ "${_STATION_EXPRESS_DEFERRED_MANAGED_PAIR:-0}" != "1" ] \
+        || error "The running managed dual-Station head could not be matched to its trusted reciprocal peer; refusing single-Station fallback."
+      [ "${_STATION_EXPRESS_MIGRATING_LEGACY_HEAD:-0}" != "1" ] \
+        || error "The running legacy single-Station head could not be matched to a trusted reciprocal peer; refusing migration and single-Station fallback."
+      [ -z "${NEMOCLAW_DGX_STATION_PEER:-}" ] \
+        || error "The explicit DGX Station peer could not be qualified; refusing single-Station fallback."
+      station_dual_pair_resume_pending \
+        && error "Dual DGX Station preparation returned a single-Station result while exact pair resume state is pending; refusing to discard it."
+      if [ "${_STATION_EXPRESS_MODEL_WAS_EXPLICIT:-0}" = "0" ]; then
+        NEMOCLAW_VLLM_MODEL="$STATION_ULTRA_VLLM_MODEL"
+        NEMOCLAW_MODEL="$STATION_ULTRA_SERVED_MODEL"
+        export NEMOCLAW_VLLM_MODEL NEMOCLAW_MODEL
+      fi
+      unset NEMOCLAW_DGX_STATION_SSH_BINDING
+      info "No trusted reciprocal dual-DGX Station pair was detected; using the existing single-Station Ultra recipe."
+      ;;
+    ready)
+      [ "$status" -eq 0 ] \
+        || error "Dual DGX Station preparation returned an inconsistent ready result; refusing to continue."
+      station_dual_pair_resume_pending \
+        || error "Dual DGX Station preparation returned ready without exact pair resume state; refusing to continue."
+      NEMOCLAW_DGX_STATION_PEER="$peer_target"
+      NEMOCLAW_DGX_STATION_SSH_BINDING="$ssh_binding"
+      export NEMOCLAW_DGX_STATION_PEER NEMOCLAW_DGX_STATION_SSH_BINDING
+      NEMOCLAW_MODEL="$STATION_ULTRA_DUAL_SERVED_MODEL"
+      export NEMOCLAW_MODEL
+      if [ "${_STATION_EXPRESS_MODEL_WAS_EXPLICIT:-0}" = "0" ]; then
+        NEMOCLAW_VLLM_MODEL="$STATION_ULTRA_VLLM_MODEL"
+        export NEMOCLAW_VLLM_MODEL
+      fi
+      ok "Trusted reciprocal dual-DGX Station pair is ready (${peer_target})"
+      ;;
+    reboot-required)
+      [ "$status" -eq 10 ] \
+        || error "Dual DGX Station preparation returned an inconsistent reboot result; refusing to continue."
+      station_dual_pair_resume_pending \
+        || error "Dual DGX Station preparation requested a reboot without exact pair resume state; refusing to continue."
+      save_station_express_resume
+      warn "Peer DGX Station ${peer_target} was prepared and requires a manual reboot."
+      info "On peer ${peer_target}, run: sudo reboot"
+      info "After the peer is back online, rerun the accepted revision on this Station:"
+      info "$(station_express_resume_command)"
+      exit 10
+      ;;
+    *)
+      error "Dual DGX Station preparation returned an unsupported result; refusing to continue."
+      ;;
+  esac
+}
+
+clear_station_dual_pair_resume() {
+  local state_file coordinator="${SCRIPT_DIR}/prepare-dual-dgx-station.mts"
+  state_file="$(station_dual_pair_resume_file)" || return 0
+  assert_nemoclaw_state_path_safe "$state_file"
+  [[ -e "$state_file" || -L "$state_file" || -e "${state_file}.ssh-binding" || -L "${state_file}.ssh-binding" ]] || return 0
+  [[ -f "$coordinator" ]] || error "Dual DGX Station preparation coordinator is missing: ${coordinator}"
+  node --no-warnings --experimental-strip-types "$coordinator" --state "$state_file" --clear-state >/dev/null \
+    || error "Could not safely clear completed dual DGX Station resume state: ${state_file}"
+}
+
+prepare_installer_host() {
+  maybe_offer_express_install
+  # Reject conflicting explicit Station selections and pending-pair bypasses
+  # before the local host-preparation helper can mutate packages or Docker.
+  validate_station_pair_selection
+  if [[ "${_SELECTED_EXPRESS_PLATFORM:-}" == "DGX Station" ]]; then
+    # Station qualification is deliberately scoped to the local factory
+    # runtime. Normalize the Docker target before any preparation probe so an
+    # ambient remote context can neither satisfy nor be changed by this path.
+    unset DOCKER_HOST
+    export DOCKER_CONTEXT=default
+  fi
+  # Intentional ordering: Station preparation owns the reboot boundary before
+  # generic Docker bootstrap; ensure_station_express_host is a no-op elsewhere.
+  ensure_station_express_host
+  prepare_portable_experimental_runtime_override
+  ensure_docker
+  ensure_openshell_build_deps
 }
 
 # Prompt the user to opt into express install on supported platforms. Sets the
@@ -2607,27 +4902,76 @@ describe_express_install() {
   local platform="$1"
   local inference_summary=""
   local inference_disclosure=""
+  local show_hf_authentication="0"
   local sandbox_summary=""
   local tier="${NEMOCLAW_POLICY_TIER:-balanced}"
   local policy_summary=""
 
   case "$platform" in
     "DGX Spark")
-      if [ -n "${NEMOCLAW_VLLM_MODEL:-}" ]; then
+      if [ "${_SPARK_EXPRESS_INFERENCE_SELECTION:-managed-vllm}" = "fixed-vllm" ]; then
+        inference_summary="Qwen3.6 35B-A3B NVFP4 with the fixed catalog-backed vLLM profile"
+        inference_disclosure="The serving catalog owns the model, image, port, and vLLM arguments. The installer rejects provider and model overrides, and the dedicated local-model onboarder rejects vLLM model, port, and serve-argument overrides before starting its managed container."
+      elif [ -n "${NEMOCLAW_VLLM_MODEL:-}" ]; then
         inference_summary="managed local vLLM with model ${NEMOCLAW_VLLM_MODEL}"
+        inference_disclosure="The explicit model remains authoritative, so this run keeps the existing single-host DGX Spark profile. Managed vLLM pulls the configured image/model and runs only its dedicated container."
+      elif [ -n "${NEMOCLAW_MODEL:-}" ]; then
+        inference_summary="managed local vLLM with explicit model intent ${NEMOCLAW_MODEL}"
+        inference_disclosure="The explicit model remains authoritative, so this run keeps the customizable managed-vLLM path and does not offer the fixed profile."
       else
-        inference_summary="managed local vLLM using the DGX Spark profile default model"
+        inference_summary="managed vLLM with automatic DGX Spark serving-profile selection"
+        inference_disclosure="With no explicit inference intent or related runtime, one exactly qualified pretrusted managed cluster topology selects a matching pinned distributed profile. An ordinary no-match keeps the existing single-host DGX Spark profile; any related or ambiguous setup remains untouched and stops installation. Managed vLLM pulls the selected image/model and runs only its dedicated containers. The selected distributed profile is experimental pending physical end-to-end validation."
       fi
-      inference_disclosure="Managed vLLM pulls the configured vLLM image/model and runs a local vLLM inference container."
-      sandbox_summary="${NEMOCLAW_SANDBOX_NAME:-my-spark-assistant}"
+      sandbox_summary="${NEMOCLAW_SANDBOX_NAME:-my-assistant}"
       ;;
     "DGX Station")
-      inference_summary="managed local vLLM"
-      inference_disclosure="Managed vLLM pulls the configured vLLM image/model and runs a local vLLM inference container."
+      if [ "${STATION_DEEPSEEK:-}" = "1" ]; then
+        show_hf_authentication="1"
+        inference_summary="managed local vLLM with DeepSeek V4 Flash"
+        inference_disclosure="Managed vLLM pulls the configured Station image/model and runs a local inference container."
+      elif [ -n "$(printf "%s" "${NEMOCLAW_VLLM_MODEL:-}" | tr -d '[:space:]')" ]; then
+        inference_summary="managed local vLLM with model ${NEMOCLAW_VLLM_MODEL}"
+        inference_disclosure="Managed vLLM pulls the configured vLLM image/model and runs a local inference container."
+        case "$(printf "%s" "${NEMOCLAW_VLLM_MODEL}" | tr '[:upper:]' '[:lower:]')" in
+          deepseek-v4-flash | deepseek-ai/deepseek-v4-flash | nemotron-3-ultra-550b-a55b | nvidia/nvidia-nemotron-3-ultra-550b-a55b-nvfp4)
+            show_hf_authentication="1"
+            ;;
+        esac
+      else
+        show_hf_authentication="1"
+        inference_summary="managed local vLLM with NVIDIA Nemotron 3 Ultra 550B and automatic Station topology selection"
+        inference_disclosure="A pretrusted reciprocal dual-Station pair selects distributed serving; otherwise NemoClaw uses the existing single-Station Ultra recipe. The pinned image and approximately 352 GB model are pulled only after topology qualification."
+      fi
+      case "$(classify_dgx_station_release)" in
+        supported-dgx-os)
+          printf "  Stock DGX OS setup reuses the factory driver and container stack after local GPU device-visibility, CDI, Docker, and Buildx validation. It does not install or replace host packages or rewrite the Docker runtime.\n"
+          ;;
+        supported-colossus-baseos)
+          printf "  Qualified BaseOS setup preserves the factory kernel, driver, DKMS, Docker, and NVIDIA Container Toolkit packages. It verifies their exact inventory, prepares Docker access and packaged CDI, and registers the NVIDIA Docker runtime only when the launch probe proves it is missing, with rollback on failure. It does not install host packages or require a reboot.\n"
+          ;;
+        supported-ai-developer-tools)
+          printf "  Factory Ubuntu with NVIDIA AI Developer Tools reuses its driver and container stack after local GPU, CDI, Docker, and Buildx validation. It may add this account to the Docker group, but does not install or replace host packages, rewrite the Docker runtime, or require a reboot.\n"
+          ;;
+        *)
+          if [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
+            printf "  Explicit --force-station-install intent bypasses only DGX release-metadata qualification. Active agent and unrelated Docker workloads still block Station preparation; an existing vLLM workload receives explicit handling choices. Setup preserves the existing driver and container stack and proceeds only after Station GB300, GPU, ECC, Docker, Buildx, Toolkit, CDI, and container GPU-visibility checks pass.\n"
+          else
+            printf "  Station host setup reuses exact prerequisite versions, applies the reviewed factory DKMS transition when present, installs missing pinned driver, Docker, and NVIDIA Container Toolkit packages, and may require one reboot.\n"
+          fi
+          ;;
+      esac
+      printf "  Host setup may add this trusted local account to the docker group, which grants root-equivalent control. This flow is only for trusted single-user development hosts; shared or managed hosts require an organization-approved Docker access path.\n"
+      printf "  DGX Station is Tested with limitations across qualified profiles on one physical DGX Station GB300; dual-Station configurations are not yet validated, and dedicated CI coverage is not available.\n"
       sandbox_summary="${NEMOCLAW_SANDBOX_NAME:-my-assistant}"
       ;;
     "Windows WSL")
-      inference_summary="Windows-host Ollama through host.docker.internal"
+      if express_wsl_can_use_windows_host_ollama; then
+        inference_summary="Windows-host Ollama through host.docker.internal"
+      elif express_wsl_docker_context_needs_node; then
+        inference_summary="local Ollama, selected once the installed Node.js runtime reads the Docker configuration"
+      else
+        inference_summary="WSL-local Ollama, with a sandbox auth proxy when containers cannot reach host loopback"
+      fi
       sandbox_summary="${NEMOCLAW_SANDBOX_NAME:-my-assistant}"
       ;;
     *)
@@ -2648,6 +4992,10 @@ describe_express_install() {
       policy_summary="base sandbox policy plus broad third-party presets"
       policy_summary="${policy_summary}, and local-inference access when needed"
       ;;
+    personal)
+      policy_summary="base sandbox policy plus TCP egress from every sandbox binary to public and private address ranges on destination ports 80 and 443"
+      policy_summary="${policy_summary} (excluding unspecified, loopback, and link-local ranges), every maintained applicable preset, and local-inference access when needed"
+      ;;
     *)
       policy_summary="base sandbox policy plus tier presets supported by the active agent"
       policy_summary="${policy_summary}, and local-inference access when needed"
@@ -2658,14 +5006,55 @@ describe_express_install() {
   if [ -n "$inference_disclosure" ]; then
     printf "  %s\n" "$inference_disclosure"
   fi
+  if [ "$show_hf_authentication" = "1" ]; then
+    describe_hf_download_authentication
+  fi
   printf "  Sandbox name: %s.\n" "$sandbox_summary"
   printf "  It runs onboarding non-interactively, but still prompts for sudo when host setup needs it.\n"
   printf "  Sandbox policy: suggested mode, tier '%s'. This uses the %s.\n" "$tier" "$policy_summary"
 }
 
+describe_hf_download_authentication() {
+  local hf_token="${HF_TOKEN:-}"
+  local hugging_face_hub_token="${HUGGING_FACE_HUB_TOKEN:-}"
+  if [[ -n "${hf_token//[[:space:]]/}" || -n "${hugging_face_hub_token//[[:space:]]/}" ]]; then
+    printf "  Hugging Face model download: authenticated.\n"
+    printf "  The token value is not displayed and is passed only to the temporary model downloader.\n"
+    return 0
+  fi
+
+  printf "  Hugging Face authentication is optional for this public model but recommended for this large download.\n"
+  printf "  Anonymous downloads may be rate-limited with HTTP 429.\n"
+  printf "  Create a read token at https://huggingface.co/settings/tokens.\n"
+  printf "  Before restarting the installer, run: export HF_TOKEN=<read-token>\n"
+  printf "  The token is passed only to the temporary model downloader.\n"
+}
+
 maybe_offer_express_install() {
   local platform
   platform="$(detect_express_platform)"
+  validate_express_platform_boundary "$platform"
+  validate_force_station_install_override "$platform"
+  validate_station_deepseek_override "$platform"
+
+  # Pair state is written before remote mutation. It therefore outranks every
+  # prompt/skip path and must recover the companion exact-revision mode/model
+  # state before any generic or single-Station setup can continue.
+  if station_dual_pair_resume_pending; then
+    [ "$platform" = "DGX Station" ] \
+      || error "A dual-DGX Station pair resume is pending, but this host no longer satisfies the DGX Station preparation boundary. Refusing to continue without exact pair revalidation."
+    [ "${NEMOCLAW_NO_EXPRESS:-}" != "1" ] \
+      || error "A dual-DGX Station pair resume is pending; finish exact pair revalidation before disabling Station setup."
+    case "${NEMOCLAW_PROVIDER:-}" in
+      "") ;;
+      install-vllm) _STATION_INSTALL_MODE="provider" ;;
+      *) error "A dual-DGX Station pair resume is pending; finish exact pair revalidation before changing providers." ;;
+    esac
+    load_station_express_resume \
+      || error "Dual-DGX Station pair state exists without its required installer resume state. Refusing to prompt, fall back, or continue; restore the owner-only state from the accepted revision."
+    resume_loaded_station_install "$platform"
+    return 0
+  fi
   # Not on a platform we have an express recipe for — say nothing.
   if [ -z "$platform" ]; then
     return 0
@@ -2673,32 +5062,76 @@ maybe_offer_express_install() {
   # On a supported platform but a skip condition applies — explain why so
   # the user understands they could have gotten express otherwise.
   if [ "${NEMOCLAW_NO_EXPRESS:-}" = "1" ]; then
+    if [ "$platform" = "DGX Station" ]; then
+      station_dual_pair_resume_pending \
+        && error "A dual-DGX Station pair resume is pending; finish exact pair revalidation before disabling Station setup."
+      clear_station_express_resume
+    fi
     info "Detected ${platform}. Skipping express prompt (NEMOCLAW_NO_EXPRESS=1)."
+    return 0
+  fi
+  if [ -n "${NEMOCLAW_PROVIDER:-}" ]; then
+    if [ "$platform" = "DGX Station" ] && [ "$NEMOCLAW_PROVIDER" = "install-vllm" ]; then
+      # An explicit managed-vLLM provider selects the same Station host/pair
+      # preparation boundary without forcing the rest of the express policy.
+      # Honor an existing exact-revision reboot resume before configuration.
+      _STATION_INSTALL_MODE="provider"
+      load_station_express_resume || true
+      _SELECTED_EXPRESS_PLATFORM="$platform"
+      configure_station_express_model
+      info "Detected ${platform}. Using Station preparation for the explicitly selected managed-vLLM provider."
+      return 0
+    fi
+    if [ "$platform" = "DGX Station" ]; then
+      station_dual_pair_resume_pending \
+        && error "A dual-DGX Station pair resume is pending; finish exact pair revalidation before changing providers."
+      clear_station_express_resume
+    fi
+    info "Detected ${platform}. Skipping express prompt (NEMOCLAW_PROVIDER=${NEMOCLAW_PROVIDER} already set)."
+    return 0
+  fi
+  if [ "$platform" = "DGX Station" ] && load_station_express_resume; then
+    resume_loaded_station_install "$platform"
     return 0
   fi
   if [ "${NON_INTERACTIVE:-}" = "1" ]; then
     info "Detected ${platform}. Skipping express prompt (--non-interactive set)."
     return 0
   fi
-  if [ -n "${NEMOCLAW_PROVIDER:-}" ]; then
-    info "Detected ${platform}. Skipping express prompt (NEMOCLAW_PROVIDER=${NEMOCLAW_PROVIDER} already set)."
-    return 0
-  fi
   local reply=""
   if [ -t 0 ]; then
     info "Detected ${platform}."
+    if [ "$platform" = "DGX Spark" ] && ! select_spark_express_inference 0; then
+      info "Skipping express install (unable to read from TTY)."
+      return 0
+    fi
     describe_express_install "$platform"
     printf "  Run express install with these settings? [Y/n]: "
     if ! IFS= read -r reply; then
+      if [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
+        fail_force_station_terminal_required
+      elif [ "${STATION_DEEPSEEK:-}" = "1" ]; then
+        fail_station_deepseek_terminal_required
+      fi
       info "Skipping express install (unable to read from TTY)."
       return 0
     fi
   elif { exec 3</dev/tty; } 2>/dev/null; then
     info "Detected ${platform}."
+    if [ "$platform" = "DGX Spark" ] && ! select_spark_express_inference 3; then
+      exec 3<&-
+      info "Skipping express install (unable to read from TTY)."
+      return 0
+    fi
     describe_express_install "$platform"
     printf "  Run express install with these settings? [Y/n]: "
     if ! IFS= read -r reply <&3; then
       exec 3<&-
+      if [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
+        fail_force_station_terminal_required
+      elif [ "${STATION_DEEPSEEK:-}" = "1" ]; then
+        fail_station_deepseek_terminal_required
+      fi
       info "Skipping express install (unable to read from TTY)."
       return 0
     fi
@@ -2711,26 +5144,7 @@ maybe_offer_express_install() {
   case "$reply" in
     "" | y | yes)
       info "Using express install for ${platform}."
-      NON_INTERACTIVE=1
-      export NEMOCLAW_NON_INTERACTIVE=1
-      export NEMOCLAW_NON_INTERACTIVE_SUDO_MODE=prompt
-      export NEMOCLAW_YES=1
-      export NEMOCLAW_POLICY_MODE=suggested
-      case "$platform" in
-        "DGX Spark")
-          export NEMOCLAW_SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-my-spark-assistant}"
-          export NEMOCLAW_PROVIDER=install-vllm
-          if [ -n "${NEMOCLAW_VLLM_MODEL:-}" ]; then
-            export NEMOCLAW_VLLM_MODEL
-          fi
-          ;;
-        "DGX Station")
-          export NEMOCLAW_PROVIDER=install-vllm
-          ;;
-        "Windows WSL")
-          export NEMOCLAW_PROVIDER=install-windows-ollama
-          ;;
-      esac
+      activate_express_install "$platform"
       ;;
     *)
       info "Skipping express install. Continuing with interactive flow."
@@ -2748,13 +5162,44 @@ main() {
 
   # Parse flags
   NON_INTERACTIVE=""
+  # #7009: record what put the run in non-interactive mode so conflict errors
+  # (e.g. validate_station_deepseek_override) can name the trigger. main()
+  # exports NON_INTERACTIVE into NEMOCLAW_NON_INTERACTIVE below, so the origin
+  # cannot be recovered from the env at error time — track it here instead.
+  NON_INTERACTIVE_SOURCE=""
   ACCEPT_THIRD_PARTY_SOFTWARE=""
   FRESH=""
+  STATION_DEEPSEEK=""
+  FORCE_STATION_INSTALL=""
+  LOCAL_MODEL_RUNTIME=""
+  EXPERIMENTAL_PROFILE="${NEMOCLAW_EXPERIMENTAL_PROFILE:-}"
+  local expect_experimental_profile=""
   for arg in "$@"; do
+    if [[ "$expect_experimental_profile" == "1" ]]; then
+      EXPERIMENTAL_PROFILE="$arg"
+      expect_experimental_profile=""
+      continue
+    fi
     case "$arg" in
-      --non-interactive) NON_INTERACTIVE=1 ;;
+      --non-interactive)
+        NON_INTERACTIVE=1
+        NON_INTERACTIVE_SOURCE="the --non-interactive flag"
+        ;;
       --yes-i-accept-third-party-software) ACCEPT_THIRD_PARTY_SOFTWARE=1 ;;
       --fresh) FRESH=1 ;;
+      --station-deepseek) STATION_DEEPSEEK=1 ;;
+      --force-station-install) FORCE_STATION_INSTALL=1 ;;
+      --local-model-runtime=*)
+        LOCAL_MODEL_RUNTIME="${arg#--local-model-runtime=}"
+        case "$LOCAL_MODEL_RUNTIME" in
+          vllm) ;;
+          *) error "--local-model-runtime must be vllm; select install-llama-cpp with NEMOCLAW_PROVIDER" ;;
+        esac
+        NON_INTERACTIVE=1
+        NON_INTERACTIVE_SOURCE="the --local-model-runtime flag"
+        ;;
+      --experimental-profile) expect_experimental_profile=1 ;;
+      --experimental-profile=*) EXPERIMENTAL_PROFILE="${arg#*=}" ;;
       --version | -v)
         local version_suffix
         version_suffix="$(installer_version_for_display)"
@@ -2771,10 +5216,42 @@ main() {
         ;;
     esac
   done
+  [[ -z "$expect_experimental_profile" ]] \
+    || error "Missing value for --experimental-profile (expected: portable)."
+  case "$EXPERIMENTAL_PROFILE" in
+    "") unset NEMOCLAW_EXPERIMENTAL_PROFILE ;;
+    portable) export NEMOCLAW_EXPERIMENTAL_PROFILE="$EXPERIMENTAL_PROFILE" ;;
+    *) error "Unknown experimental profile: $EXPERIMENTAL_PROFILE (expected: portable)." ;;
+  esac
   # Also honor env var
   NON_INTERACTIVE="${NON_INTERACTIVE:-${NEMOCLAW_NON_INTERACTIVE:-}}"
+  if [ "${NON_INTERACTIVE:-}" = "1" ] && [ -z "${NON_INTERACTIVE_SOURCE:-}" ]; then
+    NON_INTERACTIVE_SOURCE="NEMOCLAW_NON_INTERACTIVE=1"
+  fi
   ACCEPT_THIRD_PARTY_SOFTWARE="${ACCEPT_THIRD_PARTY_SOFTWARE:-${NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE:-}}"
   FRESH="${FRESH:-${NEMOCLAW_FRESH:-}}"
+  if [ -n "${LOCAL_MODEL_RUNTIME:-}" ]; then
+    export NEMOCLAW_ENABLE_LOCAL_MODEL_PROFILE=1
+    export NEMOCLAW_LOCAL_MODEL_RUNTIME="$LOCAL_MODEL_RUNTIME"
+    export NEMOCLAW_NO_EXPRESS=1
+  elif [ "${NEMOCLAW_ENABLE_LOCAL_MODEL_PROFILE:-}" = "1" ]; then
+    case "${NEMOCLAW_LOCAL_MODEL_RUNTIME:-}" in
+      vllm) ;;
+      *) error "NEMOCLAW_LOCAL_MODEL_RUNTIME must be vllm; select install-llama-cpp with NEMOCLAW_PROVIDER" ;;
+    esac
+    NON_INTERACTIVE=1
+    NON_INTERACTIVE_SOURCE="NEMOCLAW_ENABLE_LOCAL_MODEL_PROFILE=1"
+    export NEMOCLAW_NO_EXPRESS=1
+  fi
+  if [ "${NEMOCLAW_ENABLE_LOCAL_MODEL_PROFILE:-}" = "1" ] \
+    && { [ -n "${NEMOCLAW_PROVIDER:-}" ] || [ -n "${NEMOCLAW_MODEL:-}" ]; }; then
+    error "The local model profile does not accept NEMOCLAW_PROVIDER or NEMOCLAW_MODEL overrides."
+  fi
+  if [ "${NEMOCLAW_ENABLE_LOCAL_MODEL_PROFILE:-}" = "1" ] \
+    && [ "${NEMOCLAW_LOCAL_MODEL_RUNTIME:-}" = "vllm" ] \
+    && [ -n "${NEMOCLAW_VLLM_PORT:-}" ]; then
+    error "The vLLM local model profile uses fixed port 8000 and does not accept NEMOCLAW_VLLM_PORT."
+  fi
 
   # If the user explicitly accepted the third-party-software notice, treat
   # that as non-interactive intent for the rest of the run too — show_usage_notice
@@ -2782,12 +5259,35 @@ main() {
   # (run_onboard has the same gate). Without this, ACCEPT_THIRD_PARTY_SOFTWARE=1
   # alone clears the preflight below but the install can still partial-fail at
   # run_onboard with the same TTY error, leaving phases 1/2 on disk anyway.
-  if [ "${ACCEPT_THIRD_PARTY_SOFTWARE:-}" = "1" ] && [ "${NON_INTERACTIVE:-}" != "1" ]; then
+  #
+  # #7008: Station-only prompt flags are the exception — they explicitly select
+  # the interactive DGX Station express prompt, so accepting the notice must NOT
+  # imply non-interactive there. The two signals are orthogonal: one accepts a
+  # license, the other opts into an interactive express flow. Inferring
+  # non-interactive from the notice would make the express flow reject its own
+  # required flag validation.
+  if [ "${ACCEPT_THIRD_PARTY_SOFTWARE:-}" = "1" ] && [ "${NON_INTERACTIVE:-}" != "1" ] \
+    && [ "${STATION_DEEPSEEK:-}" != "1" ] && [ "${FORCE_STATION_INSTALL:-}" != "1" ]; then
     NON_INTERACTIVE=1
   fi
 
   export NEMOCLAW_NON_INTERACTIVE="${NON_INTERACTIVE}"
   export NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE="${ACCEPT_THIRD_PARTY_SOFTWARE}"
+
+  load_station_vllm_conflict_helpers
+  if consume_station_local_vllm_resume; then
+    info "Resuming the selected manual Local vLLM setup."
+  fi
+
+  # Validate the gateway port before the banner, notice acceptance, downloads,
+  # or any other installer side effect.
+  resolve_nemoclaw_gateway_port >/dev/null
+
+  # Explicit express-only flags must fail before license state, Docker, build
+  # dependencies, or any other host mutation. maybe_offer_express_install
+  # repeats the same authoritative validation at the prompt boundary because
+  # it is also exercised directly by sourced-installer callers and tests.
+  preflight_explicit_express_flags
 
   print_banner
 
@@ -2797,15 +5297,13 @@ main() {
   # still collect acceptance before Node.js or the CLI are installed.
   preflight_usage_notice_prompt
 
-  ensure_docker
-  ensure_openshell_build_deps
-
   # Offer express install on supported platforms (DGX Spark / Station / WSL).
   # Runs AFTER the third-party notice so the user has explicitly accepted the
   # license before opting into the unattended path. Express only sets the
   # provider/model/policy + non-interactive vars; license acceptance is
-  # already recorded by preflight above.
-  maybe_offer_express_install
+  # already recorded by preflight above. Station selection runs its pinned
+  # host prerequisite preparation before the generic Docker bootstrap.
+  prepare_installer_host
 
   _INSTALL_START=$SECONDS
   bash "${SCRIPT_DIR}/setup-jetson.sh"
@@ -2813,6 +5311,8 @@ main() {
   step 1 "Node.js"
   install_nodejs
   ensure_supported_runtime
+  resolve_pending_express_wsl_provider
+  ensure_station_express_pair
 
   step 2 "${_CLI_DISPLAY} CLI"
   # Ollama and vLLM install/upgrade and model pulls are owned by
@@ -2822,6 +5322,7 @@ main() {
   preinstall_backup_and_retire_legacy_gateway
   install_nemoclaw
   verify_nemoclaw
+  require_reportable_openshell_version
 
   # Gate the onboarding-adjacent steps on the absolute CLI path so a stale
   # shell PATH cache no longer suppresses auto-onboarding (#3276). Falls
@@ -2835,16 +5336,11 @@ main() {
 
   step 3 "Onboarding"
   if [ -n "$_cli_runner" ]; then
-    if [[ -f "${HOME}/.nemoclaw/sandboxes.json" ]] && node -e '
-      const fs = require("fs");
-      try {
-        const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-        const count = Object.keys(data.sandboxes || {}).length;
-        process.exit(count > 0 ? 0 : 1);
-      } catch {
-        process.exit(1);
-      }
-    ' "${HOME}/.nemoclaw/sandboxes.json"; then
+    local _registered_sandbox_count=""
+    if ! _registered_sandbox_count="$(registered_sandbox_count)"; then
+      error "Could not inspect the existing sandbox registry. Onboarding was not started."
+    fi
+    if [[ "$_registered_sandbox_count" -gt 0 ]]; then
       warn "Existing sandbox sessions detected. Onboarding may disrupt running agents."
       if [[ "${NEMOCLAW_SINGLE_SESSION:-}" == "1" ]]; then
         error "Aborting — NEMOCLAW_SINGLE_SESSION is set. Destroy existing sessions with '${_CLI_BIN} <name> destroy' before reinstalling."
@@ -2858,7 +5354,18 @@ main() {
         return 1
       fi
       if [[ "${_PREEXISTING_SANDBOX_RECOVERY_RAN:-false}" == true ]]; then
-        info "Existing sandboxes recovered; skipping generic onboarding."
+        if [[ "${_PREEXISTING_SANDBOX_ORPHANED:-false}" == true ]]; then
+          # #6520: do not claim recovery when recorded sandboxes are stranded.
+          warn "Some recorded sandboxes could not be recovered; skipping generic onboarding."
+        elif [[ "${_SELECTED_EXPRESS_PLATFORM:-}" == "DGX Station" ]] \
+          || [[ "${_STATION_EXPRESS_RESUME_LOADED:-}" == "1" ]] \
+          || station_express_receipt_retirement_pending; then
+          info "Existing sandboxes recovered; reconciling DGX Station Express onboarding state."
+          run_onboard || error "Onboarding did not complete successfully."
+          ONBOARD_RAN=true
+        else
+          info "Existing sandboxes recovered; skipping generic onboarding."
+        fi
       else
         run_onboard || error "Onboarding did not complete successfully."
         ONBOARD_RAN=true
@@ -2874,6 +5381,14 @@ main() {
   fi
 
   finalize_install
+  clear_station_resume_after_completed_onboarding
+}
+
+clear_station_resume_after_completed_onboarding() {
+  [[ "${_SELECTED_EXPRESS_PLATFORM:-}" == "DGX Station" ]] || return 0
+  [[ "${ONBOARD_RAN:-false}" == true ]] || return 0
+  clear_station_dual_pair_resume
+  clear_station_express_resume
 }
 
 # Print the completion summary, then propagate a fatal/non-zero result when the
@@ -2887,6 +5402,9 @@ finalize_install() {
   print_done
   if [[ "${_UPGRADE_SANDBOXES_FAILED:-false}" == true ]]; then
     error "Installation incomplete: one or more existing sandboxes failed to upgrade. See the recovery guidance above."
+  fi
+  if [[ "${_STATION_LOCAL_VLLM_SELECTED:-}" == "1" ]]; then
+    clear_station_local_vllm_resume
   fi
 }
 

@@ -6,6 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import { containsInteger42Answer } from "../../helpers/e2e-answer-assertions.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
+import {
+  cleanupWhenCommandAvailable,
+  cleanupWhenOpenShellAvailable,
+} from "../fixtures/cleanup-resources.ts";
 import { resultText } from "../fixtures/clients/command.ts";
 import { type HostCliClient } from "../fixtures/clients/host.ts";
 import { type SandboxClient, validateSandboxName } from "../fixtures/clients/sandbox.ts";
@@ -13,8 +17,9 @@ import { expect, test } from "../fixtures/e2e-test.ts";
 import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 
-const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-gpu-double-onboard";
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-gpu-double";
 const PROXY_PORT = process.env.NEMOCLAW_OLLAMA_PROXY_PORT ?? "11435";
+const GPU_E2E_MODEL = process.env.NEMOCLAW_MODEL ?? "qwen3.5:9b";
 const TOKEN_FILE = path.join(os.homedir(), ".nemoclaw", "ollama-proxy-token");
 const LIVE_TIMEOUT_MS = 90 * 60_000;
 
@@ -27,6 +32,7 @@ function env(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     PATH: `${os.homedir()}/.local/bin:${os.homedir()}/.npm-global/bin:${process.env.PATH ?? ""}`,
     NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1",
     NEMOCLAW_NON_INTERACTIVE: "1",
+    NEMOCLAW_MODEL: GPU_E2E_MODEL,
     NEMOCLAW_OLLAMA_PROXY_PORT: PROXY_PORT,
     NEMOCLAW_PROVIDER: "ollama",
     NEMOCLAW_RECREATE_SANDBOX: "1",
@@ -73,7 +79,17 @@ async function cleanup(host: HostCliClient, sandbox: SandboxClient): Promise<voi
       "bash",
       [
         "-lc",
-        "pkill -f 'ollama serve' 2>/dev/null || true; pkill -f 'ollama-auth-proxy' 2>/dev/null || true",
+        String.raw`set +e
+status=0
+for pattern in '[o]llama serve' '[o]llama-auth-proxy'; do
+  pkill -f "$pattern"
+  rc=$?
+  case "$rc" in
+    0|1) ;;
+    *) status="$rc" ;;
+  esac
+done
+exit "$status"`,
       ],
       {
         artifactName: "cleanup-ollama-processes",
@@ -142,7 +158,18 @@ async function expectSandboxInference42(
 
 test("gpu double onboard keeps Ollama auth proxy token consistent after re-onboard", {
   timeout: LIVE_TIMEOUT_MS,
-}, async ({ artifacts, cleanup: cleanupRegistry, host, sandbox, skip }) => {
+  meta: {
+    e2ePhases: [
+      "validate GPU and Docker prerequisites",
+      "install Ollama runtime",
+      "perform first Ollama onboard",
+      "validate first proxy token and inference",
+      "re-onboard GPU sandbox",
+      "validate persisted proxy auth and inference",
+      "remove GPU double-onboard sandbox",
+    ],
+  },
+}, async ({ artifacts, cleanup: cleanupRegistry, host, progress, sandbox, skip }) => {
   await artifacts.target.declare({
     id: "gpu-double-onboard",
     sandboxName: SANDBOX_NAME,
@@ -176,9 +203,93 @@ test("gpu double onboard keeps Ollama auth proxy token consistent after re-onboa
     skip(`NVIDIA GPU is required: ${resultText(smi)}`);
   }
 
-  cleanupRegistry.add("remove gpu double-onboard state", () => cleanup(host, sandbox));
+  cleanupRegistry.trackDisposable("stop gpu double-onboard Ollama processes", async () => {
+    const stop = await host.command(
+      "bash",
+      [
+        "-lc",
+        String.raw`set +e
+status=0
+for pattern in '[o]llama serve' '[o]llama-auth-proxy'; do
+  pkill -f "$pattern"
+  rc=$?
+  case "$rc" in
+    0|1) ;;
+    *) status="$rc" ;;
+  esac
+done
+exit "$status"`,
+      ],
+      {
+        artifactName: "cleanup-ollama-processes",
+        env: env(),
+        timeoutMs: 30_000,
+      },
+    );
+    expect(stop.exitCode, resultText(stop)).toBe(0);
+  });
+  const gatewayCleanupOptions = {
+    artifactName: "cleanup-openshell-gateway-destroy",
+    env: env(),
+    timeoutMs: 60_000,
+  };
+  cleanupRegistry.trackGateway(
+    {
+      cleanupGatewayRegistration: (name: string) =>
+        cleanupWhenOpenShellAvailable(
+          host,
+          {
+            artifactName: "cleanup-probe-openshell-gateway",
+            env: gatewayCleanupOptions.env,
+            timeoutMs: 30_000,
+          },
+          () => host.cleanupGatewayRegistration(name, gatewayCleanupOptions),
+        ),
+    },
+    "nemoclaw",
+    gatewayCleanupOptions,
+  );
+  const openshellSandboxCleanupOptions = {
+    artifactName: "cleanup-openshell-sandbox-delete",
+    env: env(),
+    timeoutMs: 60_000,
+  };
+  cleanupRegistry.trackDisposable(`delete OpenShell sandbox ${SANDBOX_NAME}`, () =>
+    cleanupWhenOpenShellAvailable(
+      host,
+      {
+        artifactName: "cleanup-probe-openshell-sandbox",
+        env: openshellSandboxCleanupOptions.env,
+        timeoutMs: 30_000,
+      },
+      () => sandbox.cleanupSandbox(SANDBOX_NAME, openshellSandboxCleanupOptions),
+    ),
+  );
+  const nemoclawSandboxCleanupOptions = {
+    artifactName: "cleanup-nemoclaw-destroy",
+    env: env(),
+    timeoutMs: 120_000,
+  };
+  cleanupRegistry.trackSandbox(
+    {
+      cleanupSandbox: (name: string) =>
+        cleanupWhenCommandAvailable(
+          host,
+          host.commandPath,
+          {
+            artifactName: "cleanup-probe-nemoclaw-sandbox",
+            env: nemoclawSandboxCleanupOptions.env,
+            timeoutMs: 30_000,
+          },
+          () => host.cleanupSandbox(name, nemoclawSandboxCleanupOptions),
+        ),
+    },
+    SANDBOX_NAME,
+    nemoclawSandboxCleanupOptions,
+  );
   await cleanup(host, sandbox);
 
+  progress.phase("install Ollama runtime");
   const installOllama = await host.command(
     "bash",
     ["-lc", "command -v ollama >/dev/null 2>&1 || curl -fsSL https://ollama.com/install.sh | sh"],
@@ -202,6 +313,7 @@ test("gpu double onboard keeps Ollama auth proxy token consistent after re-onboa
     },
   );
 
+  progress.phase("perform first Ollama onboard");
   const first = await host.command("bash", ["install.sh", "--non-interactive"], {
     artifactName: "phase-2-install-sh-first-onboard",
     cwd: REPO_ROOT,
@@ -210,6 +322,7 @@ test("gpu double onboard keeps Ollama auth proxy token consistent after re-onboa
   });
   expect(first.exitCode, resultText(first)).toBe(0);
 
+  progress.phase("validate first proxy token and inference");
   const list = await nemoclaw(host, ["list"], "phase-3-nemoclaw-list");
   expect(list.exitCode, resultText(list)).toBe(0);
   expect(list.stdout).toContain(SANDBOX_NAME);
@@ -218,7 +331,7 @@ test("gpu double onboard keeps Ollama auth proxy token consistent after re-onboa
   expect(tokenAfterFirst.length).toBeGreaterThan(10);
   expect(fileMode(TOKEN_FILE)).toBe("600");
 
-  const model = process.env.NEMOCLAW_MODEL ?? "llama3.2:1b";
+  const model = GPU_E2E_MODEL;
 
   const firstTokenStatus = await httpStatus(
     host,
@@ -229,6 +342,7 @@ test("gpu double onboard keeps Ollama auth proxy token consistent after re-onboa
   expect(firstTokenStatus.stdout.trim(), resultText(firstTokenStatus)).toBe("200");
   await expectSandboxInference42(sandbox, model, "phase-3-sandbox-inference-first-onboard");
 
+  progress.phase("re-onboard GPU sandbox");
   const reonboard = await nemoclaw(
     host,
     ["onboard", "--non-interactive", "--yes"],
@@ -243,6 +357,7 @@ test("gpu double onboard keeps Ollama auth proxy token consistent after re-onboa
   expect(fileMode(TOKEN_FILE)).toBe("600");
   expect(tokenAfterSecond).toBe(tokenAfterFirst);
 
+  progress.phase("validate persisted proxy auth and inference");
   const liveStatus = await httpStatus(
     host,
     `http://127.0.0.1:${PROXY_PORT}/api/tags`,
@@ -275,6 +390,7 @@ test("gpu double onboard keeps Ollama auth proxy token consistent after re-onboa
 
   await expectSandboxInference42(sandbox, model, "phase-6-sandbox-inference-after-reonboard");
 
+  progress.phase("remove GPU double-onboard sandbox");
   await cleanup(host, sandbox);
   const registryFile = path.join(os.homedir(), ".nemoclaw", "sandboxes.json");
   const registryText = fs.existsSync(registryFile) ? fs.readFileSync(registryFile, "utf8") : "";

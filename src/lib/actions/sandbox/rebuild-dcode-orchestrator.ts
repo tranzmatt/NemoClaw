@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { WebSearchConfig } from "../../inference/web-search";
+import type { DcodeAutoApprovalMode } from "../../onboard/dcode-auto-approval";
 import type { Session } from "../../state/onboard-session";
 import type { ToolDisclosure } from "../../tool-disclosure";
 import {
@@ -11,6 +12,7 @@ import {
   type PreparedDcodeReplacement,
   prepareDcodeReplacementBeforeMutation,
   revalidateDcodeReplacementAtMutationEdge,
+  revalidateManagedDcodeWorkloadAtMutationEdge,
 } from "./rebuild-dcode-preflight";
 import { DCODE_AGENT_NAME } from "./rebuild-dcode-target";
 import type { RebuildAgentBaseImageOptions, RebuildSandboxEntry } from "./rebuild-flow-helpers";
@@ -35,6 +37,7 @@ type CreateDcodeRebuildOrchestratorOptions = {
   sandboxName: string;
   entry: RebuildSandboxEntry;
   rebuildAgent: string | null;
+  managedWorkloadRebuild?: boolean;
   log(message: string): void;
   bail: DcodeRebuildPreflightBail;
   deps: DcodeRebuildOrchestratorDeps;
@@ -50,6 +53,7 @@ export type DcodeRebuildOrchestrator = {
     resumeConfig: RebuildResumeConfig,
     webSearchConfig: WebSearchConfig | null,
     toolDisclosure: ToolDisclosure,
+    dcodeAutoApprovalMode: DcodeAutoApprovalMode,
     skipLiveRoute: boolean,
     gatewayPort: number,
     baseImageOptions?: RebuildAgentBaseImageOptions,
@@ -57,12 +61,14 @@ export type DcodeRebuildOrchestrator = {
   revalidateBeforeDelete(
     resumeConfig: RebuildResumeConfig,
     toolDisclosure: ToolDisclosure,
+    dcodeAutoApprovalMode: DcodeAutoApprovalMode,
     skipLiveRoute: boolean,
     gatewayPort: number,
   ): Promise<boolean>;
   checkAtDeleteEdge(
     resumeConfig: RebuildResumeConfig,
     toolDisclosure: ToolDisclosure,
+    dcodeAutoApprovalMode: DcodeAutoApprovalMode,
     skipLiveRoute: boolean,
     gatewayPort: number,
   ): Promise<{ ok: true } | { ok: false; message: string; code?: number }>;
@@ -93,7 +99,15 @@ export function isDcodeRebuildAgent(agentName: string | null): boolean {
 export function createDcodeRebuildOrchestrator(
   options: CreateDcodeRebuildOrchestratorOptions,
 ): DcodeRebuildOrchestrator {
-  const { sandboxName, entry, rebuildAgent, log, bail, deps } = options;
+  const {
+    sandboxName,
+    entry,
+    rebuildAgent,
+    managedWorkloadRebuild = false,
+    log,
+    bail,
+    deps,
+  } = options;
   const scope = createDcodeRebuildPreflightScope(isDcodeRebuildAgent(rebuildAgent), bail);
 
   const run = async <T>(action: () => Promise<T>): Promise<T> => {
@@ -137,6 +151,7 @@ export function createDcodeRebuildOrchestrator(
       resumeConfig,
       webSearchConfig,
       toolDisclosure,
+      dcodeAutoApprovalMode,
       skipLiveRoute,
       gatewayPort,
       baseImageOptions,
@@ -145,12 +160,27 @@ export function createDcodeRebuildOrchestrator(
         if (!scope.enabled) {
           return deps.ensureAgentBaseImage(rebuildAgent, scope.bail, baseImageOptions);
         }
+        if (managedWorkloadRebuild) {
+          return revalidateManagedDcodeWorkloadAtMutationEdge({
+            sandboxName,
+            entry,
+            resumeConfig,
+            toolDisclosure,
+            dcodeAutoApprovalMode,
+            skipLiveRoute,
+            gatewayPort,
+            log,
+            bail: scope.bail,
+            checkGatewaySchema: () => deps.checkGatewaySchema(sandboxName, scope.bail),
+          });
+        }
         const replacement = await prepareDcodeReplacementBeforeMutation({
           sandboxName,
           entry,
           resumeConfig,
           webSearchConfig,
           toolDisclosure,
+          dcodeAutoApprovalMode,
           skipLiveRoute,
           gatewayPort,
           log,
@@ -164,9 +194,29 @@ export function createDcodeRebuildOrchestrator(
         scope.adopt(replacement);
         return true;
       }),
-    revalidateBeforeDelete: (resumeConfig, toolDisclosure, skipLiveRoute, gatewayPort) =>
+    revalidateBeforeDelete: (
+      resumeConfig,
+      toolDisclosure,
+      dcodeAutoApprovalMode,
+      skipLiveRoute,
+      gatewayPort,
+    ) =>
       run(async () => {
         if (!scope.enabled) return true;
+        if (managedWorkloadRebuild) {
+          return revalidateManagedDcodeWorkloadAtMutationEdge({
+            sandboxName,
+            entry,
+            resumeConfig,
+            toolDisclosure,
+            dcodeAutoApprovalMode,
+            skipLiveRoute,
+            gatewayPort,
+            log,
+            bail: scope.bail,
+            checkGatewaySchema: () => deps.checkGatewaySchema(sandboxName, scope.bail),
+          });
+        }
         const replacement = scope.preparedReplacement;
         if (!replacement) return scope.bail("DCode replacement preflight was not retained.");
         return revalidateDcodeReplacementAtMutationEdge({
@@ -174,6 +224,7 @@ export function createDcodeRebuildOrchestrator(
           entry,
           resumeConfig,
           toolDisclosure,
+          dcodeAutoApprovalMode,
           skipLiveRoute,
           gatewayPort,
           log,
@@ -182,33 +233,55 @@ export function createDcodeRebuildOrchestrator(
           replacement,
         });
       }),
-    checkAtDeleteEdge: async (resumeConfig, toolDisclosure, skipLiveRoute, gatewayPort) => {
+    checkAtDeleteEdge: async (
+      resumeConfig,
+      toolDisclosure,
+      dcodeAutoApprovalMode,
+      skipLiveRoute,
+      gatewayPort,
+    ) => {
       if (!scope.enabled) return { ok: true };
       const replacement = scope.preparedReplacement;
-      if (!replacement) {
+      if (!managedWorkloadRebuild && !replacement) {
         return { ok: false, message: "DCode replacement preflight was not retained." };
       }
       const capturedBail = (message: string, code?: number): never => {
         throw new CapturedDcodeRebuildBail(message, code);
       };
       try {
-        const valid = await revalidateDcodeReplacementAtMutationEdge({
-          sandboxName,
-          entry,
-          resumeConfig,
-          toolDisclosure,
-          skipLiveRoute,
-          gatewayPort,
-          log,
-          bail: capturedBail,
-          checkGatewaySchema: () => deps.checkGatewaySchema(sandboxName, capturedBail),
-          replacement,
-        });
+        const valid = await (managedWorkloadRebuild
+          ? revalidateManagedDcodeWorkloadAtMutationEdge({
+              sandboxName,
+              entry,
+              resumeConfig,
+              toolDisclosure,
+              dcodeAutoApprovalMode,
+              skipLiveRoute,
+              gatewayPort,
+              log,
+              bail: capturedBail,
+              checkGatewaySchema: () => deps.checkGatewaySchema(sandboxName, capturedBail),
+            })
+          : revalidateDcodeReplacementAtMutationEdge({
+              sandboxName,
+              entry,
+              resumeConfig,
+              toolDisclosure,
+              dcodeAutoApprovalMode,
+              skipLiveRoute,
+              gatewayPort,
+              log,
+              bail: capturedBail,
+              checkGatewaySchema: () => deps.checkGatewaySchema(sandboxName, capturedBail),
+              replacement: replacement!,
+            }));
         if (!valid) {
           scope.cleanup();
           return {
             ok: false,
-            message: "DCode replacement validation failed before sandbox deletion.",
+            message: managedWorkloadRebuild
+              ? "Managed DCode workload validation failed before sandbox deletion."
+              : "DCode replacement validation failed before sandbox deletion.",
           };
         }
         return { ok: true };

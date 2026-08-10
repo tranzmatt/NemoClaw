@@ -55,10 +55,12 @@ describe("dynamic gateway runtime helpers", () => {
       undefined,
       "http://127.0.0.1:8080/",
       undefined,
+      undefined,
     );
     expect(probeDockerDriverGatewayHttpReady).toHaveBeenLastCalledWith(
       undefined,
       "http://127.0.0.1:8080/openshell.v1.OpenShell/Health",
+      undefined,
     );
     expect(probeGatewayTcpReady).toHaveBeenLastCalledWith(8080, 250);
     expect(getGatewayClusterImageDrift).toHaveBeenLastCalledWith({ gatewayName: "nemoclaw" });
@@ -72,10 +74,19 @@ describe("dynamic gateway runtime helpers", () => {
       undefined,
       "http://127.0.0.1:8081/",
       undefined,
+      undefined,
     );
     expect(getGatewayClusterImageDrift).toHaveBeenLastCalledWith({
       gatewayName: "nemoclaw-8081",
     });
+
+    const env = { OPENSHELL_LOCAL_TLS_DIR: "/tmp/nemoclaw-test-tls" };
+    await helpers.isDockerDriverGatewayHttpReady(25, undefined, env);
+    expect(probeDockerDriverGatewayHttpReady).toHaveBeenLastCalledWith(
+      25,
+      "http://127.0.0.1:8081/openshell.v1.OpenShell/Health",
+      env,
+    );
   });
 
   it("preserves explicit probe URLs and injects the bound default wait probe", async () => {
@@ -100,12 +111,38 @@ describe("dynamic gateway runtime helpers", () => {
       25,
       "https://probe.example/health",
       "POST",
+      undefined,
     );
     await expect(helpers.waitForGatewayHttpReady()).resolves.toBe(true);
     expect(probeGatewayHttpReady).toHaveBeenLastCalledWith(
       undefined,
       "http://127.0.0.1:9090/",
       undefined,
+      undefined,
+    );
+  });
+
+  it("forwards explicit HTTP readiness abort signals", async () => {
+    const probeGatewayHttpReady = vi.fn(async () => true);
+    const helpers = createDynamicGatewayRuntimeHelpers({
+      getGatewayName: () => "nemoclaw-9090",
+      getGatewayPort: () => 9090,
+      getDockerDriverGatewayEndpoint: (port) => `http://127.0.0.1:${port}`,
+      getGatewayClusterImageDrift: vi.fn(() => null),
+      probeGatewayHttpReady,
+      probeDockerDriverGatewayHttpReady: vi.fn(async () => true),
+      waitForGatewayHttpReadyBase: vi.fn(async () => true),
+      probeGatewayTcpReady: vi.fn(async () => true),
+    });
+    const controller = new AbortController();
+
+    await helpers.isGatewayHttpReady(25, "https://probe.example/health", "POST", controller.signal);
+
+    expect(probeGatewayHttpReady).toHaveBeenLastCalledWith(
+      25,
+      "https://probe.example/health",
+      "POST",
+      controller.signal,
     );
   });
 });

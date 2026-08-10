@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  printCdiSpecUnavailableError,
   printDockerNotReachableError,
   printLowMemoryWarning,
   printMessagingProviderMissing,
@@ -72,6 +73,18 @@ describe("onboard preflight severity messages (#6004)", () => {
     expect(lines(err)[0]).toContain("✗");
     expect(lines(err)[0]).toContain("Docker driver");
     expect(lines(err).join("\n")).toContain("Switch to Docker Engine");
+    // macOS reporters use Docker Desktop or Colima, not native Docker Engine (#7320).
+    expect(lines(err).join("\n")).toContain("Docker Desktop");
+    expect(lines(err).join("\n")).toContain("Colima");
+  });
+
+  it("preserves the CDI failure message through the shared presenter (#7411)", () => {
+    const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    printCdiSpecUnavailableError();
+
+    expect(lines(err)[0]).toContain("✗ Docker is configured for CDI device injection");
+    expect(lines(err)[0]).toContain("NVIDIA GPU CDI spec is missing or stale");
   });
 
   it("prints the under-provisioned warning to stderr with a ⚠ marker and colima resize", () => {

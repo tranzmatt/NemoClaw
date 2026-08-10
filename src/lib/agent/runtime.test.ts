@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import type { AgentDefinition } from "./defs";
 // Import source directly so tests cannot pass against a stale build.
-import { buildRecoveryScript } from "./runtime";
+import { buildRecoveryScript, getRegisteredAgent } from "./runtime";
 
 function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
   return {
@@ -21,10 +21,26 @@ function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
       configFile: "/tmp/agent/config.yaml",
       envFile: null,
       format: "yaml",
+      shieldsFiles: [],
     },
     inferenceProviderOptions: [],
     mcpCapability: { support: "disabled", reason: "test fixture" },
+    stateDirectories: [],
     stateDirs: [],
+    stateDirPrefixes: [],
+    backupStateDirs: [],
+    backupStateDirPrefixes: [],
+    nonBackupStateDirs: [],
+    nonBackupStateDirPrefixes: [],
+    stateLockPlan: {
+      version: 1,
+      readOnlyRoots: [],
+      confidentialRoots: [],
+      readOnlyPrefixes: [],
+      confidentialPrefixes: [],
+      writableSubpaths: [],
+    },
+    stateLockPlanInImage: false,
     stateFiles: [],
     userManagedFiles: [],
     versionCommand: "test-agent --version",
@@ -57,7 +73,33 @@ const hermesAgent = makeAgent({
     configFile: "/sandbox/.hermes/config.yaml",
     envFile: "/sandbox/.hermes/.env",
     format: "yaml",
+    shieldsFiles: [".env"],
   },
+});
+
+describe("getRegisteredAgent", () => {
+  it("does not invent an agent when the target registry row is absent or OpenClaw", () => {
+    expect(getRegisteredAgent(null)).toBeNull();
+    expect(getRegisteredAgent({})).toBeNull();
+    expect(getRegisteredAgent({ agent: "openclaw" })).toBeNull();
+  });
+
+  it("loads only the agent named by the supplied registry row", () => {
+    expect(getRegisteredAgent({ agent: "hermes" })?.name).toBe("hermes");
+  });
+
+  it("fails closed when the registered agent definition is unavailable", () => {
+    expect(getRegisteredAgent({ agent: "missing-agent" })).toBeNull();
+  });
+
+  it.each([
+    "../openclaw",
+    "/tmp/agent",
+    "hermes/../openclaw",
+    "hermes\\openclaw",
+  ])("fails closed for path-like persisted agent name %j", (agent) => {
+    expect(getRegisteredAgent({ agent })).toBeNull();
+  });
 });
 
 function extractGatewayProcessPattern(script: string | null): string {
@@ -207,8 +249,7 @@ describe("buildRecoveryScript", () => {
       const script = buildRecoveryScript(minimalAgent, 19000);
       expect(script).not.toContain("chown gateway:gateway /tmp/gateway.log");
       expect(script).not.toContain("chown 'gateway:gateway' /tmp/gateway.log");
-      expect(script).not.toContain("gosu gateway");
-      expect(script).not.toContain("gosu 'gateway'");
+      expect(script).not.toContain("--reuid=gateway");
     });
   });
 });

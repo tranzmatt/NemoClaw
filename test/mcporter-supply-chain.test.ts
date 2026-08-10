@@ -6,9 +6,14 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
+import { type DependencyNode, findDependency } from "./fixtures/dependency-graph.ts";
 
 const repoRoot = path.join(import.meta.dirname, "..");
 const runtimeDirectory = path.join(repoRoot, "agents", "openclaw", "mcporter-runtime");
+const dependencyReview = fs.readFileSync(
+  path.join(repoRoot, "agents", "openclaw", "dependency-review.md"),
+  "utf8",
+);
 const dockerfiles = ["Dockerfile.base", "Dockerfile"].map((name) => ({
   name,
   contents: fs.readFileSync(path.join(repoRoot, name), "utf8"),
@@ -16,21 +21,32 @@ const dockerfiles = ["Dockerfile.base", "Dockerfile"].map((name) => ({
 const expectedVersion = "0.7.3";
 const expectedIntegrity =
   "sha512-egoPVYqTnWb3NjRIxo+xc8OrAI0dlPrJm9pAiZx0pImuNIV5rKhGtTnIfH/Y1ldGPVu74ibj3KR5c9U/QSdQFA==";
+const expectedTarball = "https://registry.npmjs.org/mcporter/-/mcporter-0.7.3.tgz";
+const expectedHonoNodeServerVersion = "2.0.11";
+const expectedHonoNodeServerTarball =
+  "https://registry.npmjs.org/@hono/node-server/-/node-server-2.0.11.tgz";
+const expectedFastUriVersion = "3.1.5";
+const expectedFastUriTarball = "https://registry.npmjs.org/fast-uri/-/fast-uri-3.1.5.tgz";
+const expectedIpAddressVersion = "10.3.1";
+const expectedIpAddressTarball = "https://registry.npmjs.org/ip-address/-/ip-address-10.3.1.tgz";
 const runtimePrefix = "npm --prefix /usr/local/lib/nemoclaw/mcporter-runtime";
 
 function extractIntegrityGate(contents: string): string {
   const startMarker = 'MCPORTER_EXPECTED_INTEGRITY=""';
   const start = contents.indexOf(startMarker);
-  const [end = -1] = [
-    contents.indexOf('MCPORTER_LOCK_SHA256="', start),
-    contents.indexOf("&& MCPORTER_REGISTRY_INTEGRITY=", start),
-  ]
+  const helperMarker =
+    "node --experimental-strip-types /scripts/lib/reviewed-npm-archive.mts --verify-only";
+  const helperStart = contents.indexOf(helperMarker, start);
+  const helperEndMarker = '--label "mcporter ${MCPORTER_VERSION}"';
+  const helperEnd = contents.indexOf(helperEndMarker, helperStart) + helperEndMarker.length;
+  const [end = -1] = [contents.indexOf('MCPORTER_LOCK_SHA256="', start), helperStart]
     .filter((index) => index > start)
     .sort((left, right) => left - right);
   expect(start).toBeGreaterThanOrEqual(0);
   expect(end).toBeGreaterThan(start);
-  return contents
-    .slice(start, end)
+  expect(helperStart).toBeGreaterThanOrEqual(end);
+  expect(helperEnd).toBeGreaterThan(helperStart);
+  return `${contents.slice(start, end)}\n${contents.slice(helperStart, helperEnd)}`
     .replace(/\\\s*\n/g, " ")
     .trim();
 }
@@ -40,7 +56,18 @@ function runIntegrityGate(contents: string, version: string) {
     "set -euo pipefail",
     `MCPORTER_VERSION=${JSON.stringify(version)}`,
     `MCPORTER_0_7_3_INTEGRITY=${JSON.stringify(expectedIntegrity)}`,
+    `MCPORTER_0_7_3_TARBALL=${JSON.stringify(expectedTarball)}`,
     `npm() { printf '%s\\n' ${JSON.stringify(expectedIntegrity)}; }`,
+    "node() {",
+    '  [ "$#" -eq 11 ] && [ "${1:-}" = "--experimental-strip-types" ] || return 81',
+    '  [ "${2:-}" = "/scripts/lib/reviewed-npm-archive.mts" ] && [ "${3:-}" = "--verify-only" ] || return 82',
+    '  [ "${4:-}" = "--package-spec" ] && [ "${5:-}" = "mcporter@${MCPORTER_VERSION}" ] || return 83',
+    '  [ "${6:-}" = "--integrity" ] && [ "${7:-}" = ' +
+      `${JSON.stringify(expectedIntegrity)} ] || return 84`,
+    '  [ "${8:-}" = "--tarball-url" ] && [ "${9:-}" = ' +
+      `${JSON.stringify(expectedTarball)} ] || return 85`,
+    '  [ "${10:-}" = "--label" ] && [ "${11:-}" = "mcporter ${MCPORTER_VERSION}" ] || return 86',
+    "}",
     extractIntegrityGate(contents),
     "printf 'gate-passed\\n'",
   ].join("\n");
@@ -48,6 +75,22 @@ function runIntegrityGate(contents: string, version: string) {
 }
 
 describe("mcporter image supply-chain controls", () => {
+  it("records the patched transitive dependency review boundaries", () => {
+    expect(dependencyReview).toContain("a manifest override, or the locked graph changes");
+    expect(dependencyReview).toContain(
+      "`2.0.5` is the first patched release for `GHSA-frvp-7c67-39w9`",
+    );
+    expect(dependencyReview).toContain("any version other than exact `2.0.11`");
+    expect(dependencyReview).toContain("the `/vercel` adapter");
+    expect(dependencyReview).toContain("`fast-uri@3.1.5`");
+    expect(dependencyReview).toContain("`GHSA-v2hh-gcrm-f6hx`");
+    expect(dependencyReview).toContain("`GHSA-7p8r-x3mc-p8w7`");
+    expect(dependencyReview).toContain("exact `3.1.5`");
+    expect(dependencyReview).toContain("`ip-address@10.3.1`");
+    expect(dependencyReview).toContain("`GHSA-mwp4-54f8-5fhr`");
+    expect(dependencyReview).toContain("exact `10.3.1`");
+  });
+
   it("resolves the committed production graph through npm's lockfile boundary", () => {
     const result = spawnSync(
       "npm",
@@ -55,12 +98,30 @@ describe("mcporter image supply-chain controls", () => {
       { cwd: runtimeDirectory, encoding: "utf8" },
     );
     expect(result.status, result.stderr).toBe(0);
-    const graph = JSON.parse(result.stdout) as {
-      dependencies?: Record<string, { version?: string }>;
-      problems?: string[];
-    };
+    const graph = JSON.parse(result.stdout) as DependencyNode & { problems?: string[] };
     expect(graph.problems).toBeUndefined();
     expect(graph.dependencies?.mcporter?.version).toBe(expectedVersion);
+    expect(findDependency(graph, "@hono/node-server")).toEqual(
+      expect.objectContaining({
+        overridden: true,
+        resolved: expectedHonoNodeServerTarball,
+        version: expectedHonoNodeServerVersion,
+      }),
+    );
+    expect(findDependency(graph, "fast-uri")).toEqual(
+      expect.objectContaining({
+        overridden: true,
+        resolved: expectedFastUriTarball,
+        version: expectedFastUriVersion,
+      }),
+    );
+    expect(findDependency(graph, "ip-address")).toEqual(
+      expect.objectContaining({
+        overridden: true,
+        resolved: expectedIpAddressTarball,
+        version: expectedIpAddressVersion,
+      }),
+    );
   });
 
   it.each(dockerfiles)("pins and verifies the package in $name", ({ contents }) => {
@@ -68,13 +129,20 @@ describe("mcporter image supply-chain controls", () => {
 
     expect(contents).toContain(`ARG MCPORTER_VERSION=${expectedVersion}`);
     expect(contents).toContain(`ARG MCPORTER_0_7_3_INTEGRITY=${expectedIntegrity}`);
-    expect(contents).toContain('npm view "mcporter@${MCPORTER_VERSION}" dist.integrity');
-    expect(contents).toContain(
+    expect(contents).toContain(`ARG MCPORTER_0_7_3_TARBALL=${expectedTarball}`);
+    expect(flattenedContents).toContain(
+      '--verify-only --package-spec "mcporter@${MCPORTER_VERSION}" --integrity "$MCPORTER_EXPECTED_INTEGRITY" --tarball-url "$MCPORTER_EXPECTED_TARBALL"',
+    );
+    const groupedRuntimeCopy =
+      "COPY agents/openclaw/mcporter-runtime/package.json agents/openclaw/mcporter-runtime/package-lock.json /usr/local/lib/nemoclaw/mcporter-runtime/";
+    const splitRuntimeCopies = [
       "COPY agents/openclaw/mcporter-runtime/package.json /usr/local/lib/nemoclaw/mcporter-runtime/package.json",
-    );
-    expect(contents).toContain(
       "COPY agents/openclaw/mcporter-runtime/package-lock.json /usr/local/lib/nemoclaw/mcporter-runtime/package-lock.json",
-    );
+    ];
+    expect(
+      flattenedContents.includes(groupedRuntimeCopy) ||
+        splitRuntimeCopies.every((copy) => contents.includes(copy)),
+    ).toBe(true);
     expect(flattenedContents).toContain(
       `${runtimePrefix} ci --ignore-scripts --omit=dev --no-audit --no-fund --no-progress`,
     );
@@ -101,7 +169,26 @@ describe("mcporter image supply-chain controls", () => {
   });
 
   it.each(dockerfiles)("audits the committed dependency graph in $name", ({ contents }) => {
-    expect(contents).toContain(`${runtimePrefix} audit --omit=dev --audit-level=low`);
+    const flattenedContents = contents.replace(/\\\s*\n/g, " ").replace(/\s+/g, " ");
+    expect(contents).toContain(
+      "COPY ci/npm-audit-exceptions.json /scripts/npm-audit-exceptions.json",
+    );
+    expect(
+      flattenedContents.includes(
+        "COPY scripts/lib/reviewed-npm-archive.mts scripts/lib/reviewed-npm-audit.mts scripts/lib/openclaw-npm-remediation.mts /scripts/lib/",
+      ) ||
+        contents.includes(
+          "COPY scripts/lib/reviewed-npm-audit.mts /scripts/lib/reviewed-npm-audit.mts",
+        ),
+    ).toBe(true);
+    expect(flattenedContents).toContain(
+      "node --experimental-strip-types /scripts/lib/reviewed-npm-audit.mts --directory /usr/local/lib/nemoclaw/mcporter-runtime --exceptions /scripts/npm-audit-exceptions.json --graph mcporter-runtime --threshold high",
+    );
+    expect(contents).not.toContain(`${runtimePrefix} audit --omit=dev --audit-level=low`);
     expect(contents).toContain(`${runtimePrefix} audit signatures`);
+    expect(flattenedContents).toContain(
+      `${runtimePrefix} ls --omit=dev --all @hono/node-server @modelcontextprotocol/sdk mcporter`,
+    );
+    expect(contents).toContain("StreamableHTTPServerTransport");
   });
 });

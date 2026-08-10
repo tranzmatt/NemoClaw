@@ -22,6 +22,10 @@ export type FinalGatewayStartFailureDeps = {
   cleanupGateway(): void;
 };
 
+export function normalizeGatewayStartError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
 export function reportLegacyGatewayStartResultFailure(
   output: string,
   log: (message: string) => void,
@@ -104,8 +108,6 @@ export function createFinalGatewayStartFailureHandler(deps: FinalGatewayStartFai
     printError("");
     printError("  If gateway cleanup did not complete, run:");
     printError(`    openshell gateway remove ${gatewayName}`);
-    printError("    # For OpenShell releases that still expose lifecycle commands:");
-    printError(`    openshell gateway destroy -g ${gatewayName}`);
     if (process.platform === "linux") {
       printError(
         "    sudo pkill -f openshell-gateway  # if a privileged host gateway process remains",

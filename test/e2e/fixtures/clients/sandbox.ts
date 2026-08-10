@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { Buffer } from "node:buffer";
+import * as importedSandboxNameContract from "../../../../nemoclaw/src/shared/sandbox-name.cts";
 import { buildAvailabilityProbeEnv } from "../availability-env.ts";
 import type { ShellProbeResult, ShellProbeRunOptions } from "../shell-probe.ts";
 import { trustedShellCommand } from "../shell-probe.ts";
@@ -10,7 +10,18 @@ import {
   assertExitZero,
   type CommandRunner,
   outputContainsSandbox,
+  resultText,
 } from "./command.ts";
+
+const sandboxNameContract = (
+  "default" in importedSandboxNameContract && importedSandboxNameContract.default
+    ? importedSandboxNameContract.default
+    : importedSandboxNameContract
+) as typeof import("../../../../nemoclaw/src/shared/sandbox-name.cts");
+const { diagnosticPreview, isValidName, NAME_ALLOWED_FORMAT } = sandboxNameContract;
+
+const SANDBOX_ALREADY_ABSENT =
+  /\bNotFound\b|\bNot Found\b|sandbox[^\n]*(?:not found|not present|does not exist)|no such sandbox/i;
 
 /**
  * Default env for openshell-targeted spawns. ShellProbe filters env via
@@ -52,15 +63,6 @@ export function trustedSandboxShellScript(script: string): TrustedSandboxShellSc
   return script as TrustedSandboxShellScript;
 }
 
-function sandboxShellArgument(script: TrustedSandboxShellScript): string {
-  const encodedScript = Buffer.from(script, "utf8").toString("base64");
-  return [
-    "command -v base64 >/dev/null 2>&1 || { echo NEMOCLAW_BASE64_MISSING >&2; exit 127; }",
-    `_NEMOCLAW_E2E_SCRIPT="$(printf '%s' '${encodedScript}' | base64 -d)" || exit $?`,
-    `eval "$_NEMOCLAW_E2E_SCRIPT"`,
-  ].join("; ");
-}
-
 export class SandboxClient {
   private readonly runner: CommandRunner;
   private readonly openshellPath: string;
@@ -99,6 +101,16 @@ export class SandboxClient {
     });
   }
 
+  async cleanupSandbox(name: string, options: ShellProbeRunOptions = {}): Promise<void> {
+    validateSandboxName(name);
+    const result = await this.openshell(["sandbox", "delete", name], {
+      artifactName: `cleanup-openshell-sandbox-${name}`,
+      ...options,
+    });
+    if (result.exitCode === 0 || SANDBOX_ALREADY_ABSENT.test(resultText(result))) return;
+    assertExitZero(result, `cleanup OpenShell sandbox ${name}`);
+  }
+
   exec(
     name: string,
     command: string[],
@@ -117,13 +129,10 @@ export class SandboxClient {
     options: ShellProbeRunOptions = {},
   ): Promise<ShellProbeResult> {
     validateSandboxName(name);
-    return this.openshell(
-      ["sandbox", "exec", "-n", name, "--", "sh", "-lc", sandboxShellArgument(script)],
-      {
-        artifactName: `sandbox-exec-shell-${name}`,
-        ...options,
-      },
-    );
+    return this.openshell(["sandbox", "exec", "-n", name, "--", "sh", "-lc", script], {
+      artifactName: `sandbox-exec-shell-${name}`,
+      ...options,
+    });
   }
 
   upload(
@@ -165,7 +174,7 @@ export class SandboxClient {
    *
    * Used exclusively by recovery E2E targets (#2701). Removes:
    *   - /tmp/nemoclaw-proxy-env.sh (the NODE_OPTIONS chain export file)
-   *   - the seven --require preload guard scripts written by the entrypoint
+   *   - the five --require preload guard scripts written by the entrypoint
    */
   async wipeGuardChain(
     name: string,
@@ -180,9 +189,7 @@ export class SandboxClient {
       "/tmp/nemoclaw-ciao-network-guard.js",
       "/tmp/nemoclaw-slack-channel-guard.js",
       "/tmp/nemoclaw-http-proxy-fix.js",
-      "/tmp/nemoclaw-ws-proxy-fix.js",
       "/tmp/nemoclaw-nemotron-inference-fix.js",
-      "/tmp/nemoclaw-seccomp-guard.js",
     ];
     const result = await this.exec(name, removeCommand, {
       artifactName: `sandbox-wipe-guard-chain-${name}`,
@@ -194,9 +201,9 @@ export class SandboxClient {
   }
 
   /**
-   * Disruption helper: kill the entire openclaw process tree inside the
-   * sandbox (gateway + launcher + supervisor watchdog). Used after
-   * `wipeGuardChain` to force the recovery path to relaunch from scratch.
+   * Disruption helper: kill the observed OpenClaw process tree inside the
+   * sandbox. Used after `wipeGuardChain` to force the managed watchdog or
+   * recovery path to relaunch from scratch.
    *
    * The bracket pattern `[o]penclaw` is the standard pgrep/pkill trick to
    * avoid matching the matcher process itself.
@@ -208,12 +215,10 @@ export class SandboxClient {
     options: ShellProbeRunOptions = {},
   ): Promise<ShellProbeResult> {
     validateSandboxName(name);
-    // Two-phase kill: SIGKILL the tree, sleep, then verify nothing came back.
-    // Mirrors the bash test's pkill -9 + verify pattern.
-    const script =
-      "pkill -9 -f '[o]penclaw' 2>/dev/null || true; " +
-      "sleep 2; " +
-      "pgrep -af '[o]penclaw' >/dev/null 2>&1 && exit 1 || exit 0";
+    // Require an initial gateway process, then kill it. Do not assert that the
+    // process stays absent: PID 1 is expected to respawn the gateway, and the
+    // live scenario verifies the replacement PID and restored guard chain.
+    const script = "pkill -9 -f '[o]penclaw'";
     const result = await this.exec(name, ["sh", "-c", script], {
       artifactName: `sandbox-kill-gateway-tree-${name}`,
       env: openshellProbeEnv(),
@@ -225,8 +230,10 @@ export class SandboxClient {
 }
 
 export function validateSandboxName(name: string): void {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) {
-    throw new Error(`sandbox name is invalid for fixture client: ${name}`);
+  if (!isValidName(name)) {
+    throw new Error(
+      `sandbox name is invalid for fixture client: ${diagnosticPreview(name)}. Allowed format: ${NAME_ALLOWED_FORMAT}.`,
+    );
   }
 }
 

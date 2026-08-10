@@ -1,68 +1,47 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type fs from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import YAML from "yaml";
+import {
+  createRunnerFsStore,
+  createStdoutCapture,
+  FAKE_HOME,
+  FIXED_RUN_UUID,
+  inMemoryFsMethods,
+  resolvedEndpointFor,
+} from "./runner-mock-fixtures.js";
+import {
+  blueprintWithPolicyAdditions,
+  failureResult,
+  minimalBlueprint,
+  resultForCommandFailure,
+  routedBlueprint,
+} from "./runner-test-fixtures.js";
 
 // ── In-memory filesystem ────────────────────────────────────────
 
-interface FsEntry {
-  type: "file" | "dir";
-  content?: string;
-}
-
-const store = new Map<string, FsEntry>();
-
-function addFile(p: string, content: string): void {
-  store.set(p, { type: "file", content });
-}
-
-function addDir(p: string): void {
-  store.set(p, { type: "dir" });
-}
-
-const FAKE_HOME = "/fakehome";
+const { store, addFile, addDir } = createRunnerFsStore();
 
 vi.mock("node:os", () => ({
   homedir: () => FAKE_HOME,
 }));
 
 vi.mock("node:crypto", () => ({
-  randomUUID: () => "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+  randomUUID: () => FIXED_RUN_UUID,
 }));
 
 vi.mock("node:fs", async (importOriginal) => {
   const original = await importOriginal<typeof fs>();
+  const memory = inMemoryFsMethods(store, { spy: vi.fn });
   return {
     ...original,
-    existsSync: (p: string) => store.has(p),
-    mkdirSync: vi.fn((p: string) => {
-      addDir(p);
-    }),
-    readFileSync: (p: string) => {
-      const entry = store.get(p);
-      if (entry?.type !== "file") throw new Error(`ENOENT: ${p}`);
-      return entry.content ?? "";
-    },
-    writeFileSync: vi.fn((p: string, data: string) => {
-      store.set(p, { type: "file", content: data });
-    }),
-    readdirSync: (p: string) => {
-      const prefix = p.endsWith("/") ? p : p + "/";
-      const entries = new Set<string>();
-      for (const k of store.keys()) {
-        if (k.startsWith(prefix)) {
-          const rest = k.slice(prefix.length);
-          const first = rest.split("/")[0];
-          if (first) entries.add(first);
-        }
-      }
-      if (entries.size === 0 && !store.has(p)) {
-        throw new Error(`ENOENT: ${p}`);
-      }
-      return [...entries].sort();
-    },
+    existsSync: memory.existsSync,
+    mkdirSync: memory.mkdirSync,
+    readFileSync: memory.readFileSync,
+    writeFileSync: memory.writeFileSync,
+    readdirSync: memory.readdirSync,
   };
 });
 
@@ -75,13 +54,7 @@ vi.mock("./ssrf.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./ssrf.js")>();
   return {
     ...actual,
-    validateEndpointUrl: vi.fn(async (url: string) => ({
-      url,
-      pinnedUrl: url,
-      protocol: url.startsWith("http:") ? "http:" : "https:",
-      hostname: new URL(url).hostname,
-      dnsResolved: false,
-    })),
+    validateEndpointUrl: vi.fn(async (url: string) => resolvedEndpointFor(url)),
   };
 });
 
@@ -93,99 +66,16 @@ const { emitRunId, loadBlueprint, actionPlan, actionApply, actionStatus, actionR
 
 // ── Helpers ─────────────────────────────────────────────────────
 
-const stdoutChunks: string[] = [];
+const stdoutCapture = createStdoutCapture();
+const stdoutText = stdoutCapture.text;
+const capturedJsonOutput = stdoutCapture.jsonOutput;
 
 function captureStdout(): void {
-  vi.spyOn(process.stdout, "write").mockImplementation((chunk: string | Uint8Array) => {
-    stdoutChunks.push(String(chunk));
-    return true;
-  });
-}
-
-function stdoutText(): string {
-  return stdoutChunks.join("");
-}
-
-function capturedJsonOutput<T = unknown>(): T {
-  const json = stdoutText()
-    .split("\n")
-    .filter((line) => line && !line.startsWith("RUN_ID:") && !line.startsWith("PROGRESS:"))
-    .join("\n");
-  return JSON.parse(json) as T;
-}
-
-function minimalBlueprint(overrides?: Record<string, unknown>): Record<string, unknown> {
-  return {
-    version: "1.0",
-    components: {
-      inference: {
-        profiles: {
-          default: {
-            provider_type: "openai",
-            provider_name: "my-provider",
-            endpoint: "https://api.example.com/v1",
-            model: "gpt-4",
-            credential_env: "MY_API_KEY",
-          },
-        },
-      },
-      sandbox: {
-        image: "openclaw",
-        name: "test-sandbox",
-        forward_ports: [18789],
-      },
-      policy: { additions: {} },
-    },
-    ...overrides,
-  };
-}
-
-function routedBlueprint(): Record<string, unknown> {
-  return {
-    version: "1.0",
-    components: {
-      inference: {
-        profiles: {
-          routed: {
-            provider_type: "openai",
-            provider_name: "nvidia-router",
-            endpoint: "http://localhost:4000/v1",
-            model: "routed",
-            credential_env: "NVIDIA_INFERENCE_API_KEY",
-            credential_default: "router-local",
-            timeout_secs: 180,
-          },
-        },
-      },
-      sandbox: {
-        image: "openclaw",
-        name: "test-sandbox",
-        forward_ports: [18789],
-      },
-      router: {
-        enabled: true,
-        port: 4000,
-        pool_config_path: "router/pool-config.yaml",
-      },
-      policy: { additions: {} },
-    },
-  };
+  vi.spyOn(process.stdout, "write").mockImplementation(stdoutCapture.write);
 }
 
 function seedBlueprintFile(bp?: Record<string, unknown>): void {
   addFile("blueprint.yaml", YAML.stringify(bp ?? minimalBlueprint()));
-}
-
-function blueprintWithPolicyAdditions(additions: Record<string, unknown>): Record<string, unknown> {
-  const bp = minimalBlueprint();
-  const components = bp.components as Record<string, unknown>;
-  return {
-    ...bp,
-    components: {
-      ...components,
-      policy: { additions },
-    },
-  };
 }
 
 function mockCurrentPolicy(stdout: string): void {
@@ -207,7 +97,7 @@ function mockCurrentPolicy(stdout: string): void {
 describe("runner", () => {
   beforeEach(() => {
     store.clear();
-    stdoutChunks.length = 0;
+    stdoutCapture.reset();
     vi.clearAllMocks();
     delete process.env.NEMOCLAW_BLUEPRINT_PATH;
   });
@@ -458,6 +348,21 @@ describe("runner", () => {
       expect(() => loadBlueprint()).toThrow(/valid nested component shapes/);
     });
 
+    it("rejects a non-boolean router enabled flag (#6692)", () => {
+      addFile(
+        "blueprint.yaml",
+        YAML.stringify({
+          version: "2.0",
+          components: {
+            router: {
+              enabled: "yes",
+            },
+          },
+        }),
+      );
+      expect(() => loadBlueprint()).toThrow(/valid nested component shapes/);
+    });
+
     it("rejects non-plain policy additions values", () => {
       addFile(
         "blueprint.yaml",
@@ -529,7 +434,9 @@ describe("runner", () => {
       process.env.SECRET_KEY = "real-secret-value";
       try {
         const plan = await actionPlan("secrets", bp);
-        const rendered = capturedJsonOutput<{ inference: Record<string, unknown> }>();
+        const rendered = capturedJsonOutput<{
+          inference: Record<string, unknown>;
+        }>();
         const out = stdoutText();
 
         expect(plan.inference).not.toHaveProperty("credential_env");
@@ -636,6 +543,76 @@ describe("runner", () => {
         ["sandbox", "create", "--from", "openclaw", "--name", "test-sandbox", "--forward", "18789"],
         expect.objectContaining({ reject: false }),
       );
+    });
+
+    const hasPlanJson = (): boolean => [...store.keys()].some((k) => k.endsWith("plan.json"));
+
+    it("rejects provider creation failure with a compensated ownership plan (#6703)", async () => {
+      const credential = "provider-secret-value";
+      process.env.MY_API_KEY = credential;
+      mockExeca.mockImplementation(async (_cmd: string, args: string[]) =>
+        resultForCommandFailure(
+          args,
+          ["provider", "create"],
+          `provider setup failed\nOPENAI_API_KEY=${credential}\nAuthorization: Bearer opaque-bearer`,
+        ),
+      );
+
+      try {
+        const error = await actionApply("default", minimalBlueprint()).then(
+          () => new Error("expected provider creation to fail"),
+          (cause: unknown) => cause,
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toMatch(
+          /Failed to create inference provider 'my-provider'.*provider setup failed/i,
+        );
+        expect((error as Error).message).toContain("OPENAI_API_KEY=<REDACTED>");
+        expect((error as Error).message).toContain("Authorization: Bearer <REDACTED>");
+        expect((error as Error).message).not.toContain(credential);
+        expect((error as Error).message).not.toContain("opaque-bearer");
+        expect(hasPlanJson()).toBe(true);
+        expect(stdoutText()).not.toContain("Apply complete");
+        expect(stdoutText()).not.toContain("PROGRESS:70");
+        expect(stdoutText()).not.toContain("PROGRESS:100");
+      } finally {
+        delete process.env.MY_API_KEY;
+      }
+    });
+
+    it("reuses an already-existing provider instead of failing (#6703)", async () => {
+      mockExeca.mockImplementation(async (_cmd: string, args: string[]) =>
+        resultForCommandFailure(
+          args,
+          ["provider", "create"],
+          "provider 'my-provider' already exists",
+        ),
+      );
+
+      // Matches the sandbox-create contract: already-existing is a reuse, so the
+      // apply proceeds and completes.
+      await actionApply("default", minimalBlueprint());
+      expect(hasPlanJson()).toBe(true);
+      expect(stdoutText()).toContain("Apply complete");
+    });
+
+    it("compensates an owned inference provider when inference set fails (#6703)", async () => {
+      mockExeca.mockImplementation(async (_cmd: string, args: string[]) =>
+        resultForCommandFailure(args, ["inference", "set"], "inference route rejected"),
+      );
+
+      await expect(actionApply("default", minimalBlueprint())).rejects.toThrow(
+        /Failed to set inference route .*model 'gpt-4'.*inference route rejected/i,
+      );
+
+      expect(hasPlanJson()).toBe(true);
+      expect(mockExeca).toHaveBeenCalledWith(
+        "openshell",
+        ["provider", "delete", "my-provider"],
+        expect.objectContaining({ reject: false }),
+      );
+      expect(stdoutText()).not.toContain("Apply complete");
+      expect(stdoutText()).not.toContain("PROGRESS:100");
     });
 
     it("applies blueprint policy additions by merging into the base policy", async () => {
@@ -818,7 +795,7 @@ describe("runner", () => {
     });
 
     it("reuses sandbox when 'already exists' error", async () => {
-      mockExeca.mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "already exists" });
+      mockExeca.mockResolvedValueOnce(failureResult("already exists"));
       // Subsequent calls succeed
       mockExeca.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
 
@@ -827,7 +804,7 @@ describe("runner", () => {
     });
 
     it("throws when sandbox creation fails with other error", async () => {
-      mockExeca.mockResolvedValueOnce({ exitCode: 1, stdout: "", stderr: "disk full" });
+      mockExeca.mockResolvedValueOnce(failureResult("disk full"));
 
       await expect(actionApply("default", minimalBlueprint())).rejects.toThrow(
         /Failed to create sandbox.*disk full/,
@@ -867,6 +844,7 @@ describe("runner", () => {
       const plan = JSON.parse(entry.content);
       expect(plan.profile).toBe("default");
       expect(plan.sandbox_name).toBe("test-sandbox");
+      expect(plan.sandbox_created_by_apply).toBe(true);
       expect(plan.timestamp).toBeDefined();
     });
 
@@ -904,7 +882,16 @@ describe("runner", () => {
       const persisted = JSON.parse(entry.content);
 
       expect(Object.keys(persisted).sort()).toEqual(
-        ["inference", "policy_additions", "profile", "run_id", "sandbox_name", "timestamp"].sort(),
+        [
+          "inference",
+          "inference_provider_created_by_apply",
+          "policy_additions",
+          "profile",
+          "run_id",
+          "sandbox_created_by_apply",
+          "sandbox_name",
+          "timestamp",
+        ].sort(),
       );
       expect(Object.keys(persisted.inference).sort()).toEqual(
         ["endpoint", "model", "provider_name", "provider_type"].sort(),
@@ -1212,6 +1199,7 @@ describe("runner", () => {
             token: "sandbox-token-value",
           },
           sandbox_name: "sb",
+          sandbox_created_by_apply: true,
           policy_additions: {},
           inference: {
             provider_type: "openai",
@@ -1248,6 +1236,7 @@ describe("runner", () => {
           forward_ports: [18789],
         },
         sandbox_name: "sb",
+        sandbox_created_by_apply: true,
         policy_additions: {},
         inference: {
           provider_type: "openai",
@@ -1330,25 +1319,6 @@ describe("runner", () => {
 
     it("throws when run ID is not found", async () => {
       await expect(actionRollback("nc-missing")).rejects.toThrow(/nc-missing not found/);
-    });
-
-    it("stops and removes sandbox from plan", async () => {
-      const runDir = `${RUNS_DIR}/nc-run-1`;
-      addDir(runDir);
-      addFile(`${runDir}/plan.json`, JSON.stringify({ sandbox_name: "my-sandbox" }));
-
-      await actionRollback("nc-run-1");
-
-      expect(mockExeca).toHaveBeenCalledWith(
-        "openshell",
-        ["sandbox", "stop", "my-sandbox"],
-        expect.objectContaining({ reject: false }),
-      );
-      expect(mockExeca).toHaveBeenCalledWith(
-        "openshell",
-        ["sandbox", "remove", "my-sandbox"],
-        expect.objectContaining({ reject: false }),
-      );
     });
 
     it("writes rolled_back marker file", async () => {

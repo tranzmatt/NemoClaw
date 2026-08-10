@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { expectNoSandboxDelete } from "../../../../test/helpers/rebuild-delete-assertions";
 import {
   createRebuildFlowHarness,
   makePreparedRecoveryManifest,
@@ -10,7 +11,10 @@ import {
   snapshotEnv,
 } from "../../../../test/helpers/rebuild-flow-harness";
 
-const restoreSandboxEnv = snapshotEnv(["NEMOCLAW_SANDBOX_NAME"]);
+const restoreSandboxEnv = snapshotEnv([
+  "NEMOCLAW_SANDBOX_NAME",
+  "NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE",
+]);
 
 describe("prepared rebuild recovery", () => {
   beforeEach(() => {
@@ -41,12 +45,13 @@ describe("prepared rebuild recovery", () => {
       expect.objectContaining({ deferInferenceRouteUntilOnboard: true }),
     );
     expect(harness.runOpenshellSpy).toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
+      ["sandbox", "delete", "-g", "nemoclaw", "alpha"],
       expect.objectContaining({ ignoreError: true }),
     );
     expect(harness.restoreSandboxStateSpy).toHaveBeenCalledWith(
       "alpha",
       recoveryManifest.backupPath,
+      { targetAgentType: "openclaw" },
     );
   });
 
@@ -81,12 +86,13 @@ describe("prepared rebuild recovery", () => {
 
     expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
     expect(harness.runOpenshellSpy).toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
+      ["sandbox", "delete", "-g", "nemoclaw", "alpha"],
       expect.objectContaining({ ignoreError: true }),
     );
     expect(harness.restoreSandboxStateSpy).toHaveBeenCalledWith(
       "alpha",
       recoveryManifest.backupPath,
+      { targetAgentType: "openclaw" },
     );
   });
 
@@ -104,10 +110,7 @@ describe("prepared rebuild recovery", () => {
       }),
     ).rejects.toThrow("no NemoClaw-managed image fingerprint");
 
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
     expect(harness.onboardSpy).not.toHaveBeenCalled();
   });
 
@@ -129,10 +132,7 @@ describe("prepared rebuild recovery", () => {
       }),
     ).rejects.toThrow("no NemoClaw-managed image fingerprint");
 
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
   });
 
   it("rejects a mismatched prepared manifest before deleting the sandbox (#6114)", async () => {
@@ -151,10 +151,7 @@ describe("prepared rebuild recovery", () => {
     ).rejects.toThrow("Invalid recovery manifest");
 
     expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
     expect(harness.onboardSpy).not.toHaveBeenCalled();
   });
 
@@ -178,10 +175,7 @@ describe("prepared rebuild recovery", () => {
 
     expect(validationCount).toBe(2);
     expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
     expect(harness.onboardSpy).not.toHaveBeenCalled();
   });
 
@@ -206,10 +200,7 @@ describe("prepared rebuild recovery", () => {
     ).rejects.toThrow("Recovery registry configuration changed during preflight");
 
     expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
   });
 
   it("uses the single refreshed registry snapshot for recreate rollback (#6114)", async () => {
@@ -250,10 +241,7 @@ describe("prepared rebuild recovery", () => {
     ).rejects.toThrow("Recovery backup identity changed during preflight");
 
     expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
   });
 
   it("restores the registry entry when prepared-backup recreation fails (#6114)", async () => {
@@ -272,9 +260,11 @@ describe("prepared rebuild recovery", () => {
     ).rejects.toThrow("Recreate failed");
 
     expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
+    // The journaled source row survives the delete, so no default-sandbox
+    // transition happened and none has to be reversed (#7734).
     expect(harness.restoreSandboxEntrySpy).toHaveBeenCalledWith(
       expect.objectContaining({ name: "alpha", agentVersion: "0.1.0" }),
-      { defaultTransition: { from: null, to: "alpha", expectedRevision: 1 } },
+      {},
     );
     expect(harness.restoreSandboxStateSpy).not.toHaveBeenCalled();
   });

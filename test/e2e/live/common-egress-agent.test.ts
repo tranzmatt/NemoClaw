@@ -11,6 +11,7 @@ import { shellQuote } from "../../../src/lib/core/shell-quote.ts";
 import type { ArtifactSink } from "../fixtures/artifacts.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import type { CleanupRegistry } from "../fixtures/cleanup.ts";
+import { assertCleanupSucceededOrAbsent } from "../fixtures/cleanup-resources.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import {
   type SandboxClient,
@@ -40,12 +41,10 @@ import { stripAnsi } from "./json-envelope.ts";
 // one bash script, not a new shared e2e framework.
 
 const OPENCLAW_BALANCED_SANDBOX =
-  process.env.NEMOCLAW_COMMON_EGRESS_OPENCLAW_BALANCED_SANDBOX ??
-  "e2e-common-egress-openclaw-balanced";
+  process.env.NEMOCLAW_COMMON_EGRESS_OPENCLAW_BALANCED_SANDBOX ?? "e2e-oc-bal";
 const OPENCLAW_OPEN_SANDBOX =
-  process.env.NEMOCLAW_COMMON_EGRESS_OPENCLAW_OPEN_SANDBOX ?? "e2e-common-egress-openclaw-open";
-const HERMES_SANDBOX =
-  process.env.NEMOCLAW_COMMON_EGRESS_HERMES_SANDBOX ?? "e2e-common-egress-hermes-open";
+  process.env.NEMOCLAW_COMMON_EGRESS_OPENCLAW_OPEN_SANDBOX ?? "e2e-oc-open";
+const HERMES_SANDBOX = process.env.NEMOCLAW_COMMON_EGRESS_HERMES_SANDBOX ?? "e2e-hm-open";
 const CHAT_MODEL = process.env.NEMOCLAW_MODEL ?? "nvidia/nemotron-3-super-120b-a12b";
 const ONBOARD_TIMEOUT_MS = 25 * 60_000;
 const TEST_TIMEOUT_MS = 40 * 60_000;
@@ -68,6 +67,12 @@ interface CleanupAttempt {
   exitCode: number | null;
   missingSandboxTolerated: boolean;
   outputTail: string;
+}
+
+interface CleanupSummary {
+  nemoclawDestroy?: CleanupAttempt;
+  openshellDelete?: CleanupAttempt;
+  errors: string[];
 }
 
 interface ActivePolicyPreset {
@@ -182,23 +187,13 @@ async function assertPrerequisites(
   return hosted;
 }
 
-async function bestEffortDestroySandbox(
+async function bestEffortPrecleanSandbox(
   host: HostCliClient,
   sandbox: SandboxClient,
   sandboxName: string,
   artifactPrefix: string,
-): Promise<{
-  nemoclawDestroy?: CleanupAttempt;
-  openshellDelete?: CleanupAttempt;
-  errors: string[];
-}> {
-  const result: {
-    nemoclawDestroy?: CleanupAttempt;
-    openshellDelete?: CleanupAttempt;
-    errors: string[];
-  } = {
-    errors: [],
-  };
+): Promise<CleanupSummary> {
+  const result: CleanupSummary = { errors: [] };
   try {
     const destroy = await host.command("node", [CLI_ENTRYPOINT, sandboxName, "destroy", "--yes"], {
       artifactName: `${artifactPrefix}-nemoclaw-destroy-${sandboxName}`,
@@ -238,12 +233,53 @@ async function registerSandboxCleanup(
     });
     return;
   }
-  cleanup.add(`destroy common-egress sandbox ${sandboxName}`, async () => {
-    const summary = await bestEffortDestroySandbox(host, sandbox, sandboxName, "cleanup");
+  const summary: CleanupSummary = { errors: [] };
+  cleanup.trackDisposable(`write common-egress cleanup summary for ${sandboxName}`, async () => {
     await artifacts.writeJson(`cleanup-common-egress-${sandboxName}.json`, summary);
   });
-  const summary = await bestEffortDestroySandbox(host, sandbox, sandboxName, "pre-cleanup");
-  await artifacts.writeJson(`pre-cleanup-common-egress-${sandboxName}.json`, summary);
+  cleanup.trackDisposable(`delete common-egress OpenShell sandbox ${sandboxName}`, async () => {
+    try {
+      await sandbox.cleanupSandbox(sandboxName, {
+        artifactName: `cleanup-openshell-delete-${sandboxName}`,
+        env: commandEnv(),
+        timeoutMs: 60_000,
+      });
+      summary.openshellDelete = {
+        exitCode: 0,
+        missingSandboxTolerated: false,
+        outputTail: "",
+      };
+    } catch (error) {
+      summary.errors.push(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  });
+  cleanup.trackDisposable(`destroy common-egress sandbox ${sandboxName}`, async () => {
+    const destroy = await host.command("node", [CLI_ENTRYPOINT, sandboxName, "destroy", "--yes"], {
+      artifactName: `cleanup-nemoclaw-destroy-${sandboxName}`,
+      env: commandEnv(),
+      timeoutMs: 120_000,
+    });
+    const attempt = cleanupAttempt(destroy);
+    summary.nemoclawDestroy = attempt;
+    try {
+      assertCleanupSucceededOrAbsent(
+        destroy,
+        attempt.missingSandboxTolerated,
+        `cleanup destroy sandbox ${sandboxName}`,
+      );
+    } catch (error) {
+      summary.errors.push(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+  });
+  const precleanSummary = await bestEffortPrecleanSandbox(
+    host,
+    sandbox,
+    sandboxName,
+    "pre-cleanup",
+  );
+  await artifacts.writeJson(`pre-cleanup-common-egress-${sandboxName}.json`, precleanSummary);
 }
 
 async function runOnboard(
@@ -434,7 +470,7 @@ async function runOpenClawAgentAssertion(
         "ConnectTimeout=10",
         "-o",
         "LogLevel=ERROR",
-        `openshell-${args.sandboxName}`,
+        `openshell-${args.sandboxName}.default`,
         remoteCommand,
       ],
       {
@@ -564,8 +600,19 @@ const hermesTest = process.env.NEMOCLAW_COMMON_EGRESS_SKIP_HERMES === "1" ? test
 describe.sequential("common-egress agent live targets", () => {
   openClawTest(
     "C1 OpenClaw balanced excludes weather until explicitly added, then permits a verified wttr.in curl",
-    { timeout: TEST_TIMEOUT_MS },
-    async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
+    {
+      timeout: TEST_TIMEOUT_MS,
+      meta: {
+        e2ePhases: [
+          "validate hosted OpenClaw prerequisites",
+          "onboard balanced-policy OpenClaw sandbox",
+          "verify balanced egress excludes weather",
+          "add weather egress policy",
+          "run verified weather agent turn",
+        ],
+      },
+    },
+    async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
       const hosted = await assertPrerequisites(host, secrets, skip);
       const apiKey = hosted.apiKey;
       const braveApiKey = secrets.required("BRAVE_API_KEY");
@@ -581,6 +628,7 @@ describe.sequential("common-egress agent live targets", () => {
         ],
       });
       await registerSandboxCleanup(cleanup, artifacts, host, sandbox, OPENCLAW_BALANCED_SANDBOX);
+      progress.phase("onboard balanced-policy OpenClaw sandbox");
       await runOnboard(host, {
         agent: "openclaw",
         artifacts,
@@ -592,6 +640,7 @@ describe.sequential("common-egress agent live targets", () => {
         extraRedactionValues: [braveApiKey],
       });
 
+      progress.phase("verify balanced egress excludes weather");
       expect(
         await listActivePolicyPresets(host, OPENCLAW_BALANCED_SANDBOX, "c1-balanced-initial"),
       ).toEqual([
@@ -609,6 +658,7 @@ describe.sequential("common-egress agent live targets", () => {
         "wttr.in",
       );
 
+      progress.phase("add weather egress policy");
       await addPolicyPreset(host, OPENCLAW_BALANCED_SANDBOX, "weather");
       expect(
         await listActivePolicyPresets(host, OPENCLAW_BALANCED_SANDBOX, "c1-after-weather-add"),
@@ -643,6 +693,7 @@ describe.sequential("common-egress agent live targets", () => {
         },
       );
       expect(clearWeatherProof.exitCode, text(clearWeatherProof)).toBe(0);
+      progress.phase("run verified weather agent turn");
       // The agent must leave the fetched body behind. The host-side assertion
       // independently validates it, so merely echoing the reply token cannot pass.
       const weatherProofCommand = [
@@ -692,8 +743,18 @@ After it returns, reply with only WEATHER_AGENT_OK. Do not fetch any other URL.`
 
   openClawTest(
     "C2 OpenClaw open includes public reference and agent fetches Wikidata",
-    { timeout: TEST_TIMEOUT_MS },
-    async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
+    {
+      timeout: TEST_TIMEOUT_MS,
+      meta: {
+        e2ePhases: [
+          "validate hosted OpenClaw prerequisites",
+          "onboard open-policy OpenClaw sandbox",
+          "verify public-reference egress policy",
+          "fetch Wikidata with OpenClaw agent",
+        ],
+      },
+    },
+    async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
       const hosted = await assertPrerequisites(host, secrets, skip);
       const apiKey = hosted.apiKey;
       await artifacts.target.declare({
@@ -706,6 +767,7 @@ After it returns, reply with only WEATHER_AGENT_OK. Do not fetch any other URL.`
         ],
       });
       await registerSandboxCleanup(cleanup, artifacts, host, sandbox, OPENCLAW_OPEN_SANDBOX);
+      progress.phase("onboard open-policy OpenClaw sandbox");
       await runOnboard(host, {
         agent: "openclaw",
         artifacts,
@@ -714,11 +776,13 @@ After it returns, reply with only WEATHER_AGENT_OK. Do not fetch any other URL.`
         skip,
         tier: "open",
       });
+      progress.phase("verify public-reference egress policy");
       await assertPolicyContains(sandbox, OPENCLAW_OPEN_SANDBOX, "c2-policy", [
         "www.wikidata.org",
         "nominatim.openstreetmap.org",
         "query.wikidata.org",
       ]);
+      progress.phase("fetch Wikidata with OpenClaw agent");
       await runOpenClawAgentAssertion(host, sandbox, artifacts, {
         apiKey,
         expected: "REFERENCE_AGENT_OK",
@@ -738,8 +802,18 @@ After web_fetch returns, reply exactly REFERENCE_AGENT_OK if the fetched respons
 
   hermesTest(
     "C3 Hermes open includes public reference plus Nous presets and agent fetches Wikidata",
-    { timeout: TEST_TIMEOUT_MS },
-    async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
+    {
+      timeout: TEST_TIMEOUT_MS,
+      meta: {
+        e2ePhases: [
+          "validate hosted Hermes prerequisites",
+          "onboard open-policy Hermes sandbox",
+          "verify public-reference and Nous egress",
+          "fetch Wikidata with Hermes agent",
+        ],
+      },
+    },
+    async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
       const hosted = await assertPrerequisites(host, secrets, skip);
       const apiKey = hosted.apiKey;
       await artifacts.target.declare({
@@ -753,6 +827,7 @@ After web_fetch returns, reply exactly REFERENCE_AGENT_OK if the fetched respons
         ],
       });
       await registerSandboxCleanup(cleanup, artifacts, host, sandbox, HERMES_SANDBOX);
+      progress.phase("onboard open-policy Hermes sandbox");
       await runOnboard(host, {
         agent: "hermes",
         artifacts,
@@ -761,6 +836,7 @@ After web_fetch returns, reply exactly REFERENCE_AGENT_OK if the fetched respons
         skip,
         tier: "open",
       });
+      progress.phase("verify public-reference and Nous egress");
       await assertPolicyContains(sandbox, HERMES_SANDBOX, "c3-common-policy", [
         "www.wikidata.org",
         "api.open-meteo.com",
@@ -772,6 +848,7 @@ After web_fetch returns, reply exactly REFERENCE_AGENT_OK if the fetched respons
         "/browser-use",
         "/modal",
       ]);
+      progress.phase("fetch Wikidata with Hermes agent");
       await runHermesAgentAssertion(sandbox, {
         expected: "HERMES_REFERENCE_AGENT_OK",
         label: "c3-agent-reference",

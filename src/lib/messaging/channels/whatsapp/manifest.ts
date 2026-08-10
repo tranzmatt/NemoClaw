@@ -11,7 +11,7 @@ export const whatsappManifest = {
   enrollmentHelp:
     "WhatsApp Web pairs via QR code scanned with your phone — no host-side token. After the sandbox is running, run `openshell term` and then use `openclaw channels login --channel whatsapp` for OpenClaw or `hermes whatsapp` for Hermes to display the QR.",
   enrollmentNotes: [
-    "After pairing, run `nemoclaw <sandbox> channels status --channel whatsapp` to confirm the bridge is delivering inbound messages — pairing alone does not guarantee inbound delivery (issue #4386).",
+    "After pairing, run `nemoclaw <sandbox> channels status --channel whatsapp`. OpenClaw reports inbound delivery evidence; Hermes reports gateway and dashboard session-path diagnostics.",
   ],
   supportedAgents: ["openclaw", "hermes"],
   auth: {
@@ -111,14 +111,27 @@ export const whatsappManifest = {
       spec: "npm:@openclaw/whatsapp@{{openclaw.version}}",
       pin: true,
       integrityByVersion: {
-        "2026.6.10":
-          "sha512-k/XrRdZY77SHrdaRwJOEB7/JRbjp4yVgGD/ZNyakjTMqo32XRVtwPBUnj7726rW8Kl5yyOMQQLKFiD9MDfhmPQ==",
+        "2026.7.1":
+          "sha512-wLY/Omc5fleRpl2lKGN8sxt/8hYfHGwLRezmWsk8oCbea5pRKUPE6ZX+wJO1O52NOJkAGCuiXvS7x0qIeKxXbQ==",
       },
       tarballUrlByVersion: {
-        "2026.6.10": "https://registry.npmjs.org/@openclaw/whatsapp/-/whatsapp-2026.6.10.tgz",
+        "2026.7.1": "https://registry.npmjs.org/@openclaw/whatsapp/-/whatsapp-2026.7.1.tgz",
       },
       required: true,
     },
   ],
-  hooks: [],
+  hooks: [
+    {
+      id: "whatsapp-status-health",
+      phase: "status",
+      handler: "whatsapp.statusHealth",
+      agents: ["openclaw", "hermes"],
+      outputs: [
+        {
+          id: "channelHealth",
+          kind: "status",
+        },
+      ],
+    },
+  ],
 } as const satisfies ChannelManifest;

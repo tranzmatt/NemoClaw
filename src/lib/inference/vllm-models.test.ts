@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   assertGatedModelAccess,
+  buildNemotronUltraDistributedServeCommand,
   buildVllmServeCommand,
   DEFAULT_VLLM_MODEL,
   modelsForPlatform,
@@ -16,6 +17,43 @@ import {
 } from "./vllm-models";
 
 describe("vllm model registry", () => {
+  it("starts directly with setup when the serving environment is empty (#8246)", () => {
+    const command = buildVllmServeCommand({
+      id: "test/model",
+      label: "Test model",
+      envValue: "test-model",
+      downloadSizeBytes: 1,
+      maxModelLen: 4096,
+      modelArgs: [],
+      gated: false,
+      platforms: ["spark"],
+      serveEnv: {},
+    });
+
+    expect(command).toMatch(/^pip install vllm\[fastsafetensors\] && vllm serve/u);
+  });
+
+  it("records a finite positive Hugging Face file size for every model", () => {
+    for (const model of VLLM_MODELS) {
+      expect(Number.isFinite(model.downloadSizeBytes)).toBe(true);
+      expect(model.downloadSizeBytes).toBeGreaterThan(0);
+    }
+  });
+
+  it("pins the Hugging Face repository file totals used by storage preflight (#6858)", () => {
+    expect(
+      Object.fromEntries(VLLM_MODELS.map((model) => [model.envValue, model.downloadSizeBytes])),
+    ).toEqual({
+      "qwen3.6-27b": 30_900_000_000,
+      "deepseek-r1-distill-70b": 141_000_000_000,
+      "nemotron-3-nano-4b": 5_280_000_000,
+      "deepseek-v4-flash": 352_381_000_000,
+      "nemotron-3-ultra-550b-a55b": 352_381_245_521,
+      "qwen3.6-35b-a3b-nvfp4": 23_500_000_000,
+      "muse-glimmer-30b": 25_447_097_878,
+    });
+  });
+
   it("returns null when NEMOCLAW_VLLM_MODEL is unset so the caller can fall back to the profile default", () => {
     expect(selectVllmModelFromEnv({} as NodeJS.ProcessEnv)).toBeNull();
   });
@@ -57,6 +95,122 @@ describe("vllm model registry", () => {
     ).toEqual(deepseek);
   });
 
+  it("pins the DGX Station Nemotron Ultra serving recipe", () => {
+    const ultra = VLLM_MODELS.find((m) => m.envValue === "nemotron-3-ultra-550b-a55b");
+    expect(ultra).toBeDefined();
+    expect(ultra!.id).toBe("nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4");
+    expect(ultra!.revision).toBe("183968f87ae4cedce3039313cac1fd43d112c578");
+    expect(ultra!.servedModelId).toBe("nvidia/nemotron-3-ultra-550b-a55b");
+    expect(ultra!.runtime).toEqual({
+      image:
+        "vllm/vllm-openai@sha256:0fec7ec5f3e6bc168e54899935fb0557da908a4832a1dbc88e2debcf2f889416",
+      imageDownloadSizeBytes: 10_670_087_425,
+      modelDownloadSizeBytes: 352_381_245_521,
+      loadTimeoutSec: 3600,
+      dockerRunArgs: ["--shm-size", "16g", "--ulimit", "memlock=-1", "--ulimit", "stack=67108864"],
+    });
+
+    const cmd = buildVllmServeCommand(ultra!);
+    expect(cmd).toBe(
+      [
+        "export VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY=1",
+        "&& export VLLM_NVFP4_GEMM_BACKEND=flashinfer-trtllm",
+        "&& vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+        "--tensor-parallel-size 1",
+        "--pipeline-parallel-size 1",
+        "--data-parallel-size 1",
+        "--port 8000",
+        "--trust-remote-code",
+        "--max-model-len 262144",
+        "--revision 183968f87ae4cedce3039313cac1fd43d112c578",
+        "--served-model-name nvidia/nemotron-3-ultra-550b-a55b",
+        "--host 0.0.0.0",
+        "--cpu-offload-gb 150",
+        "--cpu-offload-params experts",
+        `--kernel_config '{"enable_flashinfer_autotune": false}'`,
+        `--speculative-config '{"method":"nemotron_h_mtp","num_speculative_tokens":3}'`,
+        "--max-num-seqs 256",
+        "--gpu-memory-utilization 0.9",
+        "--reasoning-parser nemotron_v3",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser qwen3_coder",
+        `--default-chat-template-kwargs '{"enable_thinking":true,"force_nonempty_content":true}'`,
+      ].join(" "),
+    );
+  });
+
+  it("builds the pinned two-Station Nemotron Ultra vLLM v0.25.1 Ray head command", () => {
+    const cmd = buildNemotronUltraDistributedServeCommand({
+      nodeRank: 0,
+      masterAddr: "192.168.240.1",
+      masterPort: 6379,
+    });
+
+    expect(cmd).toContain('python3 -m pip install --user --no-cache-dir "ray==2.56.0"');
+    expect(cmd).toContain(
+      "ray start --head --node-ip-address=192.168.240.1 --port=6379 --num-gpus=1",
+    );
+    expect(cmd).toContain("vllm serve nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4");
+    expect(cmd).toContain("--tensor-parallel-size 1");
+    expect(cmd).toContain("--pipeline-parallel-size 2");
+    expect(cmd).toContain("--distributed-executor-backend ray");
+    expect(cmd).toContain("--kv-cache-dtype fp8");
+    expect(cmd).toContain("--max-model-len 262144");
+    expect(cmd).toContain("--distributed-timeout-seconds 7200");
+    expect(cmd).toContain("--served-model-name nemotron-ultra");
+    expect(cmd).toContain("--host 192.168.240.1");
+    expect(cmd).toContain("--max-num-seqs 256");
+    expect(cmd).toContain("--gpu-memory-utilization 0.9");
+    expect(cmd).not.toContain("--kernel_config");
+    expect(cmd).not.toContain("--speculative-config");
+    expect(cmd).not.toContain("--cpu-offload");
+  });
+
+  it("builds a Ray worker command without starting a second API server", () => {
+    const head = buildNemotronUltraDistributedServeCommand({
+      nodeRank: 0,
+      masterAddr: "192.168.240.1",
+      masterPort: 6379,
+    });
+    const worker = buildNemotronUltraDistributedServeCommand({
+      nodeRank: 1,
+      masterAddr: "192.168.240.1",
+      masterPort: 6379,
+      nodeAddr: "192.168.240.2",
+    });
+
+    expect(worker).toContain(
+      "ray start --address=192.168.240.1:6379 --node-ip-address=192.168.240.2 --num-gpus=1 --block",
+    );
+    expect(worker).not.toContain("vllm serve");
+    expect(head).toContain("vllm serve");
+  });
+
+  it("rejects invalid two-Station Nemotron Ultra rendezvous options", () => {
+    expect(() =>
+      buildNemotronUltraDistributedServeCommand({
+        nodeRank: 0,
+        masterAddr: "station a",
+        masterPort: 6379,
+      }),
+    ).toThrow(/masterAddr/);
+    expect(() =>
+      buildNemotronUltraDistributedServeCommand({
+        nodeRank: 1,
+        masterAddr: "192.168.240.1",
+        masterPort: 70000,
+      }),
+    ).toThrow(/masterPort/);
+    expect(() =>
+      buildNemotronUltraDistributedServeCommand({
+        nodeRank: 1,
+        masterAddr: "192.168.240.1",
+        masterPort: 6379,
+        nodeAddr: "worker.example.com",
+      }),
+    ).toThrow(/nodeAddr/);
+  });
+
   it("rejects an unknown NEMOCLAW_VLLM_MODEL with a helpful message", () => {
     expect(() =>
       selectVllmModelFromEnv({ NEMOCLAW_VLLM_MODEL: "made-up-model" } as NodeJS.ProcessEnv),
@@ -86,6 +240,12 @@ describe("vllm model registry", () => {
     expect(() => assertGatedModelAccess(deepseek!, {} as NodeJS.ProcessEnv)).toThrow(
       /gated on Hugging Face/,
     );
+  });
+
+  it("keeps the public Nemotron Ultra recipe usable without a Hugging Face token", () => {
+    const ultra = VLLM_MODELS.find((m) => m.envValue === "nemotron-3-ultra-550b-a55b");
+    expect(ultra?.gated).toBe(false);
+    expect(() => assertGatedModelAccess(ultra!, {} as NodeJS.ProcessEnv)).not.toThrow();
   });
 
   it("never rejects a non-gated model regardless of token state", () => {
@@ -136,6 +296,31 @@ describe("vllm model registry", () => {
     expect(cmd).toContain(`--served-model-name 'operator'"'"'s model'`);
   });
 
+  it("quotes registry arguments and serving environment values as shell literals (#8246)", () => {
+    const qwen = VLLM_MODELS.find((m) => m.envValue === "qwen3.6-27b");
+    const cmd = buildVllmServeCommand({
+      ...qwen!,
+      id: "example/model; touch /tmp/model-injection",
+      modelArgs: ["--served-model-name", "$(touch /tmp/argument-injection)"],
+      serveEnv: { SAFE_VALUE: "literal; $(touch /tmp/environment-injection)" },
+    });
+
+    expect(cmd).toContain("export SAFE_VALUE='literal; $(touch /tmp/environment-injection)'");
+    expect(cmd).toContain("vllm serve 'example/model; touch /tmp/model-injection'");
+    expect(cmd).toContain("--served-model-name '$(touch /tmp/argument-injection)'");
+  });
+
+  it("rejects invalid serving environment variable names", () => {
+    const qwen = VLLM_MODELS.find((m) => m.envValue === "qwen3.6-27b");
+
+    expect(() =>
+      buildVllmServeCommand({
+        ...qwen!,
+        serveEnv: { "UNSAFE; touch /tmp/environment-name-injection": "1" },
+      }),
+    ).toThrow("Invalid vLLM serving environment variable name");
+  });
+
   it("uses model-specific max-model-len when building the command", () => {
     const deepseek = VLLM_MODELS.find((m) => m.envValue === "deepseek-r1-distill-70b");
     const cmd = buildVllmServeCommand(deepseek!);
@@ -179,7 +364,7 @@ describe("vllm model registry", () => {
     expect(cmd).not.toContain("--gpu-memory-utilization 0.7");
   });
 
-  it("builds the Nemotron-3-Nano-4B FP8 serve command with auto tool-choice enabled (#6314)", () => {
+  it("builds the Nemotron-3-Nano-4B FP8 serve command with auto tool-choice and reasoning parser (#6314, #6915)", () => {
     // #6314: the generic-Linux managed-vLLM default (`GENERIC_LINUX_PROFILE.defaultModel`)
     // used to omit `--enable-auto-tool-choice` and `--tool-call-parser`, so every agent
     // request with `tool_choice: "auto"` failed HTTP 400 out of the box on generic Linux.
@@ -195,11 +380,19 @@ describe("vllm model registry", () => {
     expect(cmd).toContain("--load-format fastsafetensors");
     expect(cmd).toContain("--enable-auto-tool-choice");
     expect(cmd).toContain("--tool-call-parser qwen3_coder");
-    // The tool-call flags must appear paired: the parser value comes as a single
-    // shell token immediately after `--tool-call-parser`, and each switch is listed
-    // only once.
+    // #6915: Nemotron-3-Nano is a reasoning model, so the serve command must
+    // also pin the reasoning parser from the model card. Without it, vLLM
+    // leaves the `<think>…</think>` trace (and the orphan `</think>` marker the
+    // chat template does not pair with an opening tag) inline in `content`,
+    // which the agent's streaming parser mishandles into an empty turn that
+    // wedges the session. The Ultra-550B managed profile already pins the same
+    // `nemotron_v3` parser; this asserts the generic-Linux Nano default matches.
+    expect(cmd).toContain("--reasoning-parser nemotron_v3");
+    // The parser flags must appear paired and exactly once each: the value is a
+    // single shell token immediately after its switch.
     expect(cmd.match(/--enable-auto-tool-choice/g)).toHaveLength(1);
     expect(cmd.match(/--tool-call-parser/g)).toHaveLength(1);
+    expect(cmd.match(/--reasoning-parser/g)).toHaveLength(1);
   });
 
   it("registers the Qwen3.6-35B NVFP4 checkpoint for DGX Spark", () => {
@@ -209,7 +402,7 @@ describe("vllm model registry", () => {
     expect(qwen35b!.gated).toBe(false);
   });
 
-  it("builds the NVFP4 serve command from the DGX Spark model-card recipe", () => {
+  it("builds the MTP-free NVFP4 serve command for DGX Spark (#7127)", () => {
     const qwen35b = VLLM_MODELS.find((m) => m.envValue === "qwen3.6-35b-a3b-nvfp4");
     const cmd = buildVllmServeCommand(qwen35b!);
     // The current NVIDIA model card no longer needs Spark-specific env exports.
@@ -227,18 +420,73 @@ describe("vllm model registry", () => {
     expect(cmd).toContain("--attention-backend flashinfer");
     expect(cmd).toContain("--moe-backend marlin");
     expect(cmd).toContain("--enable-auto-tool-choice");
-    expect(cmd).toContain("--tool-call-parser qwen3_xml");
+    // #6457: `qwen3_coder` (not `qwen3_xml`) is the validated tool-call parser
+    // for this Spark checkpoint; `qwen3_xml` mis-parses its tool-call frames and
+    // breaks Deep Agents Code tool calls with HTTP 400.
+    expect(cmd).toContain("--tool-call-parser qwen3_coder");
+    expect(cmd).not.toContain("qwen3_xml");
+    // Exactly one tool-call parser is configured for the Spark recipe, so the
+    // #6457 regression (serving this checkpoint with qwen3_xml, which mis-parses
+    // its tool-call frames and fails Deep Agents Code with HTTP 400) cannot creep
+    // back in alongside qwen3_coder.
+    expect(cmd.match(/--tool-call-parser/g)).toHaveLength(1);
     expect(cmd).toContain("--reasoning-parser qwen3");
     expect(cmd).toContain("--max-model-len 262144");
-    expect(cmd).toContain(
-      `--speculative-config '{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'`,
-    );
+    expect(cmd).toContain("--dtype auto");
+    expect(cmd).toContain("--max-num-seqs 4");
+    expect(cmd).toContain("--max-num-batched-tokens 8192");
+    expect(cmd).toContain("--enable-chunked-prefill");
+    expect(cmd).toContain("--async-scheduling");
+    expect(cmd).toContain("--enable-prefix-caching");
+    expect(cmd).not.toContain("--speculative-config");
+    expect(cmd).not.toContain('"method":"mtp"');
     // Single-node parallel flags stay shared; 0.4 utilization follows the
     // current DGX Spark model-card recipe.
     expect(cmd).toContain("--gpu-memory-utilization 0.4");
     expect(cmd).toContain("--pipeline-parallel-size 1");
     expect(cmd).toContain("--data-parallel-size 1");
     expect(cmd).not.toContain("--gpu-memory-utilization 0.7");
+  });
+
+  it("pins the authenticated Muse Glimmer recipe for one DGX Spark", () => {
+    const muse = VLLM_MODELS.find((model) => model.envValue === "muse-glimmer-30b");
+
+    expect(muse).toMatchObject({
+      id: "Inferact/Muse-Glimmer-30B-NVFP4-W4A4",
+      label: "Muse Glimmer 30B NVFP4 W4A4 [Experimental]",
+      revision: "d35cb79050f419c457611b1cee5c5d15b176f285",
+      servedModelId: "muse-glimmer",
+      maxModelLen: 32768,
+      platforms: ["spark"],
+      minComputeCapability: 121,
+      gated: false,
+      installFastSafetensors: false,
+      trustRemoteCode: false,
+      managedBearerAuth: true,
+      runtime: {
+        image:
+          "vllm/vllm-openai@sha256:ab0f5fc3bb81b9257a9aee801abcb0eeb94bb0523b57b2bb79349dc61e7c1e25",
+        imageDownloadSizeBytes: 10_507_991_780,
+        modelDownloadSizeBytes: 25_447_097_878,
+      },
+    });
+
+    const command = buildVllmServeCommand(muse!);
+    expect(command).toContain("vllm serve Inferact/Muse-Glimmer-30B-NVFP4-W4A4");
+    expect(command).toContain("--served-model-name muse-glimmer");
+    expect(command).toContain("--revision d35cb79050f419c457611b1cee5c5d15b176f285");
+    expect(command).toContain("--max-model-len 32768");
+    expect(command).toContain("--gpu-memory-utilization 0.75");
+    expect(command).toContain("--max-num-seqs 1");
+    expect(command).toContain("--max-num-batched-tokens 4096");
+    expect(command).toContain("--enable-auto-tool-choice");
+    expect(command).toContain("--tool-call-parser muse_glimmer");
+    expect(command).toContain("--reasoning-parser muse_glimmer");
+    expect(command).toContain("--generation-config auto");
+    expect(command).not.toContain("--trust-remote-code");
+    expect(command).not.toContain("--quantization");
+    expect(command).not.toContain("--speculative-config");
+    expect(command).not.toContain("pip install");
   });
 });
 
@@ -249,6 +497,7 @@ describe("modelsForPlatform", () => {
     expect(slugs).toContain("qwen3.6-27b");
     expect(slugs).toContain("nemotron-3-nano-4b");
     expect(slugs).toContain("deepseek-r1-distill-70b");
+    expect(slugs).toContain("muse-glimmer-30b");
     expect(slugs).not.toContain("deepseek-v4-flash");
   });
 
@@ -258,7 +507,9 @@ describe("modelsForPlatform", () => {
     expect(slugs).toContain("nemotron-3-nano-4b");
     expect(slugs).toContain("deepseek-r1-distill-70b");
     expect(slugs).toContain("deepseek-v4-flash");
+    expect(slugs).toContain("nemotron-3-ultra-550b-a55b");
     expect(slugs).not.toContain("qwen3.6-35b-a3b-nvfp4");
+    expect(slugs).not.toContain("muse-glimmer-30b");
   });
 
   it("omits arch-specific entries from the generic Linux profile", () => {
@@ -267,6 +518,7 @@ describe("modelsForPlatform", () => {
     expect(slugs).toContain("nemotron-3-nano-4b");
     expect(slugs).toContain("deepseek-r1-distill-70b");
     expect(slugs).not.toContain("qwen3.6-35b-a3b-nvfp4");
+    expect(slugs).not.toContain("muse-glimmer-30b");
     expect(slugs).not.toContain("deepseek-v4-flash");
   });
 

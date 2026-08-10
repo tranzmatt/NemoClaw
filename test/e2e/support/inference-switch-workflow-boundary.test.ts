@@ -11,38 +11,19 @@ import {
   validateInferenceSwitchWorkflow,
   validateInferenceSwitchWorkflowBoundary,
 } from "../../../tools/e2e/inference-switch-workflow-boundary.mts";
-import {
-  evaluateE2eWorkflowDispatchSelectors,
-  validateE2eWorkflowBoundary,
-} from "../../../tools/e2e/workflow-boundary.mts";
+import { validateE2eWorkflowBoundary } from "../../../tools/e2e/workflow-boundary.mts";
 
 describe("inference switch workflow boundary", () => {
-  it("runs hosted and Anthropic-compatible modes for both agents", () => {
+  it("accepts the canonical Anthropic-compatible mode for both agents", () => {
     expect(validateInferenceSwitchWorkflowBoundary()).toEqual([]);
     expect(validateE2eWorkflowBoundary()).toEqual([]);
-
-    for (const [job, target] of [
-      ["hermes-inference-switch", "hermes-inference-switch"],
-      ["openclaw-inference-switch", "openclaw-inference-switch"],
-    ]) {
-      expect(evaluateE2eWorkflowDispatchSelectors({ targets: target })).toMatchObject({
-        valid: true,
-        liveTargetsRun: false,
-        selectedFreeStandingJobs: [job],
-      });
-      expect(evaluateE2eWorkflowDispatchSelectors({ jobs: job })).toMatchObject({
-        valid: true,
-        liveTargetsRun: false,
-        selectedFreeStandingJobs: [job],
-      });
-    }
   });
 
   it("rejects removal or misconfiguration of an Anthropic-compatible mode", () => {
     const missingMode = readInferenceSwitchWorkflow();
     missingMode.jobs["hermes-inference-switch"].strategy?.matrix?.include?.pop();
     expect(validateInferenceSwitchWorkflow(missingMode)).toContain(
-      "hermes-inference-switch must run the exact hosted and Anthropic-compatible modes",
+      "hermes-inference-switch must run the canonical Anthropic-compatible mode",
     );
 
     const failFast = readInferenceSwitchWorkflow();
@@ -76,32 +57,46 @@ describe("inference switch workflow boundary", () => {
     );
   });
 
-  it("uses a healthy hosted switch target and scopes its credentials to hosted mode", () => {
-    const wrongTarget = readInferenceSwitchWorkflow();
-    const hosted = wrongTarget.jobs["hermes-inference-switch"].strategy?.matrix?.include?.find(
-      (entry) => entry.mode === "hosted",
+  it("rejects missing or misconfigured E2E shard mappings", () => {
+    const missingShard = readInferenceSwitchWorkflow();
+    delete missingShard.jobs["hermes-inference-switch"].env!.NEMOCLAW_E2E_SHARD;
+    expect(validateInferenceSwitchWorkflow(missingShard)).toContain(
+      "hermes-inference-switch must map NEMOCLAW_E2E_SHARD from its mode matrix",
     );
-    hosted!.switch_model = "nvidia/nvidia/nemotron-3-super-v3";
+
+    const hardcodedShard = readInferenceSwitchWorkflow();
+    hardcodedShard.jobs["openclaw-inference-switch"].env!.NEMOCLAW_E2E_SHARD = "hosted";
+    expect(validateInferenceSwitchWorkflow(hardcodedShard)).toContain(
+      "openclaw-inference-switch must map NEMOCLAW_E2E_SHARD from its mode matrix",
+    );
+  });
+
+  it("pins the local Anthropic switch target without hosted credentials", () => {
+    const wrongTarget = readInferenceSwitchWorkflow();
+    const anthropic = wrongTarget.jobs["hermes-inference-switch"].strategy?.matrix?.include?.find(
+      (entry) => entry.mode === "anthropic",
+    );
+    anthropic!.switch_model = "nvidia/nvidia/nemotron-3-super-v3";
     expect(validateInferenceSwitchWorkflow(wrongTarget)).toContain(
-      "hermes-inference-switch must run the exact hosted and Anthropic-compatible modes",
+      "hermes-inference-switch must run the canonical Anthropic-compatible mode",
     );
 
     const unscopedSecret = readInferenceSwitchWorkflow();
     const runStep = unscopedSecret.jobs["openclaw-inference-switch"].steps!.find(
       (step) => step.name === "Run OpenClaw inference switch live test",
     )!;
-    runStep.env!.NVIDIA_INFERENCE_API_KEY = "${{ secrets.NVIDIA_INFERENCE_API_KEY }}";
+    runStep.env = { NVIDIA_INFERENCE_API_KEY: "${{ secrets.NVIDIA_INFERENCE_API_KEY }}" };
     expect(validateInferenceSwitchWorkflow(unscopedSecret)).toContain(
-      "openclaw-inference-switch must expose NVIDIA_INFERENCE_API_KEY only to its hosted run step",
+      "openclaw-inference-switch must not expose NVIDIA_INFERENCE_API_KEY in its Anthropic-compatible mode",
     );
 
     const unscopedPublicKey = readInferenceSwitchWorkflow();
     const publicRunStep = unscopedPublicKey.jobs["hermes-inference-switch"].steps!.find(
       (step) => step.name === "Run Hermes inference switch live Vitest test",
     )!;
-    publicRunStep.env!.NVIDIA_API_KEY = "${{ secrets.NVIDIA_API_KEY }}";
+    publicRunStep.env = { NVIDIA_API_KEY: "${{ secrets.NVIDIA_API_KEY }}" };
     expect(validateInferenceSwitchWorkflow(unscopedPublicKey)).toContain(
-      "hermes-inference-switch must expose NVIDIA_API_KEY only to its hosted run step",
+      "hermes-inference-switch must not expose NVIDIA_API_KEY in its Anthropic-compatible mode",
     );
 
     const publicKey = readInferenceSwitchWorkflow();
@@ -111,12 +106,24 @@ describe("inference switch workflow boundary", () => {
     );
   });
 
+  it("rejects a step-scoped hosted inference override in a local switch job", () => {
+    const hostedInference = readInferenceSwitchWorkflow();
+    const runStep = hostedInference.jobs["openclaw-inference-switch"].steps!.find(
+      (step) => step.name === "Run OpenClaw inference switch live test",
+    )!;
+    runStep.env = {
+      ...runStep.env,
+      NEMOCLAW_E2E_USE_HOSTED_INFERENCE: "1",
+    };
+
+    expect(validateInferenceSwitchWorkflow(hostedInference)).toContain(
+      "openclaw-inference-switch must not define NEMOCLAW_E2E_USE_HOSTED_INFERENCE at step scope for its Anthropic-compatible mode",
+    );
+  });
+
   it("accepts shared guarded Docker authentication without mode-specific auth scripts", () => {
     const workflow = readInferenceSwitchWorkflow();
     const steps = workflow.jobs["openclaw-inference-switch"].steps!;
-    expect(steps.some((step) => step.name === "Configure isolated Docker auth directory")).toBe(
-      false,
-    );
 
     const authenticate = steps.find((step) => step.name === "Authenticate to Docker Hub")!;
     const authIndex = steps.indexOf(authenticate);
@@ -138,7 +145,7 @@ describe("inference switch workflow boundary", () => {
     try {
       writeFileSync(workflowPath, YAML.stringify(workflow));
       expect(validateE2eWorkflowBoundary(workflowPath)).toContain(
-        "openclaw-inference-switch must run the exact hosted and Anthropic-compatible modes",
+        "openclaw-inference-switch must run the canonical Anthropic-compatible mode",
       );
     } finally {
       rmSync(directory, { force: true, recursive: true });

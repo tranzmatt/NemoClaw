@@ -38,20 +38,46 @@ process.env.NEMOCLAW_CLI_BIN ??= CLI_ENTRYPOINT;
 // targeted unsupported target at module load so the job log/summary
 // captures it before vitest reports the skipped test by id.
 const SELECTED_TARGET_ID = process.env.TARGET_ID;
+const REGISTRY_TARGET_PHASES = [
+  "resolve the target contract and run plan",
+  "confirm the target environment is ready",
+  "prepare the target lifecycle prerequisites",
+  "onboard the registry-selected sandbox",
+  "execute the target lifecycle boundary",
+  "verify the expected sandbox state",
+  "run target-specific cloud checks",
+  "record target completion evidence",
+] as const;
 
-for (const target of listTargets()) {
+for (const [targetIndex, target] of listTargets().entries()) {
   const support = liveTargetSupport(target);
   if (!support.supported) {
     if (SELECTED_TARGET_ID === target.id) {
       console.warn(`[not wired] ${target.id}: ${support.reasons.join("; ")}`);
     }
-    test.skip(liveTargetTestName(target), () => {});
+    // biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
+    test.skip(
+      liveTargetTestName(target),
+      { meta: { e2ePhases: REGISTRY_TARGET_PHASES } },
+      () => {},
+    );
     continue;
   }
 
+  // biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
   test(
     liveTargetTestName(target),
-    async ({ artifacts, environment, host, lifecycle, onboard, secrets, stateValidation }) => {
+    { meta: { e2ePhases: REGISTRY_TARGET_PHASES } },
+    async ({
+      artifacts,
+      environment,
+      host,
+      lifecycle,
+      onboard,
+      progress,
+      secrets,
+      stateValidation,
+    }) => {
       for (const secret of target.requiredSecrets ?? []) {
         secrets.required(secret);
       }
@@ -76,8 +102,25 @@ for (const target of listTargets()) {
       const runPlan = buildLiveTargetRunPlan(target);
       await artifacts.writeJson("run-plan.json", runPlan);
 
+      progress.phase("confirm the target environment is ready");
       const ready = await environment.assertReady(target.environment);
-      const instance = await onboard.from(ready, { sandboxName: `e2e-${target.id}` });
+      const profile = target.environment.lifecycle;
+      const lifecycleProfile = isLifecycleProfile(profile) ? profile : undefined;
+      if (profile && !lifecycleProfile) {
+        throw new Error(
+          `target '${target.id}' declares lifecycle '${profile}' which is not ` +
+            `dispatched by LifecyclePhaseFixture; update the fixture and the ` +
+            `SUPPORTED_LIFECYCLES whitelist together.`,
+        );
+      }
+      progress.phase("prepare the target lifecycle prerequisites");
+      await (lifecycleProfile === "post-reboot-recovery"
+        ? lifecycle.preparePostReboot()
+        : Promise.resolve());
+      progress.phase("onboard the registry-selected sandbox");
+      const instance = await onboard.from(ready, {
+        sandboxName: `e2e-reg-${targetIndex.toString(36)}`,
+      });
 
       // Lifecycle phase runs between onboard and state-validation.
       // Targets opt in by setting `environment.lifecycle` to a
@@ -85,30 +128,27 @@ for (const target of listTargets()) {
       // runtime-support.ts). Profiles dispatch through
       // LifecyclePhaseFixture before state validation.
       let lifecycleResult: Awaited<ReturnType<typeof lifecycle.simulate>> | undefined;
-      const profile = target.environment.lifecycle;
-      if (profile) {
-        if (!isLifecycleProfile(profile)) {
-          throw new Error(
-            `target '${target.id}' declares lifecycle '${profile}' which is not ` +
-              `dispatched by LifecyclePhaseFixture; update the fixture and the ` +
-              `SUPPORTED_LIFECYCLES whitelist together.`,
-          );
-        }
+      // Every registry target crosses the optional lifecycle boundary before
+      // state validation.
+      progress.phase("execute the target lifecycle boundary");
+      if (lifecycleProfile) {
         lifecycleResult =
-          profile === "dcode-rebuild-invalid-credential"
+          lifecycleProfile === "dcode-rebuild-invalid-credential"
             ? await lifecycle.simulate(
-                profile,
+                lifecycleProfile,
                 instance,
                 dcodeInvalidCredentialRebuildOptionsFromRegistryEntry(
                   readRegistrySandboxEntry(instance.sandboxName),
                   secrets.required(HOSTED_INFERENCE_SECRET),
                 ),
               )
-            : await lifecycle.simulate(profile, instance);
+            : await lifecycle.simulate(lifecycleProfile, instance);
       }
 
+      progress.phase("verify the expected sandbox state");
       const validation = await stateValidation.from(target.expectedStateId, instance);
 
+      progress.phase("run target-specific cloud checks");
       const checkScripts = runPlan.e2eCloudExperimentalChecks ?? [];
       expect(checkScripts).toEqual(
         cloudExperimentalChecksForOnboarding(target.environment.onboarding),
@@ -123,6 +163,7 @@ for (const target of listTargets()) {
         secrets,
       });
 
+      progress.phase("record target completion evidence");
       await artifacts.target.complete({
         id: target.id,
         expectedStateId: validation.state.id,

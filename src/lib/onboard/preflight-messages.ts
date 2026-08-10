@@ -24,7 +24,16 @@ export function printDockerNotReachableError(): void {
 export function printUnsupportedRuntimeError(): void {
   console.error(failLine(`${cliDisplayName()} onboarding now uses OpenShell's Docker driver.`));
   console.error(`    Podman is not supported for this ${cliDisplayName()} integration path.`);
-  console.error("    Switch to Docker Engine and rerun onboarding.");
+  console.error("    Switch to Docker Engine, Docker Desktop, or Colima, then rerun onboarding.");
+}
+
+/** NVIDIA CDI state cannot support GPU passthrough for this onboarding run. */
+export function printCdiSpecUnavailableError(): void {
+  console.error(
+    failLine(
+      "Docker is configured for CDI device injection (CDISpecDirs is set), but the NVIDIA GPU CDI spec is missing or stale. OpenShell GPU startup can fail until the CDI spec is refreshed.",
+    ),
+  );
 }
 
 export interface UnderProvisionedRuntimeWarning {

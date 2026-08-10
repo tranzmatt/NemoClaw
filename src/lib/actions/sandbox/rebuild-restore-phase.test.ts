@@ -1,16 +1,36 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { createHash } from "node:crypto";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import * as policies from "../../policy";
+import * as sandboxConfig from "../../sandbox/config";
 import * as sandboxState from "../../state/sandbox";
 import { MCP_BRIDGE_POLICY_SOURCE } from "./mcp-bridge-contracts";
-import { resolveRestoredPolicyRegistryState } from "./rebuild-post-restore-phase";
+import {
+  printSuccessfulRebuildSummary,
+  resolveRestoredPolicyRegistryState,
+} from "./rebuild-post-restore-phase";
 import { runRebuildRestorePhase } from "./rebuild-restore-phase";
+import * as snapshotRestore from "./snapshot/restore-authority";
 
 const BUILTIN_OBSERVABILITY_CONTENT =
   "network_policies:\n  observability-otlp-local:\n    name: observability-otlp-local\n";
+
+type StandardRestoreOptions = Omit<
+  Parameters<typeof runRebuildRestorePhase>[0],
+  "targetAgentType" | "targetImageIsCustom"
+>;
+
+function runStandardRebuildRestorePhase(options: StandardRestoreOptions) {
+  return runRebuildRestorePhase({
+    ...options,
+    targetAgentType: "openclaw",
+    targetImageIsCustom: false,
+  });
+}
 
 describe("rebuild policy restore fidelity", () => {
   beforeEach(() => {
@@ -24,17 +44,164 @@ describe("rebuild policy restore fidelity", () => {
     vi.restoreAllMocks();
   });
 
-  it("replays custom web-policy names from exact content instead of same-name built-ins", () => {
+  it("migrates restored legacy Hermes dashboard state into its profile", () => {
     vi.spyOn(console, "log").mockImplementation(() => undefined);
-    vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const parsePresetPolicyKeys = vi.spyOn(policies, "parsePresetPolicyKeys");
-    vi.spyOn(sandboxState, "restoreSandboxState").mockReturnValue({
+    vi.spyOn(snapshotRestore, "restoreRecreatedSandboxStateWithManagedAuthority").mockReturnValue({
       success: true,
-      restoredDirs: [],
+      restoredDirs: ["profiles", "dashboard-home"],
       restoredFiles: [],
       failedDirs: [],
       failedFiles: [],
     });
+    const target = {
+      agentName: "hermes",
+      configDir: "/sandbox/.hermes",
+      configPath: "/sandbox/.hermes/config.yaml",
+      configFile: "config.yaml",
+      format: "yaml",
+      stateLockPlanInImage: true,
+    } as const;
+    vi.spyOn(sandboxConfig, "resolveAgentConfig").mockReturnValue(target);
+    const seedDashboard = vi
+      .spyOn(sandboxConfig, "restoreHermesDashboardConfig")
+      .mockReturnValue("converged");
+    const log = vi.fn();
+
+    const result = runRebuildRestorePhase({
+      sandboxName: "hermes",
+      targetAgentType: "hermes",
+      targetImageIsCustom: false,
+      backupManifest: { agentType: "hermes", backupPath: "/tmp/rebuild-backup" } as never,
+      policyPresets: [],
+      customPolicies: [],
+      reconcileManagedDcodeObservability: false,
+      log,
+    });
+
+    expect(seedDashboard).toHaveBeenCalledWith("hermes", target);
+    expect(log).toHaveBeenCalledWith("Hermes dashboard state after restore: converged");
+    expect(result.restoreSucceeded).toBe(true);
+  });
+
+  it("reports a failed Hermes dashboard migration as an incomplete restore", () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(snapshotRestore, "restoreRecreatedSandboxStateWithManagedAuthority").mockReturnValue({
+      success: true,
+      restoredDirs: ["dashboard-home"],
+      restoredFiles: [],
+      failedDirs: [],
+      failedFiles: [],
+    });
+    vi.spyOn(sandboxConfig, "resolveAgentConfig").mockReturnValue({
+      agentName: "hermes",
+      configDir: "/sandbox/.hermes",
+      configPath: "/sandbox/.hermes/config.yaml",
+      configFile: "config.yaml",
+      format: "yaml",
+      stateLockPlanInImage: true,
+    });
+    vi.spyOn(sandboxConfig, "restoreHermesDashboardConfig").mockReturnValue("failed");
+
+    const result = runRebuildRestorePhase({
+      sandboxName: "hermes",
+      targetAgentType: "hermes",
+      targetImageIsCustom: false,
+      backupManifest: { agentType: "hermes", backupPath: "/tmp/rebuild-backup" } as never,
+      policyPresets: [],
+      customPolicies: [],
+      reconcileManagedDcodeObservability: false,
+      log: vi.fn(),
+    });
+
+    expect(result.restoreSucceeded).toBe(false);
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("Could not migrate restored Hermes dashboard state into its profile"),
+    );
+  });
+
+  it("reports an unresolved Hermes target as an incomplete restore", () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(snapshotRestore, "restoreRecreatedSandboxStateWithManagedAuthority").mockReturnValue({
+      success: true,
+      restoredDirs: ["dashboard-home"],
+      restoredFiles: [],
+      failedDirs: [],
+      failedFiles: [],
+    });
+    vi.spyOn(sandboxConfig, "resolveAgentConfig").mockReturnValue({
+      agentName: "openclaw",
+      configDir: "/sandbox/.openclaw",
+      configPath: "/sandbox/.openclaw/openclaw.json",
+      configFile: "openclaw.json",
+      format: "json",
+      stateLockPlanInImage: true,
+    });
+    const seedDashboard = vi.spyOn(sandboxConfig, "restoreHermesDashboardConfig");
+
+    const result = runRebuildRestorePhase({
+      sandboxName: "hermes",
+      targetAgentType: "hermes",
+      targetImageIsCustom: false,
+      backupManifest: { agentType: "hermes", backupPath: "/tmp/rebuild-backup" } as never,
+      policyPresets: [],
+      customPolicies: [],
+      reconcileManagedDcodeObservability: false,
+      log: vi.fn(),
+    });
+
+    expect(seedDashboard).not.toHaveBeenCalled();
+    expect(result.restoreSucceeded).toBe(false);
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining("Could not migrate restored Hermes dashboard state into its profile"),
+    );
+  });
+
+  it("surfaces a fresh OpenClaw plugin registry precondition failure", () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const log = vi.fn();
+    vi.spyOn(snapshotRestore, "restoreRecreatedSandboxStateWithManagedAuthority").mockReturnValue({
+      success: false,
+      restoredDirs: [],
+      restoredFiles: [],
+      failedDirs: ["extensions"],
+      failedFiles: [],
+      error: "could not read fresh OpenClaw plugin install registry",
+    });
+
+    const result = runStandardRebuildRestorePhase({
+      sandboxName: "alpha",
+      backupManifest: { agentType: "openclaw", backupPath: "/tmp/rebuild-backup" } as never,
+      policyPresets: [],
+      customPolicies: [],
+      reconcileManagedDcodeObservability: false,
+      log,
+    });
+
+    expect(result.restoreSucceeded).toBe(false);
+    expect(consoleError).toHaveBeenCalledWith(
+      "  Restore blocked: could not read fresh OpenClaw plugin install registry",
+    );
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("error=could not read fresh OpenClaw plugin install registry"),
+    );
+  });
+
+  it("replays custom web-policy names from exact content instead of same-name built-ins", () => {
+    vi.spyOn(console, "log").mockImplementation(() => undefined);
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const parsePresetPolicyKeys = vi.spyOn(policies, "parsePresetPolicyKeys");
+    const restoreRecreatedSandboxState = vi
+      .spyOn(snapshotRestore, "restoreRecreatedSandboxStateWithManagedAuthority")
+      .mockReturnValue({
+        success: true,
+        restoredDirs: [],
+        restoredFiles: [],
+        failedDirs: [],
+        failedFiles: [],
+      });
     const applyPreset = vi.spyOn(policies, "applyPreset").mockReturnValue(true);
     const applyPresetContent = vi.spyOn(policies, "applyPresetContent").mockReturnValue(true);
     const customPolicies = ["brave", "tavily", "nous-web"].map((name) => ({
@@ -42,9 +209,10 @@ describe("rebuild policy restore fidelity", () => {
       content: `network_policies:\n  ${name}-custom:\n    name: ${name}-custom\n`,
       sourcePath: `/tmp/${name}.yaml`,
     }));
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: {
+        agentType: "openclaw",
         backupPath: "/tmp/rebuild-backup",
         customPolicies,
       } as never,
@@ -54,6 +222,14 @@ describe("rebuild policy restore fidelity", () => {
       log: vi.fn(),
     });
 
+    expect(restoreRecreatedSandboxState).toHaveBeenCalledWith(
+      "alpha",
+      expect.objectContaining({ backupPath: "/tmp/rebuild-backup" }),
+      {
+        targetAgentType: "openclaw",
+      },
+      { getSandbox: expect.any(Function) },
+    );
     expect(applyPreset).toHaveBeenCalledOnce();
     expect(applyPreset).toHaveBeenCalledWith("alpha", "npm");
     for (const entry of customPolicies) {
@@ -79,14 +255,20 @@ describe("rebuild policy restore fidelity", () => {
       failedFiles: [],
     });
     const applyPresetContent = vi.spyOn(policies, "applyPresetContent").mockReturnValue(true);
+    const privateContent =
+      "network_policies:\n  custom-egress:\n    endpoints:\n      - host: api.corp.example\n        allowed_ips: [10.20.30.40]\n";
     const customPolicies = [
       {
         name: "custom-egress",
-        content: "network_policies:\n  custom-egress: {}\n",
+        content: privateContent,
         sourcePath: "/tmp/custom-egress.yaml",
+        trustedPrivatePins: {
+          version: 1 as const,
+          contentDigest: createHash("sha256").update(privateContent).digest("hex"),
+        },
       },
     ];
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: [],
@@ -99,7 +281,14 @@ describe("rebuild policy restore fidelity", () => {
       "alpha",
       "custom-egress",
       customPolicies[0]!.content,
-      { custom: { sourcePath: "/tmp/custom-egress.yaml" } },
+      {
+        custom: {
+          sourcePath: "/tmp/custom-egress.yaml",
+          trustedPrivatePinCapability: expect.objectContaining({
+            receipt: customPolicies[0]!.trustedPrivatePins,
+          }),
+        },
+      },
     );
     expect(result.restoredPresets).toEqual(["custom-egress"]);
     expect(result.finalPresets).toEqual(["custom-egress"]);
@@ -119,7 +308,7 @@ describe("rebuild policy restore fidelity", () => {
         "network_policies:\n  mcp-bridge-search:\n    endpoints:\n      - host: mcp.example.com\n        allowed_ips: [203.0.113.10]\n",
       sourcePath: MCP_BRIDGE_POLICY_SOURCE,
     };
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: [],
@@ -148,7 +337,7 @@ describe("rebuild policy restore fidelity", () => {
       .mockReturnValueOnce("absent");
     const removePreset = vi.spyOn(policies, "removePreset").mockReturnValue(true);
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: ["npm"],
@@ -173,7 +362,7 @@ describe("rebuild policy restore fidelity", () => {
       .mockReturnValueOnce(null);
     vi.spyOn(policies, "removePreset").mockReturnValue(true);
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: ["npm"],
@@ -203,7 +392,7 @@ describe("rebuild policy restore fidelity", () => {
         throw new Error("apply failed");
       });
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: ["npm", "bad", "throw"],
@@ -224,7 +413,7 @@ describe("rebuild policy restore fidelity", () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(policies, "applyPreset").mockReturnValue(true);
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: ["observability-otlp-local"],
@@ -245,7 +434,7 @@ describe("rebuild policy restore fidelity", () => {
     vi.spyOn(policies, "applyPreset").mockReturnValue(true);
     vi.spyOn(policies, "getPresetContentGatewayState").mockReturnValue(null);
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: ["observability-otlp-local"],
@@ -261,7 +450,7 @@ describe("rebuild policy restore fidelity", () => {
   it("does not remove or persist DCode base-policy keys detected as broad presets", () => {
     const removePreset = vi.spyOn(policies, "removePreset");
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: [],
@@ -286,7 +475,7 @@ describe("rebuild policy restore fidelity", () => {
       sourcePath: "/tmp/operator-collector.yaml",
     };
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: [],
@@ -318,7 +507,7 @@ describe("rebuild policy restore fidelity", () => {
       sourcePath: "/tmp/corp-otel.yaml",
     };
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: [],
@@ -352,7 +541,7 @@ describe("rebuild policy restore fidelity", () => {
       .mockReturnValueOnce("absent");
     const removePreset = vi.spyOn(policies, "removePreset").mockReturnValue(true);
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: ["observability-otlp-local"],
@@ -381,7 +570,7 @@ describe("rebuild policy restore fidelity", () => {
       .mockReturnValueOnce("absent");
     const removePreset = vi.spyOn(policies, "removePreset").mockReturnValue(true);
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: [],
@@ -409,7 +598,7 @@ describe("rebuild policy restore fidelity", () => {
     vi.spyOn(policies, "getPresetContentGatewayState").mockReturnValue("drift");
     const removePreset = vi.spyOn(policies, "removePreset");
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: [],
@@ -436,7 +625,7 @@ describe("rebuild policy restore fidelity", () => {
       .mockReturnValueOnce(null);
     vi.spyOn(policies, "removePreset").mockReturnValue(true);
 
-    const result = runRebuildRestorePhase({
+    const result = runStandardRebuildRestorePhase({
       sandboxName: "alpha",
       backupManifest: null,
       policyPresets: ["observability-otlp-local"],
@@ -470,5 +659,26 @@ describe("rebuild policy restore fidelity", () => {
       resolveRestoredPolicyRegistryState({ policyPresetsFinalized: true }, [], ["tavily"])
         .policyPresetsFinalized,
     ).toBeUndefined();
+  });
+
+  it("retains the force-skipped backup warning in the successful final summary", () => {
+    const writeLine = vi.fn();
+
+    printSuccessfulRebuildSummary(
+      {
+        sandboxName: "alpha",
+        backupManifest: null,
+        backupWasForceSkipped: true,
+        staleRecovery: false,
+        rebuiltAgentName: "OpenClaw",
+        expectedVersion: "2026.6.10",
+      },
+      writeLine,
+    );
+
+    const output = writeLine.mock.calls.flat().join("\n");
+    expect(output).toContain("Sandbox 'alpha' rebuilt successfully");
+    expect(output).toContain("Backup was skipped via --force after a total backup failure");
+    expect(output).toContain("prior workspace state was not preserved");
   });
 });

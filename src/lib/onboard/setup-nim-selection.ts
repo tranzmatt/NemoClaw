@@ -1,12 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { applyCompatibleEndpointContextWindow } from "../inference/compatible-endpoint-context";
+import type { TrustedPrivateEndpointCapability } from "../inference/endpoint-ssrf-preflight";
 import type { GatewayRouteDiscoveryConstraints } from "../inference/gateway-route-compatibility";
+import { getProbeExtraHeaders } from "../inference/onboard-probes";
+import type { OnboardInferenceCapabilityCache } from "./inference-capability-cache";
 import type { NvidiaFeaturedModelSession } from "./nvidia-featured-model-selection";
+import type { ReasoningEffort } from "./reasoning-mode";
 
 export { createNvidiaFeaturedModelSession } from "./nvidia-featured-model-selection";
 
 export type SetupNimSelectionBackNavigation = Readonly<{ kind: "NEMOCLAW_BACK_TO_SELECTION" }>;
+
+/** Defaults passed into Ollama model selection and runtime context adoption. */
+export type OllamaModelSelectionDefaults = {
+  requestedModel: string | null;
+  recoveredModel: string | null;
+  lockedModel?: string | null;
+  /** Minimum runtime context window required by the selected agent. */
+  contextWindowFloor?: number;
+  /** Interactive prompt default from provider/model environment variables. */
+  promptDefaultModel?: string | null;
+};
 
 export type SetupNimSelectionState<THermesAuthMethod = unknown> = {
   model: string | SetupNimSelectionBackNavigation | null;
@@ -17,11 +33,23 @@ export type SetupNimSelectionState<THermesAuthMethod = unknown> = {
   hermesToolGateways: string[];
   preferredInferenceApi: string | null;
   compatibleEndpointReasoning?: string | null;
+  compatibleEndpointReasoningEffort?: string | null;
   nimContainer: string | null;
   allowToolsIncompatible: boolean;
+  /** Minimum Ollama daemon context length to request for this agent. */
+  ollamaContextWindowFloor?: number;
   skipHostInferenceSmoke?: boolean;
+  /** Public addresses approved for the selected custom endpoint. */
+  endpointPinnedAddresses?: string[];
+  /** Non-forgeable proof of the exact host and complete pins admitted by the selected preflight. */
+  endpointTrustedPrivateCapability?: TrustedPrivateEndpointCapability;
   reuseGatewayCredentialWithoutLocalKey?: boolean;
+  /** Ephemeral selection-to-smoke validation cache; never written to session state. */
+  inferenceCapabilityCache?: OnboardInferenceCapabilityCache;
+  /** Route-validated vLLM checkpoint identity; ephemeral and never persisted directly. */
+  vllmModelIdentity?: string;
   nvidiaFeaturedModels?: NvidiaFeaturedModelSession;
+  openRouterFeaturedModels?: NvidiaFeaturedModelSession;
   /** Attempt-wide shared-gateway guard, invoked after identity selection and before probes. */
   assertRouteCompatible?: () => GatewayRouteDiscoveryConstraints;
 };
@@ -49,6 +77,9 @@ export function applyCloudFallbackSelection(
   state.allowToolsIncompatible = false;
   state.skipHostInferenceSmoke = false;
   state.reuseGatewayCredentialWithoutLocalKey = false;
+  delete state.vllmModelIdentity;
+  delete state.endpointPinnedAddresses;
+  delete state.endpointTrustedPrivateCapability;
 }
 
 export function clearNimContainerBeforeRetry(state: SetupNimSelectionState): void {
@@ -103,10 +134,18 @@ type ProbeOptions = {
   requireResponsesToolCalling?: boolean;
   skipResponsesProbe?: boolean;
   authMode?: ProbeAuthMode;
+  extraHeaders?: readonly string[];
+  capabilityCache?: OnboardInferenceCapabilityCache;
 };
 
 type ValidationResult =
-  | { ok: true; api: string | null; retry?: never }
+  | {
+      ok: true;
+      api: string | null;
+      retry?: never;
+      pinnedAddresses?: string[];
+      trustedPrivateCapability?: TrustedPrivateEndpointCapability;
+    }
   | { ok: false; api?: string; retry?: "credential" | "retry" | "model" | "selection" | string };
 
 type RemoteModelValidationResult = "selected" | "retry-model" | "retry-selection";
@@ -122,6 +161,7 @@ type RemoteModelValidatorDeps = {
     model: string,
     credentialEnv: string,
     helpUrl: string | null,
+    capabilityCache?: OnboardInferenceCapabilityCache,
   ) => Promise<ValidationResult>;
   validateCustomAnthropicSelection: (
     label: string,
@@ -153,7 +193,9 @@ type RemoteModelValidatorDeps = {
   shouldRequireResponsesToolCalling: (provider: string) => boolean;
   shouldSkipResponsesProbe: (provider: string) => boolean;
   getProbeAuthMode: (provider: string) => ProbeAuthMode;
+  getProbeExtraHeaders?: (provider: string) => readonly string[];
   configureCompatibleEndpointReasoning?: () => Promise<"true" | "false">;
+  configureCompatibleEndpointReasoningEffort?: () => Promise<ReasoningEffort | null>;
   log?: (message: string) => void;
 };
 
@@ -194,6 +236,8 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
       selectedCredentialEnv,
       intendedInferenceApi = "anthropic-messages",
     }) => {
+      delete state.endpointPinnedAddresses;
+      delete state.endpointTrustedPrivateCapability;
       const selectedModel = deps.requireValue(
         deps.isBackToSelection(state.model) ? null : state.model,
         `Missing model for ${remoteConfig.label}`,
@@ -204,6 +248,8 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
         if (reasoning) {
           state.compatibleEndpointReasoning = reasoning;
         }
+        const reasoningEffort = await deps.configureCompatibleEndpointReasoningEffort?.();
+        state.compatibleEndpointReasoningEffort = reasoningEffort ?? null;
         if (reasoning === "true") {
           (deps.log ?? console.log)(
             "  ⚠ Reasoning mode validates Chat Completions only; tools and streaming are unverified.",
@@ -215,8 +261,23 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
           selectedModel,
           selectedCredentialEnv,
           remoteConfig.helpUrl,
+          state.inferenceCapabilityCache,
         );
         if (validation.ok) {
+          if (validation.pinnedAddresses)
+            state.endpointPinnedAddresses = validation.pinnedAddresses;
+          else delete state.endpointPinnedAddresses;
+          if (validation.trustedPrivateCapability)
+            state.endpointTrustedPrivateCapability = validation.trustedPrivateCapability;
+          else delete state.endpointTrustedPrivateCapability;
+          // Probe the endpoint's runtime max_model_len so a custom vLLM endpoint
+          // gets its real context window baked in instead of a small
+          // architecture default; an explicit override always wins (#6177).
+          await applyCompatibleEndpointContextWindow(
+            state.endpointUrl || deps.OPENAI_ENDPOINT_URL,
+            selectedModel,
+            { credentialEnv: selectedCredentialEnv },
+          );
           const explicitApi = (process.env.NEMOCLAW_PREFERRED_API || "").trim().toLowerCase();
           if (
             explicitApi &&
@@ -251,6 +312,12 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
           { intendedApi },
         );
         if (validation.ok) {
+          if (validation.pinnedAddresses)
+            state.endpointPinnedAddresses = validation.pinnedAddresses;
+          else delete state.endpointPinnedAddresses;
+          if (validation.trustedPrivateCapability)
+            state.endpointTrustedPrivateCapability = validation.trustedPrivateCapability;
+          else delete state.endpointTrustedPrivateCapability;
           state.preferredInferenceApi = validation.api;
           return "selected";
         }
@@ -291,6 +358,9 @@ export function createRemoteModelValidator(deps: RemoteModelValidatorDeps): {
           requireResponsesToolCalling: deps.shouldRequireResponsesToolCalling(state.provider),
           skipResponsesProbe: deps.shouldSkipResponsesProbe(state.provider),
           authMode: deps.getProbeAuthMode(state.provider),
+          extraHeaders:
+            deps.getProbeExtraHeaders?.(state.provider) ?? getProbeExtraHeaders(state.provider),
+          capabilityCache: state.inferenceCapabilityCache,
         },
       );
       if (validation.ok) {

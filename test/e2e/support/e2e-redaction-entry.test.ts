@@ -22,11 +22,36 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { ArtifactSink } from "../fixtures/artifacts.ts";
-import { buildChildEnv, redactString } from "../fixtures/redaction.ts";
+import { startTestProgress } from "../fixtures/progress.ts";
+import { buildChildEnv, isValidSecretEnvKey, redactString } from "../fixtures/redaction.ts";
 import { SecretStore } from "../fixtures/secrets.ts";
 import { ShellProbe, trustedShellCommand } from "../fixtures/shell-probe.ts";
 
+function supportProgress() {
+  return startTestProgress(
+    "ShellProbe redaction support",
+    ["run redaction probe", "verify redacted evidence"],
+    { logLine: () => undefined },
+  );
+}
+
 describe("fixture redaction entry point", () => {
+  it("recognizes pass env names only at exact or underscore-delimited boundaries", () => {
+    for (const key of ["PASS", "PASSWD", "CUSTOM_PASS", "CUSTOM_PASSWD"]) {
+      expect(isValidSecretEnvKey(key), key).toBe(true);
+    }
+    for (const key of ["COMPASS", "BYPASS", "PASSENGER_COUNT", "PASSED"]) {
+      expect(isValidSecretEnvKey(key), key).toBe(false);
+    }
+
+    expect(
+      buildChildEnv(
+        { COMPASS: "north", BYPASS: "allowed" },
+        { fixtureOverlay: {}, additionalAllowedEnv: ["COMPASS", "BYPASS"] },
+      ),
+    ).toMatchObject({ COMPASS: "north", BYPASS: "allowed" });
+  });
+
   it("passes only the workflow-owned trace directory through child env", () => {
     const childEnv = buildChildEnv(
       {
@@ -88,6 +113,15 @@ describe("fixture redaction entry point", () => {
     expect(out).not.toContain(canonical);
   });
 
+  it("keeps explicit sentinels stable without masking adjacent credential text", () => {
+    const explicit = "test-secret-aBcD";
+    const once = redactString(`TOKEN=${explicit}`, [explicit]);
+
+    expect(once).toBe("TOKEN=[REDACTED]");
+    expect(redactString(once)).toBe(once);
+    expect(redactString("TOKEN=prefix[REDACTED]suffix")).toBe("TOKEN=<REDACTED>");
+  });
+
   it("redacts a complete multi-segment LangSmith key without exposing its tail", () => {
     const canonical = `lsv2_sk_${"a".repeat(36)}_${"tail".repeat(3)}`;
 
@@ -117,6 +151,58 @@ describe("fixture redaction entry point", () => {
   it("returns the input unchanged when no explicit values are supplied and no shape matches", () => {
     expect(redactString("nothing sensitive here")).toBe("nothing sensitive here");
     expect(redactString("nothing sensitive here", [])).toBe("nothing sensitive here");
+  });
+
+  it("preserves managed credential references and non-credential JSON identifiers", () => {
+    const discordReference = "openshell:resolve:env:DISCORD_BOT_TOKEN";
+    const versionedReference = "openshell:resolve:env:v2237303833964223913_WECHAT_BOT_TOKEN";
+    const slackReference = "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN";
+    const discordAssignment = `DISCORD_BOT_TOKEN=${discordReference}`;
+    const text = JSON.stringify({
+      key: "agent:main:main",
+      replyMarker: "A2603-REPLY",
+      token: discordReference,
+      versionedToken: versionedReference,
+      botToken: slackReference,
+    });
+
+    expect(redactString(text)).toBe(text);
+    expect(redactString(discordAssignment)).toBe(discordAssignment);
+    const collision = `\uE000 NEMOCLAW_SAFE_CREDENTIAL_REFERENCE_0 \uE001 ${text}`;
+    expect(redactString(collision)).toBe(collision);
+    expect(redactString(text, [discordReference])).not.toContain(discordReference);
+    expect(redactString('{"replyToken":"opaqueCredentialPayloadZ1234567890"}')).toBe(
+      '{"replyToken":"<REDACTED>"}',
+    );
+
+    const privateKey = [
+      ["-----BEGIN", "PRIVATE KEY-----"].join(" "),
+      `opaquePrivateMaterial123 ${discordReference} morePrivateMaterial456`,
+      ["-----END", "PRIVATE KEY-----"].join(" "),
+    ].join("\n");
+    expect(redactString(privateKey)).toBe("<REDACTED>");
+  });
+
+  it.each([
+    ["attached suffix", "TOKEN=openshell:resolve:env:FOO-opaqueCredentialPayloadZ1234567890"],
+    ["dot suffix", "TOKEN=openshell:resolve:env:FOO.opaqueCredentialPayloadZ1234567890"],
+    ["slash suffix", "TOKEN=openshell:resolve:env:FOO/opaqueCredentialPayloadZ1234567890"],
+    ["colon suffix", "TOKEN=openshell:resolve:env:FOO:opaqueCredentialPayloadZ1234567890"],
+    ["semicolon suffix", "TOKEN=openshell:resolve:env:FOO;opaqueCredentialPayloadZ1234567890"],
+    ["hash suffix", "TOKEN=openshell:resolve:env:FOO#opaqueCredentialPayloadZ1234567890"],
+    ["comma suffix", "TOKEN=openshell:resolve:env:FOO,opaqueCredentialPayloadZ1234567890"],
+    ["brace suffix", "TOKEN=openshell:resolve:env:FOO}opaqueCredentialPayloadZ1234567890"],
+    ["bracket suffix", "TOKEN=openshell:resolve:env:FOO]opaqueCredentialPayloadZ1234567890"],
+    ["nested assignment", "TOKEN=foo=openshell:resolve:env:FOO"],
+    ["short prefix", "TOKEN=short:openshell:resolve:env:FOO"],
+    ["oversized revision", `TOKEN=openshell:resolve:env:v${"1".repeat(21)}_FOO`],
+    ["oversized identifier", `TOKEN=openshell:resolve:env:${"A".repeat(129)}`],
+    ["mixed case", "TOKEN=OpenShell:Resolve:Env:FOO"],
+    ["lowercase Slack", "TOKEN=xoxb-openshell-resolve-env-SLACK_BOT_TOKEN"],
+  ])("redacts a managed-reference lookalike with $label", (_label, value) => {
+    const out = redactString(value);
+    expect(out).toContain("<REDACTED>");
+    expect(out).not.toContain(value.slice("TOKEN=".length));
   });
 
   it("returns empty input verbatim", () => {
@@ -190,6 +276,7 @@ describe("fixture redaction entry point", () => {
     );
     const probe = new ShellProbe({
       artifacts,
+      progress: supportProgress(),
       redact: (text, extra) => secrets.redact(text, extra),
       signal: new AbortController().signal,
     });
@@ -260,5 +347,92 @@ describe("fixture redaction entry point", () => {
     );
 
     await fs.rm(rootDir, { recursive: true, force: true });
+  });
+
+  it("bounds high-volume shell output while preserving a redacted diagnostic tail", async () => {
+    const secret = "fake-rebuild-output-secret-value";
+    const boundarySecret = "fake-secret-that-crosses-the-capture-boundary";
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "nemoclaw-e2e-bounded-output-"));
+    try {
+      const artifacts = new ArtifactSink(path.join(rootDir, "e2e-artifacts/live/bounded-output"));
+      await artifacts.ensureRoot();
+      const probe = new ShellProbe({
+        artifacts,
+        progress: supportProgress(),
+        redact: (text, extra) => redactString(text, extra),
+        signal: new AbortController().signal,
+      });
+      const stdoutSuffix = `${secret}-stdout-tail`;
+      const stdoutTail = `${"t".repeat(84 - stdoutSuffix.length)}${stdoutSuffix}`;
+      const stdoutPayload = `${"o".repeat(64)}${boundarySecret}${stdoutTail}`;
+      const stderrSuffix = `${secret}-stderr-tail`;
+      const stderrTail = `${"t".repeat(94 - stderrSuffix.length)}${stderrSuffix}`;
+      const stderrPayload = `${"e".repeat(64)}🦀${stderrTail}`;
+
+      const result = await probe.run(
+        trustedShellCommand({
+          command: "bash",
+          args: ["-lc", 'printf "%s" "$STDOUT_PAYLOAD"; printf "%s" "$STDERR_PAYLOAD" >&2'],
+          reason: "exercise bounded output capture for long E2E commands",
+        }),
+        {
+          artifactName: "bounded-output",
+          captureLimitBytes: 96,
+          env: { STDOUT_PAYLOAD: stdoutPayload, STDERR_PAYLOAD: stderrPayload },
+          redactionValues: [secret, boundarySecret],
+        },
+      );
+
+      expect(result.stdout).toContain("[shell-probe omitted ");
+      expect(result.stdout).toContain("[REDACTED]-stdout-tail");
+      expect(result.stdout).not.toContain(boundarySecret.slice(-12));
+      expect(result.stderr).toContain("[shell-probe omitted ");
+      expect(result.stderr).toContain("[REDACTED]-stderr-tail");
+      expect(result.stderr).not.toContain("�");
+      expect(result.stdout).not.toContain(secret);
+      expect(result.stderr).not.toContain(secret);
+      await expect(fs.readFile(result.artifacts.stdout, "utf8")).resolves.toBe(result.stdout);
+      await expect(fs.readFile(result.artifacts.stderr, "utf8")).resolves.toBe(result.stderr);
+      await expect(fs.readFile(result.artifacts.result, "utf8")).resolves.not.toContain(secret);
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    0,
+    -1,
+    1.5,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1,
+  ])("rejects invalid capture limit %s before spawning a child or writing artifacts", async (captureLimitBytes) => {
+    const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "nemoclaw-e2e-invalid-capture-"));
+    try {
+      const artifactRoot = path.join(rootDir, "e2e-artifacts/live/invalid-capture");
+      const spawnMarker = path.join(rootDir, "spawned.txt");
+      const artifacts = new ArtifactSink(artifactRoot);
+      await artifacts.ensureRoot();
+      const probe = new ShellProbe({
+        artifacts,
+        progress: supportProgress(),
+        redact: (text, extra) => redactString(text, extra),
+        signal: new AbortController().signal,
+      });
+
+      await expect(
+        probe.run(
+          trustedShellCommand({
+            command: "bash",
+            args: ["-lc", 'printf spawned >"$SPAWN_MARKER"'],
+            reason: "prove invalid output limits fail before child execution",
+          }),
+          { captureLimitBytes, env: { SPAWN_MARKER: spawnMarker } },
+        ),
+      ).rejects.toThrow("captureLimitBytes must be a positive safe integer");
+      await expect(fs.access(spawnMarker)).rejects.toThrow();
+      await expect(fs.readdir(artifactRoot)).resolves.toEqual([]);
+    } finally {
+      await fs.rm(rootDir, { recursive: true, force: true });
+    }
   });
 });

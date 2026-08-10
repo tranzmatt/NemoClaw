@@ -8,7 +8,11 @@ import path from "node:path";
 
 import type { ArtifactSink } from "../fixtures/artifacts.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
-import { assertExitZero as expectExitZero, shellQuote } from "../fixtures/clients/command.ts";
+import {
+  assertExitZero as expectExitZero,
+  resultText,
+  shellQuote,
+} from "../fixtures/clients/command.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import {
   type SandboxClient,
@@ -29,7 +33,7 @@ export const BASE_POLICY = path.join(
   "openclaw-sandbox.yaml",
 );
 export const FAKE_LIB_DIR = path.join(REPO_ROOT, "test", "e2e", "lib");
-export const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? `e2e-msg-provider-${process.pid}`;
+export const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? `e2e-msg-${process.pid}`;
 export const INSTALL_TIMEOUT_MS = 45 * 60_000;
 export const REBUILD_TIMEOUT_MS = 25 * 60_000;
 export const PROBE_TIMEOUT_MS = 120_000;
@@ -139,8 +143,8 @@ export function isUnresolvedPlaceholderRejection(text: string): boolean {
 
 export function isNvidiaEndpointRateLimitFailure(text: string): boolean {
   return (
-    /\b429\b|too many requests|rate limit/i.test(text) &&
-    /NVIDIA|endpoint|validation|models|inference/i.test(text)
+    /NVIDIA Endpoints endpoint validation failed/i.test(text) &&
+    /HTTP 429|too many requests|rate limit/i.test(text)
   );
 }
 
@@ -299,7 +303,7 @@ export function messagingEnv(): MessagingEnv {
   return { env, tokens, telegramIds, telegramAllowlistKey, slackIds, wechatAccount };
 }
 
-export async function bestEffort(run: () => Promise<unknown>): Promise<void> {
+export async function runSecondaryCleanup(run: () => Promise<unknown>): Promise<void> {
   try {
     await run();
   } catch {
@@ -612,15 +616,19 @@ export async function startFakeDockerApi(
   );
 
   cleanup(`remove ${container}`, async () => {
-    await bestEffort(() =>
-      runHost(host, "docker", ["rm", "-f", container], {
+    try {
+      const remove = await runHost(host, "docker", ["rm", "-f", container], {
         artifactName: `cleanup-${container}`,
         env: options.env,
         redactionValues: options.redactionValues,
         timeoutMs: 60_000,
-      }),
-    );
-    fs.rmSync(dir, { recursive: true, force: true });
+      });
+      if (remove.exitCode !== 0 && !/No such container:/iu.test(resultText(remove))) {
+        expectExitZero(remove, `remove fake ${options.kind} API container ${container}`);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   const start = await runHost(host, "docker", dockerArgs, {

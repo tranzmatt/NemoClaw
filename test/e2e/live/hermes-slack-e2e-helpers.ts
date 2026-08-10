@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { setTimeout as sleep } from "node:timers/promises";
+import { cleanupWhenOpenShellAvailable } from "../fixtures/cleanup-resources.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import type { SandboxClient } from "../fixtures/clients/sandbox.ts";
 import { type E2ETargetFixtures, expect } from "../fixtures/e2e-test.ts";
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 import {
-  bestEffort,
+  runSecondaryCleanup as bestEffortLifecycleCleanup,
   CLI,
   dockerInfo,
   expectExitZero,
@@ -15,9 +16,10 @@ import {
   phase6Env,
   precleanSandbox,
   resultText,
-  sandboxEncodedSh,
   sandboxSh,
+  sandboxShWithArgs,
   shellQuote,
+  trackPreinstallSandboxCleanup,
 } from "./phase6-messaging-helpers.ts";
 
 const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-hermes-slack";
@@ -61,14 +63,14 @@ function redactions(apiKey?: string): string[] {
   );
 }
 
-async function cleanupHermesSlack(options: {
+async function precleanHermesSlack(options: {
   host: HostCliClient;
   apiKey?: string;
   artifactPrefix: string;
 }): Promise<void> {
   const env = hermesSlackEnv(options.apiKey);
   const redactionValues = redactions(options.apiKey);
-  await bestEffort(() =>
+  await bestEffortLifecycleCleanup(() =>
     options.host.command("node", [CLI, SANDBOX_NAME, "destroy", "--yes"], {
       artifactName: `${options.artifactPrefix}-nemoclaw-destroy`,
       env,
@@ -76,8 +78,8 @@ async function cleanupHermesSlack(options: {
       timeoutMs: 15 * 60_000,
     }),
   );
-  await bestEffort(() =>
-    options.host.command("openshell", ["sandbox", "delete", SANDBOX_NAME], {
+  await bestEffortLifecycleCleanup(() =>
+    options.host.command(options.host.openshellCommandPath, ["sandbox", "delete", SANDBOX_NAME], {
       artifactName: `${options.artifactPrefix}-openshell-sandbox-delete`,
       env,
       redactionValues,
@@ -85,8 +87,8 @@ async function cleanupHermesSlack(options: {
     }),
   );
   for (const provider of [`${SANDBOX_NAME}-slack-bridge`, `${SANDBOX_NAME}-slack-app`]) {
-    await bestEffort(() =>
-      options.host.command("openshell", ["provider", "delete", provider], {
+    await bestEffortLifecycleCleanup(() =>
+      options.host.command(options.host.openshellCommandPath, ["provider", "delete", provider], {
         artifactName: `${options.artifactPrefix}-openshell-provider-delete-${provider}`,
         env,
         redactionValues,
@@ -94,14 +96,44 @@ async function cleanupHermesSlack(options: {
       }),
     );
   }
-  await bestEffort(() =>
-    options.host.command("openshell", ["gateway", "destroy", "-g", "nemoclaw"], {
-      artifactName: `${options.artifactPrefix}-openshell-gateway-destroy`,
-      env,
-      redactionValues,
-      timeoutMs: 120_000,
-    }),
+  await bestEffortLifecycleCleanup(() =>
+    options.host.command(
+      options.host.openshellCommandPath,
+      ["gateway", "destroy", "-g", "nemoclaw"],
+      {
+        artifactName: `${options.artifactPrefix}-openshell-gateway-destroy`,
+        env,
+        redactionValues,
+        timeoutMs: 120_000,
+      },
+    ),
   );
+}
+
+async function cleanupHermesSlackProvider(options: {
+  host: HostCliClient;
+  apiKey?: string;
+  provider: string;
+}): Promise<void> {
+  const result = await options.host.command(
+    options.host.openshellCommandPath,
+    ["provider", "delete", options.provider],
+    {
+      artifactName: `cleanup-hermes-slack-openshell-provider-delete-${options.provider}`,
+      env: hermesSlackEnv(options.apiKey),
+      redactionValues: redactions(options.apiKey),
+      timeoutMs: 60_000,
+    },
+  );
+  if (
+    result.exitCode === 0 ||
+    /\bNotFound\b|provider[^\n]*(?:not found|does not exist)|no such provider/i.test(
+      resultText(result),
+    )
+  ) {
+    return;
+  }
+  expectExitZero(result, `cleanup OpenShell provider ${options.provider}`);
 }
 
 async function hostSlackTokenStdin(options: {
@@ -115,7 +147,7 @@ async function hostSlackTokenStdin(options: {
     "set -euo pipefail",
     "ssh_config=$(mktemp)",
     "trap 'rm -f \"$ssh_config\"' EXIT",
-    `openshell sandbox ssh-config ${shellQuote(SANDBOX_NAME)} >"$ssh_config"`,
+    `${shellQuote(options.host.openshellCommandPath)} sandbox ssh-config ${shellQuote(SANDBOX_NAME)} >"$ssh_config"`,
     [
       'printf "%s\\n%s\\n" "$SLACK_BOT_TOKEN" "$SLACK_APP_TOKEN"',
       "|",
@@ -125,7 +157,7 @@ async function hostSlackTokenStdin(options: {
       "-o UserKnownHostsFile=/dev/null",
       "-o ConnectTimeout=10",
       "-o LogLevel=ERROR",
-      shellQuote(`openshell-${SANDBOX_NAME}`),
+      shellQuote(`openshell-${SANDBOX_NAME}.default`),
       shellQuote(options.remoteCommand),
     ].join(" "),
   ].join("\n");
@@ -145,7 +177,7 @@ async function expectProvider(options: {
   artifactName: string;
 }): Promise<void> {
   const result = await options.host.command(
-    "openshell",
+    options.host.openshellCommandPath,
     ["provider", "get", options.providerName],
     {
       artifactName: options.artifactName,
@@ -189,7 +221,7 @@ async function providerExists(options: {
   artifactName: string;
 }): Promise<boolean> {
   const result = await options.host.command(
-    "openshell",
+    options.host.openshellCommandPath,
     ["provider", "get", options.providerName],
     {
       artifactName: options.artifactName,
@@ -209,6 +241,7 @@ export async function runHermesSlackE2E({
   artifacts,
   cleanup,
   host,
+  progress,
   sandbox,
   secrets,
   skip,
@@ -217,9 +250,52 @@ export async function runHermesSlackE2E({
   const env = hermesSlackEnv(apiKey);
   const redactionValues = redactions(apiKey);
 
-  cleanup.add(`destroy Hermes Slack sandbox ${SANDBOX_NAME}`, async () => {
-    await cleanupHermesSlack({ host, apiKey, artifactPrefix: "cleanup-hermes-slack" });
-  });
+  const gatewayCleanupOptions = {
+    artifactName: "cleanup-hermes-slack-openshell-gateway-destroy",
+    env,
+    redactionValues,
+    timeoutMs: 120_000,
+  };
+  cleanup.trackGateway(
+    {
+      cleanupGatewayRegistration: (name: string) =>
+        cleanupWhenOpenShellAvailable(
+          host,
+          {
+            artifactName: "cleanup-hermes-slack-probe-openshell-gateway",
+            env,
+            redactionValues,
+            timeoutMs: 30_000,
+          },
+          () => host.cleanupGatewayRegistration(name, gatewayCleanupOptions),
+        ),
+    },
+    "nemoclaw",
+    gatewayCleanupOptions,
+  );
+  for (const provider of [`${SANDBOX_NAME}-slack-app`, `${SANDBOX_NAME}-slack-bridge`]) {
+    cleanup.trackDisposable(`delete OpenShell provider ${provider}`, () =>
+      cleanupWhenOpenShellAvailable(
+        host,
+        {
+          artifactName: `cleanup-hermes-slack-probe-openshell-provider-${provider}`,
+          env,
+          redactionValues,
+          timeoutMs: 30_000,
+        },
+        () => cleanupHermesSlackProvider({ host, apiKey, provider }),
+      ),
+    );
+  }
+  trackPreinstallSandboxCleanup(
+    cleanup,
+    host,
+    sandbox,
+    SANDBOX_NAME,
+    env,
+    redactionValues,
+    "cleanup-hermes-slack",
+  );
 
   await artifacts.target.declare({
     id: "hermes-slack-e2e",
@@ -237,9 +313,10 @@ export async function runHermesSlackE2E({
     return;
   }
 
-  await cleanupHermesSlack({ host, apiKey, artifactPrefix: "preclean-hermes-slack" });
+  await precleanHermesSlack({ host, apiKey, artifactPrefix: "preclean-hermes-slack" });
   await precleanSandbox(host, SANDBOX_NAME, env, redactionValues, "preclean-hermes-slack-cli");
 
+  progress.phase("install Hermes Slack sandbox");
   const install = await installSandboxOrSkipOnRateLimit(
     host,
     env,
@@ -252,7 +329,12 @@ export async function runHermesSlackE2E({
 
   const cliProbe = await host.command(
     "bash",
-    ["-lc", "command -v nemoclaw && command -v openshell && openshell --version"],
+    [
+      "-lc",
+      'command -v nemoclaw && command -v "$1" && "$1" --version',
+      "cli-probe-hermes-slack",
+      host.openshellCommandPath,
+    ],
     {
       artifactName: "phase-1-cli-probe-hermes-slack",
       env,
@@ -264,6 +346,7 @@ export async function runHermesSlackE2E({
   expect(resultText(cliProbe)).toContain("nemoclaw");
   expect(resultText(cliProbe)).toContain("openshell");
 
+  progress.phase("validate Slack providers and Hermes health");
   const list = await host.command("node", [CLI, "list"], {
     artifactName: "phase-2-nemoclaw-list-hermes-slack",
     env,
@@ -288,7 +371,8 @@ export async function runHermesSlackE2E({
 
   await waitForHermesHealth({ sandbox, apiKey });
 
-  const configProbe = await sandboxEncodedSh(
+  progress.phase("inspect Slack config and secret isolation");
+  const configProbe = await sandboxShWithArgs(
     sandbox,
     SANDBOX_NAME,
     String.raw`python3 - <<'PY'
@@ -312,6 +396,11 @@ else:
         errors.append("platforms.slack missing or not a mapping")
     elif slack.get("enabled") is not True:
         errors.append(f"platforms.slack.enabled is not true ({slack!r})")
+    elif (
+        not isinstance(slack.get("extra"), dict)
+        or slack["extra"].get("rich_blocks") is not True
+    ):
+        errors.append(f"platforms.slack.extra.rich_blocks is not true ({slack!r})")
 if "SLACK_BOT_TOKEN" in config_text or "SLACK_APP_TOKEN" in config_text:
     errors.append("config.yaml contains Slack token env keys")
 if errors:
@@ -329,7 +418,44 @@ PY`,
   expectExitZero(configProbe, "Hermes Slack config shape probe");
   expect(configProbe.stdout.trim()).toBe("OK");
 
-  const envProbe = await sandboxEncodedSh(
+  const rendererProbe = await sandboxShWithArgs(
+    sandbox,
+    SANDBOX_NAME,
+    String.raw`python3 - <<'PY'
+import importlib.util
+from pathlib import Path
+
+renderer_path = Path("/opt/hermes/plugins/platforms/slack/block_kit.py")
+if not renderer_path.is_file():
+    print(f"FAIL Hermes Slack Block Kit renderer missing: {renderer_path}")
+    raise SystemExit
+
+spec = importlib.util.spec_from_file_location("hermes_slack_block_kit", renderer_path)
+if spec is None or spec.loader is None:
+    print("FAIL cannot load Hermes Slack Block Kit renderer")
+    raise SystemExit
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+markdown = "# Results\n\n| Check | Result |\n|:------|:------:|\n| Hermes | Pass |"
+blocks = module.render_blocks(markdown)
+types = [block.get("type") for block in blocks or []]
+if "header" not in types or "table" not in types:
+    print(f"FAIL expected header and native table Block Kit blocks, got {types!r}")
+else:
+    print("OK")
+PY`,
+    [],
+    {
+      artifactName: "phase-4-rich-block-renderer",
+      redactionValues,
+      timeoutMs: 60_000,
+    },
+  );
+  expectExitZero(rendererProbe, "Hermes Slack Block Kit renderer probe");
+  expect(rendererProbe.stdout.trim()).toBe("OK");
+
+  const envProbe = await sandboxShWithArgs(
     sandbox,
     SANDBOX_NAME,
     String.raw`python3 - <<'PY'
@@ -357,7 +483,7 @@ PY`,
   expectExitZero(envProbe, "Hermes Slack .env placeholder probe");
   expect(envProbe.stdout.trim()).toBe("OK");
 
-  const secretBoundaryProbe = await sandboxEncodedSh(
+  const secretBoundaryProbe = await sandboxShWithArgs(
     sandbox,
     SANDBOX_NAME,
     String.raw`python3 - <<'PY'
@@ -454,12 +580,17 @@ else:
   expectExitZero(processScan, "raw Slack token process scan");
   if (processScan.stdout.trim() !== "EMPTY") expect(processScan.stdout.trim()).toBe("OK");
 
-  const policy = await host.command("openshell", ["policy", "get", "--full", SANDBOX_NAME], {
-    artifactName: "phase-5-policy-get",
-    env,
-    redactionValues,
-    timeoutMs: 60_000,
-  });
+  progress.phase("validate Hermes-scoped Slack policy");
+  const policy = await host.command(
+    host.openshellCommandPath,
+    ["policy", "get", "--full", SANDBOX_NAME],
+    {
+      artifactName: "phase-5-policy-get",
+      env,
+      redactionValues,
+      timeoutMs: 60_000,
+    },
+  );
   expectExitZero(policy, "openshell policy get --full");
   const policyText = resultText(policy);
   const slackBlockMatch = policyText.match(/^  slack:[\s\S]*?(?=^  [A-Za-z0-9_-]+:|$(?![\s\S]))/m);
@@ -474,7 +605,7 @@ else:
   expect(slackBlock).toContain("wss-backup.slack.com");
   expect(slackBlock).toContain("request_body_credential_rewrite: true");
 
-  const bridgeResidue = await sandboxEncodedSh(
+  const bridgeResidue = await sandboxShWithArgs(
     sandbox,
     SANDBOX_NAME,
     String.raw`set +e
@@ -500,7 +631,8 @@ done`,
   expectExitZero(bridgeResidue, "Hermes Slack bridge residue probe");
   expect(resultText(bridgeResidue).trim()).toBe("");
 
-  const slackProbe = await sandboxEncodedSh(
+  progress.phase("exercise Slack API through credential aliases");
+  const slackProbe = await sandboxShWithArgs(
     sandbox,
     SANDBOX_NAME,
     String.raw`sh -lc '. /tmp/nemoclaw-proxy-env.sh 2>/dev/null || true; if [ -x /opt/hermes/.venv/bin/python ]; then exec /opt/hermes/.venv/bin/python -; fi; exec python3 -' <<'PY'
@@ -593,6 +725,7 @@ PY`,
   expect(slackProbeText).not.toMatch(/^(FAIL|ERROR)/m);
 
   if (process.env.NEMOCLAW_E2E_KEEP_SANDBOX !== "1") {
+    progress.phase("remove Hermes Slack sandbox");
     const destroy = await host.command("node", [CLI, SANDBOX_NAME, "destroy", "--yes"], {
       artifactName: "phase-7-nemoclaw-destroy",
       env,
@@ -600,8 +733,8 @@ PY`,
       timeoutMs: 15 * 60_000,
     });
     expectExitZero(destroy, "nemoclaw destroy Hermes Slack sandbox");
-    await bestEffort(() =>
-      host.command("openshell", ["gateway", "destroy", "-g", "nemoclaw"], {
+    await bestEffortLifecycleCleanup(() =>
+      host.command(host.openshellCommandPath, ["gateway", "destroy", "-g", "nemoclaw"], {
         artifactName: "phase-7-openshell-gateway-destroy",
         env,
         redactionValues,
@@ -637,6 +770,7 @@ PY`,
     }
   }
 
+  progress.phase("record Hermes Slack results");
   await artifacts.target.complete({
     id: "hermes-slack-e2e",
     assertions: {
@@ -644,6 +778,7 @@ PY`,
       slackProvidersCreated: true,
       hermesHealthOk: true,
       hermesSlackConfigShape: true,
+      hermesSlackRichBlockTableRendering: true,
       resolverPlaceholders: true,
       rawTokensAbsentFromFilesLogsAndProcesses: true,
       hermesScopedSlackPolicy: true,

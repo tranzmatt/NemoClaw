@@ -88,7 +88,7 @@ describe("docker-driver gateway runtime helpers", () => {
         },
         () => {
           const { helpers } = makeHelpers({
-            supportedOpenshellFallbackVersion: "0.0.99",
+            supportedOpenshellFallbackVersion: "0.0.101",
           });
 
           expect(helpers.getDockerDriverGatewayStateDir()).toBe(path.resolve(stateDir));
@@ -99,7 +99,7 @@ describe("docker-driver gateway runtime helpers", () => {
           expect(env.OPENSHELL_DOCKER_NETWORK_NAME).toBe("custom-openshell-docker");
           expect(env.OPENSHELL_DOCKER_SUPERVISOR_BIN).toBe(path.resolve(sandboxBin));
           expect(env.OPENSHELL_DOCKER_SUPERVISOR_IMAGE).toBe(
-            "ghcr.io/nvidia/openshell/supervisor:0.0.99",
+            "ghcr.io/nvidia/openshell/supervisor@sha256:b58be5e40c788977ffa0e8305a8cad9c656efdf1a3fe182582a00ca870bb0edb",
           );
           expect(env.OPENSHELL_GATEWAY_CONFIG).toBe(
             path.join(path.resolve(stateDir), "openshell-gateway.toml"),
@@ -130,19 +130,58 @@ describe("docker-driver gateway runtime helpers", () => {
     ).toBe("ghcr.io/nvidia/openshell/supervisor:dev");
   });
 
-  it("pins the stable 0.0.72 supervisor default while preserving an explicit override", () => {
+  it("pins the stable 0.0.101 supervisor default while preserving an explicit override", () => {
     const image = (fallback: string) =>
       makeHelpers({
-        getBlueprintMaxOpenshellVersion: () => "0.0.72",
+        getBlueprintMaxOpenshellVersion: () => "0.0.101",
         supportedOpenshellFallbackVersion: fallback,
       }).helpers.getDockerDriverGatewayEnv(null, "linux").OPENSHELL_DOCKER_SUPERVISOR_IMAGE;
-    const stable = withEnv({ OPENSHELL_DOCKER_SUPERVISOR_IMAGE: undefined }, () => image("0.0.72"));
+    const stable = withEnv({ OPENSHELL_DOCKER_SUPERVISOR_IMAGE: undefined }, () =>
+      image("0.0.101"),
+    );
     expect(stable).toBe(
-      "ghcr.io/nvidia/openshell/supervisor@sha256:80ed9cda5bf672fefdb9dcd4604b40a8b09c0891b6eb9d03e10227c7e3dfb49d",
+      "ghcr.io/nvidia/openshell/supervisor@sha256:b58be5e40c788977ffa0e8305a8cad9c656efdf1a3fe182582a00ca870bb0edb",
     );
     const override = "registry.example.test/supervisor@sha256:override";
-    expect(withEnv({ OPENSHELL_DOCKER_SUPERVISOR_IMAGE: override }, () => image("0.0.72"))).toBe(
+    expect(withEnv({ OPENSHELL_DOCKER_SUPERVISOR_IMAGE: override }, () => image("0.0.101"))).toBe(
       override,
+    );
+  });
+
+  it("pins the portable gateway config to the prepared rootless Podman socket", () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-podman-runtime-"));
+    try {
+      withEnv(
+        {
+          DOCKER_HOST: "unix:///run/user/1001/podman/podman.sock",
+          NEMOCLAW_EXPERIMENTAL_PROFILE: "portable",
+          NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR: stateDir,
+        },
+        () => {
+          const { helpers } = makeHelpers();
+          const env = helpers.getDockerDriverGatewayEnv(null, "linux");
+          expect(env.OPENSHELL_PODMAN_SOCKET).toBe("/run/user/1001/podman/podman.sock");
+          expect(fs.readFileSync(env.OPENSHELL_GATEWAY_CONFIG, "utf-8")).toContain(
+            'socket_path = "/run/user/1001/podman/podman.sock"',
+          );
+        },
+      );
+    } finally {
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a portable gateway without a prepared absolute Podman socket", () => {
+    withEnv(
+      {
+        DOCKER_HOST: undefined,
+        NEMOCLAW_EXPERIMENTAL_PROFILE: "portable",
+      },
+      () => {
+        expect(() => makeHelpers().helpers.getDockerDriverGatewayEnv(null, "linux")).toThrow(
+          "requires the prepared absolute rootless Podman socket",
+        );
+      },
     );
   });
 
@@ -199,15 +238,18 @@ describe("docker-driver gateway runtime helpers", () => {
           NEMOCLAW_OPENSHELL_GATEWAY_STATE_DIR: stateDir,
         },
         () => {
+          const processOutput = new Map([
+            [`ps -p ${pid} -o args=`, "openshell-gateway[nemoclaw=nemoclaw-18080;port=18080]\n"],
+            [
+              "ps -axo pid=,ppid=,command=",
+              [
+                `${pid} 1 ${gatewayBin}`,
+                `${pid + 1} ${pid} /usr/local/bin/openshell-driver-vm --bind-socket /tmp/vm.sock`,
+              ].join("\n"),
+            ],
+          ]);
           const { helpers, runCapture } = makeHelpers({
-            runCapture: vi.fn((args) =>
-              args.join(" ") === "ps -axo pid=,ppid=,command="
-                ? [
-                    `${pid} 1 ${gatewayBin}`,
-                    `${pid + 1} ${pid} /usr/local/bin/openshell-driver-vm --bind-socket /tmp/vm.sock`,
-                  ].join("\n")
-                : "",
-            ),
+            runCapture: vi.fn((args) => processOutput.get(args.join(" ")) ?? ""),
           });
           const desiredEnv = helpers.getDockerDriverGatewayEnv(null, "darwin");
           writeDockerDriverGatewayRuntimeMarkerForStateDir(stateDir, {
@@ -357,7 +399,9 @@ describe("docker-driver gateway runtime helpers", () => {
     const identityGatewayBin = "/opt/openshell/openshell-gateway";
     const replacementGatewayBin = "/opt/openshell/replaced/openshell-gateway";
     const desiredEnv = { OPENSHELL_DRIVERS: "docker" };
-    const { helpers } = makeHelpers();
+    const { helpers } = makeHelpers({
+      runCapture: vi.fn(() => "openshell-gateway[nemoclaw=nemoclaw-18080;port=18080]\n"),
+    });
     const originalExistsSync = fs.existsSync.bind(fs);
     const originalReadFileSync = fs.readFileSync.bind(fs);
     const originalReadlinkSync = fs.readlinkSync.bind(fs);
@@ -384,5 +428,67 @@ describe("docker-driver gateway runtime helpers", () => {
       helpers.getDockerDriverGatewayRuntimeDrift(pid, desiredEnv, identityGatewayBin, "linux")
         ?.reason,
     ).toBe(`executable=${replacementGatewayBin} (expected ${identityGatewayBin})`);
+  });
+
+  it("reuses a systemd-owned gateway without detached cleanup identity (#6903)", () => {
+    const pid = 12_350;
+    const gatewayBin = "/usr/bin/openshell-gateway";
+    const desiredEnv = { OPENSHELL_DRIVERS: "docker" };
+    const { helpers } = makeHelpers({
+      runCapture: vi.fn(() => gatewayBin),
+    });
+    const originalExistsSync = fs.existsSync.bind(fs);
+    const originalReadFileSync = fs.readFileSync.bind(fs);
+    const originalReadlinkSync = fs.readlinkSync.bind(fs);
+    const existingProcPaths = new Set([
+      `/proc/${pid}/cmdline`,
+      `/proc/${pid}/environ`,
+      `/proc/${pid}/exe`,
+    ]);
+    const procFileContents = new Map([
+      [`/proc/${pid}/cmdline`, `${gatewayBin}\0`],
+      [`/proc/${pid}/environ`, "OPENSHELL_DRIVERS=docker\0"],
+    ]);
+    try {
+      vi.spyOn(fs, "existsSync").mockImplementation(
+        ((candidate) =>
+          existingProcPaths.has(String(candidate)) ||
+          originalExistsSync(candidate)) as typeof fs.existsSync,
+      );
+      vi.spyOn(fs, "readFileSync").mockImplementation(
+        ((candidate, options) =>
+          procFileContents.get(String(candidate)) ??
+          originalReadFileSync(candidate, options as never)) as typeof fs.readFileSync,
+      );
+      vi.spyOn(fs, "readlinkSync").mockImplementation(((candidate, options) =>
+        String(candidate) === `/proc/${pid}/exe`
+          ? gatewayBin
+          : originalReadlinkSync(candidate, options as never)) as typeof fs.readlinkSync);
+
+      expect(
+        helpers.getDockerDriverGatewayRuntimeDrift(pid, desiredEnv, gatewayBin, "linux")?.reason,
+      ).toContain("lacks target-bound cleanup identity");
+      expect(
+        helpers.getDockerDriverGatewayReuseDrift(pid, desiredEnv, gatewayBin, pid, "linux"),
+      ).toBeNull();
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("reuses the active official Homebrew gateway without detached cleanup identity (#6903)", () => {
+    const pid = 12_351;
+    const gatewayBin = "/opt/homebrew/bin/openshell-gateway";
+    const { helpers } = makeHelpers();
+
+    expect(
+      helpers.getDockerDriverGatewayReuseDrift(
+        pid,
+        { OPENSHELL_DRIVERS: "docker" },
+        gatewayBin,
+        pid,
+        "darwin",
+      ),
+    ).toBeNull();
   });
 });

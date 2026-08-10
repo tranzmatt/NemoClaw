@@ -5,24 +5,30 @@ import fs from "node:fs";
 import path from "node:path";
 import { testTimeoutOptions } from "../../helpers/timeouts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
+import {
+  cleanupWhenCommandAvailable,
+  cleanupWhenOpenShellAvailable,
+} from "../fixtures/cleanup-resources.ts";
 import { resultText } from "../fixtures/clients/command.ts";
 import { validateSandboxName } from "../fixtures/clients/sandbox.ts";
 import { expect, test } from "../fixtures/e2e-test.ts";
 import { startFakeOpenAiCompatibleServer } from "../fixtures/fake-openai-compatible.ts";
 import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
 
-// Keep this free-standing and direct: the the contract is the real CLI +
+// Keep this free-standing and direct: the contract is the real CLI +
 // OpenShell/provider boundary for messaging credential reuse/rotation, not the
 // typed registry target steady-state probe path. The test drives the real
 // `nemoclaw onboard` CLI with fake provider tokens, preserving the provider
 // upsert, registry credential-hash, sandbox rebuild, and reuse assertions.
 
 const REGISTRY_FILE = path.join(process.env.HOME ?? "/tmp", ".nemoclaw", "sandboxes.json");
-const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? `e2e-token-rotation-${process.pid}`;
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? `e2e-tok-${process.pid}`;
 validateSandboxName(SANDBOX_NAME);
 
 const ONBOARD_TIMEOUT_MS = 25 * 60_000;
 const PHASE_TIMEOUT_MS = 40 * 60_000;
+
+process.env.NEMOCLAW_CLI_BIN ??= CLI_ENTRYPOINT;
 
 interface TokenSet {
   telegram: string;
@@ -258,10 +264,25 @@ async function destroyGatewayIfOpenshellExists(
   );
 }
 
+// biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
 test(
   "messaging token rotation rebuilds only the changed provider and reuses unchanged credentials",
-  testTimeoutOptions(PHASE_TIMEOUT_MS),
-  async ({ artifacts, cleanup, host, skip }) => {
+  {
+    ...testTimeoutOptions(PHASE_TIMEOUT_MS),
+    meta: {
+      e2ePhases: [
+        "confirm Docker and start hermetic inference",
+        "install the sandbox and confirm provider hashes",
+        "rotate only the Telegram provider",
+        "reuse the sandbox after the unchanged Telegram token",
+        "rotate only the Discord provider",
+        "reuse the sandbox after the unchanged Discord token",
+        "rotate only the Slack providers",
+        "reuse the sandbox and record rotation evidence",
+      ],
+    },
+  },
+  async ({ artifacts, cleanup, host, progress, sandbox, skip }) => {
     expect(
       fs.existsSync(CLI_ENTRYPOINT),
       "run `npm run build:cli` before live repo CLI targets",
@@ -284,10 +305,11 @@ test(
     const fakeOpenAI = await startFakeOpenAiCompatibleServer({
       chatContent: "OK",
       host: "0.0.0.0",
+      progress,
       publicHost: "host.openshell.internal",
       responseText: "OK",
     });
-    cleanup.add("stop fake OpenAI-compatible endpoint for token rotation", async () => {
+    cleanup.trackDisposable("stop fake OpenAI-compatible endpoint for token rotation", async () => {
       await artifacts.writeJson("fake-openai-compatible-requests.json", fakeOpenAI.requests());
       await fakeOpenAI.close();
     });
@@ -318,18 +340,71 @@ test(
     });
 
     const cleanupEnv = buildAvailabilityProbeEnv();
-    cleanup.add(`destroy token-rotation sandbox ${SANDBOX_NAME}`, async () => {
-      await host.command("node", [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes"], {
-        artifactName: "cleanup-nemoclaw-destroy-token-rotation",
-        env: cleanupEnv,
-        timeoutMs: 120_000,
-      });
-      await deleteSandboxIfOpenshellExists(host, "cleanup-openshell-sandbox-delete-token-rotation");
-      await destroyGatewayIfOpenshellExists(
+    const gatewayCleanupOptions = {
+      artifactName: "cleanup-openshell-gateway-destroy-token-rotation",
+      env: cleanupEnv,
+      redactionValues: redactionValues(),
+      timeoutMs: 60_000,
+    };
+    cleanup.trackGateway(
+      {
+        cleanupGatewayRegistration: (name: string) =>
+          cleanupWhenOpenShellAvailable(
+            host,
+            {
+              artifactName: "cleanup-probe-openshell-gateway-token-rotation",
+              env: gatewayCleanupOptions.env,
+              redactionValues: gatewayCleanupOptions.redactionValues,
+              timeoutMs: 30_000,
+            },
+            () => host.cleanupGatewayRegistration(name, gatewayCleanupOptions),
+          ),
+      },
+      "nemoclaw",
+      gatewayCleanupOptions,
+    );
+    const openshellSandboxCleanupOptions = {
+      artifactName: "cleanup-openshell-sandbox-delete-token-rotation",
+      env: cleanupEnv,
+      redactionValues: redactionValues(),
+      timeoutMs: 60_000,
+    };
+    cleanup.trackDisposable(`delete OpenShell sandbox ${SANDBOX_NAME}`, () =>
+      cleanupWhenOpenShellAvailable(
         host,
-        "cleanup-openshell-gateway-destroy-token-rotation",
-      );
-    });
+        {
+          artifactName: "cleanup-probe-openshell-sandbox-token-rotation",
+          env: openshellSandboxCleanupOptions.env,
+          redactionValues: openshellSandboxCleanupOptions.redactionValues,
+          timeoutMs: 30_000,
+        },
+        () => sandbox.cleanupSandbox(SANDBOX_NAME, openshellSandboxCleanupOptions),
+      ),
+    );
+    const nemoclawSandboxCleanupOptions = {
+      artifactName: "cleanup-nemoclaw-destroy-token-rotation",
+      env: cleanupEnv,
+      redactionValues: redactionValues(),
+      timeoutMs: 120_000,
+    };
+    cleanup.trackSandbox(
+      {
+        cleanupSandbox: (name: string) =>
+          cleanupWhenCommandAvailable(
+            host,
+            host.commandPath,
+            {
+              artifactName: "cleanup-probe-nemoclaw-sandbox-token-rotation",
+              env: nemoclawSandboxCleanupOptions.env,
+              redactionValues: nemoclawSandboxCleanupOptions.redactionValues,
+              timeoutMs: 30_000,
+            },
+            () => host.cleanupSandbox(name, nemoclawSandboxCleanupOptions),
+          ),
+      },
+      SANDBOX_NAME,
+      nemoclawSandboxCleanupOptions,
+    );
 
     await host.command("node", [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes"], {
       artifactName: "pre-cleanup-nemoclaw-destroy-token-rotation",
@@ -345,6 +420,7 @@ test(
       "pre-cleanup-openshell-gateway-destroy-token-rotation",
     );
 
+    progress.phase("install the sandbox and confirm provider hashes");
     const first = await runInstall(host, fakeOpenAI.baseUrl, TOKEN_A, {
       NEMOCLAW_RECREATE_SANDBOX: "1",
     });
@@ -365,12 +441,13 @@ test(
       },
     );
     expect(retainBuildCache.exitCode, resultText(retainBuildCache)).toBe(0);
-    cleanup.add("remove token-rotation build cache tag", async () => {
-      await host.command("docker", ["image", "rm", cacheImageTag], {
+    cleanup.trackDisposable("remove token-rotation build cache tag", async () => {
+      const remove = await host.command("docker", ["image", "rm", cacheImageTag], {
         artifactName: "cleanup-token-rotation-build-cache",
         env: buildAvailabilityProbeEnv(),
         timeoutMs: 30_000,
       });
+      expect(remove.exitCode, resultText(remove)).toBe(0);
     });
 
     const openshellVersion = await host.command("openshell", ["--version"], {
@@ -404,6 +481,7 @@ test(
     }
     await assertSandboxRunning(host, "phase-1-sandbox-running-after-install");
 
+    progress.phase("rotate only the Telegram provider");
     const telegram = await runOnboard(
       host,
       fakeOpenAI.baseUrl,
@@ -423,6 +501,7 @@ test(
     );
     await assertSandboxRunning(host, "phase-2-sandbox-running-after-telegram-rotation");
 
+    progress.phase("reuse the sandbox after the unchanged Telegram token");
     const afterTelegramSame = await runOnboard(
       host,
       fakeOpenAI.baseUrl,
@@ -434,6 +513,7 @@ test(
     expect(afterTelegramSameText).toContain(`Sandbox '${SANDBOX_NAME}' exists and is ready`);
     expect(afterTelegramSameText).toContain("reusing it");
 
+    progress.phase("rotate only the Discord provider");
     const discord = await runOnboard(
       host,
       fakeOpenAI.baseUrl,
@@ -453,6 +533,7 @@ test(
     );
     await assertSandboxRunning(host, "phase-4-sandbox-running-after-discord-rotation");
 
+    progress.phase("reuse the sandbox after the unchanged Discord token");
     const afterDiscordSame = await runOnboard(
       host,
       fakeOpenAI.baseUrl,
@@ -464,6 +545,7 @@ test(
     expect(afterDiscordSameText).toContain(`Sandbox '${SANDBOX_NAME}' exists and is ready`);
     expect(afterDiscordSameText).toContain("reusing it");
 
+    progress.phase("rotate only the Slack providers");
     const slack = await runOnboard(host, fakeOpenAI.baseUrl, TOKEN_B, "phase-6-rotate-slack");
     const slackText = resultText(slack);
     expect(slack.exitCode, slackText).toBe(0);
@@ -474,6 +556,7 @@ test(
     );
     await assertSandboxRunning(host, "phase-6-sandbox-running-after-slack-rotation");
 
+    progress.phase("reuse the sandbox and record rotation evidence");
     const afterSlackSame = await runOnboard(
       host,
       fakeOpenAI.baseUrl,

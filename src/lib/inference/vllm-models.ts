@@ -5,8 +5,9 @@
  * Registry of models the express vLLM install path knows how to serve.
  *
  * Each entry pins the model-specific `vllm serve` flags (reasoning parser,
- * tool-call parser, max model length, load format) so the express path can
- * swap models without leaving the wrong flags behind.
+ * tool-call parser, max model length, load format) and any required runtime
+ * image/container overrides so the express path can swap models without
+ * leaving the wrong recipe behind.
  *
  * Selection precedence in `installVllm`:
  *   1. `NEMOCLAW_VLLM_MODEL=<envValue-or-HF-id>` for automation overrides.
@@ -26,7 +27,43 @@
  * envelope, and tool-call behaviour validated.
  */
 
+import net from "node:net";
+
 export type VllmPlatform = "spark" | "station" | "linux";
+
+export interface VllmRuntimeOverride {
+  /** Model-specific runtime image, pinned by digest. */
+  image: string;
+  /** Compressed size of the selected platform manifest. */
+  imageDownloadSizeBytes: number;
+  /** Size of the pinned Hugging Face snapshot used for cache preflight. */
+  modelDownloadSizeBytes?: number;
+  /** Maximum time to wait for this model to become ready after launch. */
+  loadTimeoutSec?: number;
+  /** Additional `docker run` arguments required by this recipe. */
+  dockerRunArgs?: readonly string[];
+  /** Replace, rather than extend, the platform Docker arguments. */
+  dockerRunArgsMode?: "append" | "replace";
+  /** Maximum time allowed for the immutable image pull. */
+  pullTimeoutSec?: number;
+}
+
+export const NEMOTRON_ULTRA_STATION_IMAGE = {
+  tag: "vllm/vllm-openai:v0.22.0",
+  arm64: {
+    ref: "vllm/vllm-openai@sha256:0fec7ec5f3e6bc168e54899935fb0557da908a4832a1dbc88e2debcf2f889416",
+    downloadSizeBytes: 10_670_087_425,
+  },
+} as const;
+
+/** Runtime pinned from the published dual-DGX-Station playbook. */
+export const NEMOTRON_ULTRA_DUAL_STATION_IMAGE = {
+  tag: "vllm/vllm-openai:v0.25.1-aarch64",
+  arm64: {
+    ref: "vllm/vllm-openai@sha256:2cc49b81319f7a66a33dd8bd63a7bfddae079122b33ce51989b6828a1f038c37",
+    downloadSizeBytes: 10_238_912_364,
+  },
+} as const;
 
 export interface VllmModelDef {
   /** Hugging Face model id (also passed to `vllm serve`). */
@@ -35,8 +72,14 @@ export interface VllmModelDef {
   label: string;
   /** Stable identifier accepted via `NEMOCLAW_VLLM_MODEL`. */
   envValue: string;
+  /** Approximate full Hugging Face repository file size in bytes. */
+  downloadSizeBytes: number;
   /** `--max-model-len` flag value. */
   maxModelLen: number;
+  /** Immutable Hugging Face revision used for download and serving. */
+  revision?: string;
+  /** Stable model name exposed by the local OpenAI-compatible endpoint. */
+  servedModelId?: string;
   /** Model-specific flags appended after the shared serving flags. */
   modelArgs: string[];
   /** True when the upstream HF repo requires accepting a licence. */
@@ -45,10 +88,12 @@ export interface VllmModelDef {
    * Platforms whose interactive picker should offer this entry. Models with
    * platform-specific flags (the NVFP4 MoE checkpoint targets `sm_121a` only,
    * the very large V4 Flash recipe wants Station-class VRAM) appear only on
-   * profiles they can actually run on. Non-interactive callers and direct
-   * `NEMOCLAW_VLLM_MODEL` overrides bypass the filter.
+   * profiles they can actually run on. Direct `NEMOCLAW_VLLM_MODEL`
+   * overrides bypass the picker filter, so `runVllmInstall` rejects any
+   * override outside this list before the image pull and model download.
    */
   platforms: readonly VllmPlatform[];
+  minComputeCapability?: number;
   /**
    * Environment variables exported immediately before `vllm serve` (e.g.
    * FlashInfer / MoE-backend selection, target SM arch). Joined as
@@ -56,6 +101,16 @@ export interface VllmModelDef {
    * container shell.
    */
   serveEnv?: Record<string, string>;
+  /** Runtime overrides for recipes that cannot use the platform image. */
+  runtime?: VllmRuntimeOverride;
+  /** Whether startup must install vLLM's fastsafetensors extra. Defaults to true. */
+  installFastSafetensors?: boolean;
+  /** Disable remote model code for a runtime image that contains native model support. */
+  trustRemoteCode?: false;
+  /** Require the host-global managed bearer credential and a loopback-only listener. */
+  managedBearerAuth?: true;
+  /** Reject environment-provided model and serving-argument overrides. */
+  fixedServeCommand?: true;
 }
 
 export const VLLM_MODELS: readonly VllmModelDef[] = [
@@ -63,6 +118,7 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
     id: "Qwen/Qwen3.6-27B-FP8",
     label: "Qwen3.6 27B FP8",
     envValue: "qwen3.6-27b",
+    downloadSizeBytes: 30_900_000_000,
     maxModelLen: 262144,
     modelArgs: [
       "--gpu-memory-utilization",
@@ -80,11 +136,13 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
     ],
     gated: false,
     platforms: ["spark", "station", "linux"],
+    minComputeCapability: 89,
   },
   {
     id: "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
     label: "DeepSeek-R1 Distill Llama 70B",
     envValue: "deepseek-r1-distill-70b",
+    downloadSizeBytes: 141_000_000_000,
     maxModelLen: 32768,
     modelArgs: [
       "--gpu-memory-utilization",
@@ -104,6 +162,7 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
     id: "nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8",
     label: "NVIDIA Nemotron-3 Nano 4B FP8",
     envValue: "nemotron-3-nano-4b",
+    downloadSizeBytes: 5_280_000_000,
     // Matches the model card's `max_position_embeddings` and the vLLM
     // example NVIDIA publishes for this checkpoint. The previous value
     // (262000) was an undocumented round-down with no headroom rationale.
@@ -117,9 +176,22 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
     // --tool-call-parser to be set" (#6314) — which blocks every agent
     // tool-call flow on the generic-Linux managed vLLM default (Spark and
     // Station defaults already pin their own tool-call parser).
+    //
+    // `--reasoning-parser nemotron_v3` is likewise part of that same model
+    // card launch recipe: Nemotron-3-Nano is a reasoning model that emits a
+    // `<think>…</think>` trace. Without a reasoning parser vLLM leaves the
+    // trace — including the bare `</think>` marker the chat template does not
+    // pair with an opening `<think>` — inline in `content`, and the agent's
+    // streaming parser mishandles that orphan marker into an empty turn that
+    // wedges the session (#6915). `nemotron_v3` is a built-in parser in the
+    // pinned NGC vLLM image (it subclasses the DeepSeek-R1 parser) and moves
+    // the trace out of `content`, so no plugin file is required. The Spark and
+    // Station defaults already pin their own reasoning parser.
     modelArgs: [
       "--gpu-memory-utilization",
       "0.7",
+      "--reasoning-parser",
+      "nemotron_v3",
       "--load-format",
       "fastsafetensors",
       "--enable-auto-tool-choice",
@@ -128,11 +200,13 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
     ],
     gated: false,
     platforms: ["spark", "station", "linux"],
+    minComputeCapability: 89,
   },
   {
     id: "deepseek-ai/DeepSeek-V4-Flash",
     label: "DeepSeek V4 Flash",
     envValue: "deepseek-v4-flash",
+    downloadSizeBytes: 352_381_000_000,
     maxModelLen: 1048576,
     modelArgs: [
       "--kv-cache-dtype",
@@ -143,7 +217,7 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
       "--gpu-memory-utilization",
       "0.92",
       "--compilation-config",
-      `'{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'`,
+      `{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}`,
       "--attention_config.use_fp4_indexer_cache",
       "True",
       "--tokenizer-mode",
@@ -158,7 +232,7 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
       "--max-cudagraph-capture-size",
       "128",
       "--speculative-config",
-      `'{"method":"mtp","num_speculative_tokens":3}'`,
+      `{"method":"mtp","num_speculative_tokens":3}`,
       "--max-num-batched-tokens",
       "8192",
       "--max-num-seqs",
@@ -168,11 +242,68 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
     ],
     gated: false,
     platforms: ["station"],
+    minComputeCapability: 100,
+  },
+  {
+    id: "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+    label: "NVIDIA Nemotron 3 Ultra 550B NVFP4",
+    envValue: "nemotron-3-ultra-550b-a55b",
+    downloadSizeBytes: 352_381_245_521,
+    maxModelLen: 262144,
+    revision: "183968f87ae4cedce3039313cac1fd43d112c578",
+    // Keep the route identity aligned with NemoClaw's existing managed
+    // Nemotron Ultra compatibility manifests and request adapters.
+    servedModelId: "nvidia/nemotron-3-ultra-550b-a55b",
+    modelArgs: [
+      "--host",
+      "0.0.0.0",
+      "--cpu-offload-gb",
+      "150",
+      "--cpu-offload-params",
+      "experts",
+      "--kernel_config",
+      `{"enable_flashinfer_autotune": false}`,
+      "--speculative-config",
+      `{"method":"nemotron_h_mtp","num_speculative_tokens":3}`,
+      "--max-num-seqs",
+      "256",
+      "--gpu-memory-utilization",
+      "0.9",
+      "--reasoning-parser",
+      "nemotron_v3",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser",
+      "qwen3_coder",
+      "--default-chat-template-kwargs",
+      `{"enable_thinking":true,"force_nonempty_content":true}`,
+    ],
+    gated: false,
+    platforms: ["station"],
+    minComputeCapability: 100,
+    serveEnv: {
+      VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: "1",
+      VLLM_NVFP4_GEMM_BACKEND: "flashinfer-trtllm",
+    },
+    runtime: {
+      image: NEMOTRON_ULTRA_STATION_IMAGE.arm64.ref,
+      imageDownloadSizeBytes: NEMOTRON_ULTRA_STATION_IMAGE.arm64.downloadSizeBytes,
+      modelDownloadSizeBytes: 352_381_245_521,
+      loadTimeoutSec: 3600,
+      // The single-host runtime keeps NemoClaw's bridge-networked local-
+      // inference boundary. The qualified dual-Station lifecycle intentionally
+      // builds a separate host-networked launch contract for NCCL/RDMA.
+      dockerRunArgs: ["--shm-size", "16g", "--ulimit", "memlock=-1", "--ulimit", "stack=67108864"],
+    },
+    // The digest-pinned vLLM image already contains the serving package, and
+    // this recipe does not use the fastsafetensors load format. Avoid mutating
+    // the reviewed runtime from the package index when the container starts.
+    installFastSafetensors: false,
   },
   {
     id: "nvidia/Qwen3.6-35B-A3B-NVFP4",
     label: "Qwen3.6 35B-A3B NVFP4",
     envValue: "qwen3.6-35b-a3b-nvfp4",
+    downloadSizeBytes: 23_500_000_000,
     maxModelLen: 262144,
     // Additive flags on top of the shared serving defaults. The shared flags
     // already cover --tensor-parallel-size/--pipeline-parallel-size/
@@ -200,17 +331,66 @@ export const VLLM_MODELS: readonly VllmModelDef[] = [
       "--async-scheduling",
       "--enable-prefix-caching",
       "--enable-auto-tool-choice",
+      // `qwen3_coder`, not `qwen3_xml` (#6457). On DGX Spark this checkpoint's
+      // tool-call frames do not round-trip through vLLM's `qwen3_xml` parser: it
+      // logs `qwen3xml_tool_parser.py:303 Error when parsing XML elements: not
+      // well-formed (invalid token)` and emits truncated/extra-`}` tool
+      // arguments, so Deep Agents Code headless (`dcode -n`) tool calls fail
+      // with `POST /v1/chat/completions 400 Bad Request`
+      // (`json.decoder.JSONDecodeError: Extra data`) and `dcode` exits 1.
+      // `qwen3_coder` matches this Qwen3.6-family checkpoint's emitted tool-call
+      // format — the parser the other Qwen3.6 recipes in this registry already
+      // use (Qwen3.6-27B-FP8, Nemotron-3-Nano-4B). Validated end-to-end on real
+      // DGX Spark (GB10); see PR verification notes for the `dcode -n` transcript.
       "--tool-call-parser",
-      "qwen3_xml",
+      "qwen3_coder",
       "--reasoning-parser",
       "qwen3",
-      "--speculative-config",
-      `'{"method":"mtp","num_speculative_tokens":3,"moe_backend":"triton"}'`,
+      // Keep MTP speculative decoding opt-in on DGX Spark. It increases the
+      // managed profile's cold-start memory pressure and long-context risk
+      // without being required for correct model or tool-call behavior (#7127).
       "--load-format",
       "fastsafetensors",
     ],
     gated: false,
     platforms: ["spark"],
+    minComputeCapability: 121,
+  },
+  {
+    id: "Inferact/Muse-Glimmer-30B-NVFP4-W4A4",
+    label: "Muse Glimmer 30B NVFP4 W4A4 [Experimental]",
+    envValue: "muse-glimmer-30b",
+    downloadSizeBytes: 25_447_097_878,
+    maxModelLen: 32768,
+    revision: "d35cb79050f419c457611b1cee5c5d15b176f285",
+    servedModelId: "muse-glimmer",
+    modelArgs: [
+      "--gpu-memory-utilization",
+      "0.75",
+      "--max-num-seqs",
+      "1",
+      "--max-num-batched-tokens",
+      "4096",
+      "--enable-auto-tool-choice",
+      "--tool-call-parser",
+      "muse_glimmer",
+      "--reasoning-parser",
+      "muse_glimmer",
+      "--generation-config",
+      "auto",
+    ],
+    gated: false,
+    platforms: ["spark"],
+    minComputeCapability: 121,
+    runtime: {
+      image:
+        "vllm/vllm-openai@sha256:ab0f5fc3bb81b9257a9aee801abcb0eeb94bb0523b57b2bb79349dc61e7c1e25",
+      imageDownloadSizeBytes: 10_507_991_780,
+      modelDownloadSizeBytes: 25_447_097_878,
+    },
+    installFastSafetensors: false,
+    trustRemoteCode: false,
+    managedBearerAuth: true,
   },
 ] as const;
 
@@ -360,37 +540,223 @@ const SHARED_VLLM_ARGS: readonly string[] = [
   "--trust-remote-code",
 ] as const;
 
+const FIXED_HOST_LOCAL_VLLM_ARGS: readonly string[] = [
+  "--tensor-parallel-size",
+  "1",
+  "--pipeline-parallel-size",
+  "1",
+  "--data-parallel-size",
+  "1",
+  "--port",
+  "8000",
+] as const;
+
 function shellQuote(value: string): string {
   if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(value)) return value;
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+function rewriteVllmArgs(
+  args: readonly string[],
+  overrides: Readonly<Record<string, string>>,
+  omittedFlags: ReadonlySet<string> = new Set(),
+): string[] {
+  const result: string[] = [];
+  const remainingOverrides = new Set(Object.keys(overrides));
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (omittedFlags.has(arg)) {
+      if (index === args.length - 1) throw new Error(`Missing value for vLLM argument '${arg}'.`);
+      index += 1;
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(overrides, arg)) {
+      if (index === args.length - 1) throw new Error(`Missing value for vLLM argument '${arg}'.`);
+      result.push(arg, overrides[arg]);
+      remainingOverrides.delete(arg);
+      index += 1;
+      continue;
+    }
+    result.push(arg);
+  }
+  if (remainingOverrides.size > 0) {
+    throw new Error(`Cannot override missing vLLM argument '${[...remainingOverrides][0]}'.`);
+  }
+  return result;
+}
+
+export interface NemotronUltraDistributedServeOptions {
+  /** Ray role: rank 0 owns the API and rank 1 is the worker. */
+  nodeRank: 0 | 1;
+  /** Routable head address used by both nodes for the Ray control plane. */
+  masterAddr: string;
+  /** Routable Ray head port. */
+  masterPort: number;
+  /** Routable address of the node running this command. */
+  nodeAddr?: string;
+}
+
+/**
+ * Build one side of the published two-Station Nemotron Ultra vLLM v0.25.1
+ * Ray pipeline-parallel launch. Existing callers keep the single-node
+ * registry command unless they opt into this role/address/port API.
+ */
+export function buildNemotronUltraDistributedServeCommand(
+  options: NemotronUltraDistributedServeOptions,
+): string {
+  if (options.nodeRank !== 0 && options.nodeRank !== 1) {
+    throw new Error("Nemotron Ultra distributed nodeRank must be 0 or 1.");
+  }
+  const masterAddr = options.masterAddr.trim();
+  if (net.isIP(masterAddr) !== 4) {
+    throw new Error("Nemotron Ultra distributed masterAddr must be a canonical IPv4 address.");
+  }
+  if (
+    !Number.isInteger(options.masterPort) ||
+    options.masterPort < 1 ||
+    options.masterPort > 65535
+  ) {
+    throw new Error("Nemotron Ultra distributed masterPort must be an integer from 1 to 65535.");
+  }
+  const nodeAddr = (options.nodeAddr ?? masterAddr).trim();
+  if (net.isIP(nodeAddr) !== 4) {
+    throw new Error("Nemotron Ultra distributed nodeAddr must be a canonical IPv4 address.");
+  }
+  if (options.nodeRank === 0 && nodeAddr !== masterAddr) {
+    throw new Error("Nemotron Ultra Ray head nodeAddr must match masterAddr.");
+  }
+
+  const model = VLLM_MODELS.find(
+    (candidate) => candidate.envValue === "nemotron-3-ultra-550b-a55b",
+  );
+  if (!model?.revision || !model.servedModelId) {
+    throw new Error(
+      "Nemotron Ultra distributed serving requires a pinned revision and served model id.",
+    );
+  }
+
+  const sharedArgs = rewriteVllmArgs(SHARED_VLLM_ARGS, {
+    "--tensor-parallel-size": "1",
+    "--pipeline-parallel-size": "2",
+  });
+  const modelArgs = rewriteVllmArgs(
+    model.modelArgs,
+    {
+      // Rank 0 binds only to the selected direct-attach RoCE address. This
+      // keeps the API off the management network while still giving the
+      // OpenShell route a host-reachable endpoint. The lifecycle also enables
+      // vLLM bearer authentication. The Ray worker exposes no API.
+      "--host": masterAddr,
+      "--max-num-seqs": "256",
+      "--gpu-memory-utilization": "0.9",
+    },
+    new Set([
+      "--cpu-offload-gb",
+      "--cpu-offload-params",
+      "--kernel_config",
+      "--speculative-config",
+      "--default-chat-template-kwargs",
+    ]),
+  );
+  const args = [
+    ...sharedArgs,
+    "--distributed-executor-backend",
+    "ray",
+    "--kv-cache-dtype",
+    "fp8",
+    "--max-model-len",
+    "262144",
+    "--distributed-timeout-seconds",
+    "7200",
+    "--enable-prefix-caching",
+    "--revision",
+    model.revision,
+    "--served-model-name",
+    "nemotron-ultra",
+    ...modelArgs,
+  ];
+  const bootstrap = [
+    "set -euo pipefail",
+    'export PATH="$HOME/.local/bin:$PATH"',
+    'python3 -m pip install --user --no-cache-dir "ray==2.56.0"',
+  ];
+  if (options.nodeRank === 1) {
+    return [
+      ...bootstrap,
+      "python3 - <<'PY'",
+      "import socket",
+      "import time",
+      `address = (${JSON.stringify(masterAddr)}, ${String(options.masterPort)})`,
+      "deadline = time.time() + 3600",
+      "while True:",
+      "    try:",
+      "        with socket.create_connection(address, timeout=5):",
+      "            break",
+      "    except OSError:",
+      "        if time.time() >= deadline:",
+      '            raise TimeoutError("Ray head did not become reachable within 3600 seconds")',
+      "        time.sleep(5)",
+      "PY",
+      `exec ray start --address=${shellQuote(`${masterAddr}:${String(options.masterPort)}`)} --node-ip-address=${shellQuote(nodeAddr)} --num-gpus=1 --block`,
+    ].join("\n");
+  }
+  return [
+    ...bootstrap,
+    `ray start --head --node-ip-address=${shellQuote(masterAddr)} --port=${String(options.masterPort)} --num-gpus=1`,
+    "python3 - <<'PY'",
+    "import time",
+    "import ray",
+    'ray.init(address="auto")',
+    "deadline = time.time() + 3600",
+    'while ray.cluster_resources().get("GPU", 0) < 2:',
+    "    if time.time() >= deadline:",
+    '        raise TimeoutError("peer DGX Station GPU did not join Ray within 3600 seconds")',
+    "    time.sleep(5)",
+    "print(ray.cluster_resources())",
+    "PY",
+    `exec vllm serve ${model.id} ${args.join(" ")}`,
+  ].join("\n");
 }
 
 /**
  * Build the `vllm serve` command line for the supplied model: the shared
  * serving flags merged with the model-specific args from the registry.
  *
- * The command is prefixed with the `pip install` that pulls the
- * `fastsafetensors` extra so existing express scripts keep working; a model
- * may prepend env exports via `serveEnv`.
+ * By default the command is prefixed with the `pip install` that pulls the
+ * `fastsafetensors` extra so existing express scripts keep working. A pinned
+ * runtime that already contains everything its recipe needs may disable that
+ * mutation with `installFastSafetensors: false`; a model may also prepend env
+ * exports via `serveEnv`.
  */
 export function buildVllmServeCommand(
   model: VllmModelDef,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  const envPrefix = model.serveEnv
-    ? `${Object.entries(model.serveEnv)
-        .map(([key, value]) => `export ${key}=${value}`)
-        .join(" && ")} && `
-    : "";
+  const envPrefix =
+    model.serveEnv && Object.keys(model.serveEnv).length > 0
+      ? `${Object.entries(model.serveEnv)
+          .map(([key, value]) => {
+            if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(key)) {
+              throw new Error(`Invalid vLLM serving environment variable name: ${key}`);
+            }
+            return `export ${key}=${shellQuote(value)}`;
+          })
+          .join(" && ")} && `
+      : "";
   const args = [
-    ...SHARED_VLLM_ARGS,
+    ...(model.fixedServeCommand || model.trustRemoteCode === false
+      ? FIXED_HOST_LOCAL_VLLM_ARGS
+      : SHARED_VLLM_ARGS),
     "--max-model-len",
     String(model.maxModelLen),
+    ...(model.revision ? ["--revision", model.revision] : []),
+    ...(model.servedModelId ? ["--served-model-name", model.servedModelId] : []),
     ...model.modelArgs,
   ];
-  const extraArgs = parseVllmExtraServeArgs(env).map(shellQuote);
-  return `${envPrefix}pip install vllm[fastsafetensors] && vllm serve ${model.id} ${[
-    ...args,
-    ...extraArgs,
-  ].join(" ")}`;
+  const extraArgs = model.fixedServeCommand ? [] : parseVllmExtraServeArgs(env);
+  const setup =
+    model.installFastSafetensors === false ? "" : "pip install vllm[fastsafetensors] && ";
+  return `${envPrefix}${setup}vllm serve ${[model.id, ...args, ...extraArgs]
+    .map(shellQuote)
+    .join(" ")}`;
 }

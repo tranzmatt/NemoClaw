@@ -1,556 +1,65 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawn } from "node:child_process";
-import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ArtifactSink } from "../fixtures/artifacts.ts";
+
+import { HTTPS_PIN_RUNTIME_ADAPTER_BASE_ORIGIN } from "../../../src/lib/inference/https-pin-runtime.ts";
+import { REGISTRY_FILE, type SandboxEntry } from "../../../src/lib/state/registry.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import { resultText } from "../fixtures/clients/command.ts";
-import type { HostCliClient } from "../fixtures/clients/host.ts";
-import type { SandboxClient } from "../fixtures/clients/sandbox.ts";
-import { trustedSandboxShellScript, validateSandboxName } from "../fixtures/clients/sandbox.ts";
-import { expect, test } from "../fixtures/e2e-test.ts";
-import { CLI_DIST_ENTRYPOINT, CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
-import { redactString } from "../fixtures/redaction.ts";
+import { type E2ETargetFixtures, expect, test } from "../fixtures/e2e-test.ts";
+import { startFakeOpenAiCompatibleServer } from "../fixtures/fake-openai-compatible.ts";
+import { REPO_ROOT } from "../fixtures/paths.ts";
+import { resolveVerifiedCloudflaredBinary } from "./cloudflared-prerequisite.ts";
+import {
+  remapDnsRebindingHostname,
+  restoreDnsRebindingHostsFixture,
+  setupDnsRebindingHostsFixture,
+} from "./dns-rebinding-hosts-fixture.ts";
+import { startFakeHttpsCompatibleServer } from "./https-pin-compatible-server.ts";
+import {
+  CREDENTIAL_CLASSIFICATION_PATTERN,
+  cleanupSandbox,
+  expectNoActiveSandbox,
+  expectOnboardFailure,
+  expectOnboardSuccess,
+  expectOpenAiChatThroughSandbox,
+  hasRawNodeStackTrace,
+  inferenceSandboxName,
+  onboardSandbox,
+  redactedResultText,
+  requireLivePrerequisites,
+  runNemoclawCli,
+  runRawCommand,
+  TRANSPORT_CLASSIFICATION_PATTERN,
+  writeFakeOpenShellForBlueprintFailClosed,
+} from "./inference-routing-helpers.ts";
+import { startPublicMcpHttpsTunnel } from "./mcp-bridge-servers.ts";
+import { startRuntimeIdentityOAuthServer } from "./runtime-identity-oauth-server.ts";
 
-// live conversion: direct CLI/onboard subprocesses plus OpenShell sandbox
-// probes, with local helpers only where raw in-memory output is required to
-// prove credential non-exposure before redacted artifacts are written.
-
-const DIST_ENTRYPOINT = CLI_DIST_ENTRYPOINT;
-const NEMOCLAW_STATE_DIR = path.join(os.homedir(), ".nemoclaw");
-const ONBOARD_SESSION_FILE = path.join(NEMOCLAW_STATE_DIR, "onboard-session.json");
-const ONBOARD_LOCK_FILE = path.join(NEMOCLAW_STATE_DIR, "onboard.lock");
-const ONBOARD_ARGS = [
-  "onboard",
-  "--non-interactive",
-  "--yes",
-  "--yes-i-accept-third-party-software",
-];
-const STACK_TRACE_PATTERNS = [
-  /^\s+at (Object\.|Module\.|node:internal|process\.)/m,
-  /\bat node:internal/m,
-];
-const CREDENTIAL_CLASSIFICATION_PATTERN =
-  /authorization|credential|invalid|401|unauthorized|api[._-]?key/i;
-const TRANSPORT_CLASSIFICATION_PATTERN =
-  /unreachable|timeout|connect|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EAI_AGAIN|No route to host|transport|network|endpoint|dns/i;
-
-function shouldRunProviderSmoke(provider: "openai" | "anthropic" | "compatible"): boolean {
-  // The former shell script auto-ran these smokes when provider secrets were
-  // present. This live migration requires an explicit opt-in so PR-safe jobs
-  // cannot spend third-party quota accidentally; any future secret-backed lane
-  // must set NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE=all or a provider name.
-  const requested = process.env.NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE?.trim().toLowerCase();
-  return requested === "1" || requested === "true" || requested === "all" || requested === provider;
-}
-
-type SkipFn = (note?: string) => void;
-
-function skipLive(skip: SkipFn, note: string): never {
-  skip(note);
-  throw new Error(note);
-}
-
-interface RawRunResult {
-  readonly command: readonly string[];
-  readonly exitCode: number | null;
-  readonly signal: NodeJS.Signals | null;
-  readonly timedOut: boolean;
-  readonly stdout: string;
-  readonly stderr: string;
-  readonly redactedStdout: string;
-  readonly redactedStderr: string;
-}
-
-interface RawRunOptions {
-  readonly artifactName: string;
-  readonly artifacts: ArtifactSink;
-  readonly cwd?: string;
-  readonly env?: NodeJS.ProcessEnv;
-  readonly redactionValues?: readonly string[];
-  readonly timeoutMs?: number;
-}
-
-function redactedResultText(
-  result: Pick<RawRunResult, "redactedStdout" | "redactedStderr">,
-): string {
-  return [result.redactedStdout, result.redactedStderr].filter(Boolean).join("\n");
-}
-
-function hasRawNodeStackTrace(text: string): boolean {
-  return STACK_TRACE_PATTERNS.some((pattern) => pattern.test(text));
-}
-
-function inferenceSandboxName(prefix: string): string {
-  const name = `${prefix}-${process.pid}`;
-  validateSandboxName(name);
-  return name;
-}
-
-function onboardEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return {
-    ...buildAvailabilityProbeEnv(),
-    ...extra,
-    NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1",
-    NEMOCLAW_NON_INTERACTIVE: "1",
-    NEMOCLAW_RECREATE_SANDBOX: "1",
-  };
-}
-
-function clearOnboardState(): void {
-  fs.rmSync(ONBOARD_LOCK_FILE, { force: true });
-  fs.rmSync(ONBOARD_SESSION_FILE, { force: true });
-}
-
-function writeFakeOpenShellForBlueprintFailClosed(binDir: string): string {
-  const commandLogPath = path.join(binDir, "openshell-commands.jsonl");
-  const scriptPath = path.join(binDir, "openshell");
-  fs.writeFileSync(
-    scriptPath,
-    `#!/usr/bin/env node
-const fs = require("node:fs");
-fs.appendFileSync(${JSON.stringify(commandLogPath)}, JSON.stringify({ args: process.argv.slice(2) }) + "\\n");
-process.exit(0);
-`,
-    { mode: 0o755 },
-  );
-  return commandLogPath;
-}
-
-function redactedCommand(command: readonly string[], values: readonly string[]): string[] {
-  return command.map((part) => redactString(part, values));
-}
-
-async function runRawCommand(
-  command: string,
-  args: readonly string[],
-  options: RawRunOptions,
-): Promise<RawRunResult> {
-  const timeoutMs = options.timeoutMs ?? 60_000;
-  const redactionValues = [...(options.redactionValues ?? [])];
-  const child = spawn(command, [...args], {
-    cwd: options.cwd ?? REPO_ROOT,
-    detached: true,
-    env: options.env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const fullCommand = [command, ...args];
-  let stdout = "";
-  let stderr = "";
-  let timedOut = false;
-  let spawnError: Error | undefined;
-
-  const killProcessGroup = (signal: NodeJS.Signals): void => {
-    if (child.pid === undefined) return;
-    try {
-      process.kill(-child.pid, signal);
-    } catch {
-      child.kill(signal);
-    }
-  };
-
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    killProcessGroup("SIGTERM");
-    setTimeout(() => killProcessGroup("SIGKILL"), 1_000).unref();
-  }, timeoutMs);
-  timeout.unref();
-
-  child.stdout?.on("data", (chunk: Buffer) => {
-    stdout += chunk.toString("utf8");
-  });
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderr += chunk.toString("utf8");
-  });
-  child.on("error", (error) => {
-    spawnError = error;
-  });
-
-  const { exitCode, signal } = await new Promise<{
-    exitCode: number | null;
-    signal: NodeJS.Signals | null;
-  }>((resolve) => {
-    child.on("close", (code, closeSignal) => resolve({ exitCode: code, signal: closeSignal }));
-  });
-  clearTimeout(timeout);
-
-  if (spawnError) {
-    const message = redactString(spawnError.message, redactionValues);
-    throw new Error(`failed to spawn ${redactString(command, redactionValues)}: ${message}`);
-  }
-
-  const redactedStdout = redactString(stdout, redactionValues);
-  const redactedStderr = redactString(stderr, redactionValues);
-  await options.artifacts.writeText(`raw-shell/${options.artifactName}.stdout.txt`, redactedStdout);
-  await options.artifacts.writeText(`raw-shell/${options.artifactName}.stderr.txt`, redactedStderr);
-  await options.artifacts.writeJson(`raw-shell/${options.artifactName}.result.json`, {
-    command: redactedCommand(fullCommand, redactionValues),
-    exitCode,
-    signal,
-    timedOut,
-    stdout: redactedStdout,
-    stderr: redactedStderr,
-  });
-
-  return {
-    command: fullCommand,
-    exitCode,
-    signal,
-    timedOut,
-    stdout,
-    stderr,
-    redactedStdout,
-    redactedStderr,
-  };
-}
-
-async function runNemoclawCli(
-  args: readonly string[],
-  options: RawRunOptions,
-): Promise<RawRunResult> {
-  return runRawCommand(process.execPath, [CLI_ENTRYPOINT, ...args], options);
-}
-
-function rawOpenShellEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  return {
-    ...buildAvailabilityProbeEnv(),
-    OPENSHELL_GATEWAY: process.env.OPENSHELL_GATEWAY ?? "nemoclaw",
-    ...extra,
-  };
-}
-
-async function runOpenShell(
-  args: readonly string[],
-  options: RawRunOptions,
-): Promise<RawRunResult> {
-  return runRawCommand("openshell", args, {
-    ...options,
-    env: rawOpenShellEnv(options.env),
-  });
-}
-
-async function requireLivePrerequisites(host: HostCliClient, skip: SkipFn): Promise<void> {
-  expect(
-    fs.existsSync(DIST_ENTRYPOINT),
-    "run `npm run build:cli` before live inference-routing targets",
-  ).toBe(true);
-
-  const docker = await host.command("docker", ["info"], {
-    artifactName: "prereq-docker-info-inference-routing",
-    env: buildAvailabilityProbeEnv(),
-    timeoutMs: 30_000,
-  });
-  if (docker.exitCode !== 0) {
-    const message = `Docker is required for live inference-routing coverage: ${resultText(docker)}`;
-    if (process.env.GITHUB_ACTIONS === "true") throw new Error(message);
-    skipLive(skip, message);
-  }
-
-  try {
-    const openshell = await host.command("openshell", ["--version"], {
-      artifactName: "prereq-openshell-version-inference-routing",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 30_000,
-    });
-    if (openshell.exitCode !== 0) {
-      // A fresh GitHub runner may not have OpenShell before the first onboard;
-      // `nemoclaw onboard` installs it. Record the prereq probe without blocking.
-      return;
-    }
-  } catch {
-    // Same as non-zero: fresh runner may not have openshell until onboard.
-    return;
-  }
-}
-
-interface CleanupSandboxOptions {
-  readonly strict?: boolean;
-}
-
-function isExpectedPreOnboardCleanupMiss(text: string): boolean {
-  return /does not exist|run 'nemoclaw onboard'|no active gateway|not found|no such file|enoent/i.test(
-    text,
-  );
-}
-
-async function optionalCleanupStep(
-  label: string,
-  run: () => Promise<{ exitCode: number | null; stdout: string; stderr: string }>,
-): Promise<void> {
-  try {
-    const result = await run();
-    if (result.exitCode === 0) return;
-    const text = resultText(result);
-    if (isExpectedPreOnboardCleanupMiss(text)) return;
-    throw new Error(`${label} failed unexpectedly during pre-onboard cleanup: ${text}`);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (isExpectedPreOnboardCleanupMiss(message)) return;
-    throw error;
-  }
-}
-
-function probeSummary(
-  label: string,
-  result: { exitCode: number | null; stdout: string; stderr: string },
-): string {
-  const text = resultText(result).trim();
-  return `${label} exit=${result.exitCode}${text ? `: ${text.slice(0, 500)}` : ""}`;
-}
-
-async function cleanupSandbox(
-  host: HostCliClient,
-  sandbox: SandboxClient,
-  sandboxName: string,
-  options: CleanupSandboxOptions = {},
-): Promise<void> {
-  if (!options.strict) {
-    await optionalCleanupStep("nemoclaw destroy", () =>
-      host.command(process.execPath, [CLI_ENTRYPOINT, sandboxName, "destroy", "--yes"], {
-        artifactName: `cleanup-nemoclaw-destroy-${sandboxName}`,
-        env: buildAvailabilityProbeEnv(),
-        timeoutMs: 120_000,
-      }),
-    );
-    await optionalCleanupStep("openshell sandbox delete", () =>
-      sandbox.openshell(["sandbox", "delete", sandboxName], {
-        artifactName: `cleanup-openshell-sandbox-delete-${sandboxName}`,
-        env: buildAvailabilityProbeEnv(),
-        timeoutMs: 60_000,
-      }),
-    );
-    clearOnboardState();
-    return;
-  }
-
-  const cleanupEvidence: string[] = [];
-  try {
-    const destroy = await host.command(
-      process.execPath,
-      [CLI_ENTRYPOINT, sandboxName, "destroy", "--yes"],
-      {
-        artifactName: `cleanup-nemoclaw-destroy-${sandboxName}`,
-        env: buildAvailabilityProbeEnv(),
-        timeoutMs: 120_000,
-      },
-    );
-    cleanupEvidence.push(probeSummary("nemoclaw destroy", destroy));
-  } catch (error) {
-    cleanupEvidence.push(
-      `nemoclaw destroy threw: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
-  try {
-    const deletion = await sandbox.openshell(["sandbox", "delete", sandboxName], {
-      artifactName: `cleanup-openshell-sandbox-delete-${sandboxName}`,
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 60_000,
-    });
-    cleanupEvidence.push(probeSummary("openshell sandbox delete", deletion));
-  } catch (error) {
-    cleanupEvidence.push(
-      `openshell sandbox delete threw: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-
-  clearOnboardState();
-
-  const status = await sandbox.status(sandboxName, {
-    artifactName: `cleanup-openshell-sandbox-status-${sandboxName}`,
-    env: buildAvailabilityProbeEnv(),
-    timeoutMs: 30_000,
-  });
-  cleanupEvidence.push(probeSummary("openshell sandbox status", status));
-  if (status.exitCode === 0) {
-    throw new Error(
-      `sandbox '${sandboxName}' still exists after strict cleanup\n${cleanupEvidence.join("\n")}`,
-    );
-  }
-}
-
-async function expectNoActiveSandbox(host: HostCliClient, sandboxName: string): Promise<void> {
-  const status = await host.command(process.execPath, [CLI_ENTRYPOINT, sandboxName, "status"], {
-    artifactName: `post-failure-status-${sandboxName}`,
-    env: buildAvailabilityProbeEnv(),
-    timeoutMs: 30_000,
-  });
-  const text = resultText(status);
-  expect(
-    /running|ready/i.test(text),
-    `sandbox '${sandboxName}' is still active after failed onboard: ${text}`,
-  ).toBe(false);
-}
-
-async function onboardSandbox(
-  artifacts: ArtifactSink,
-  sandboxName: string,
-  extraEnv: NodeJS.ProcessEnv,
-  redactionValues: readonly string[],
-  artifactName: string,
-  timeoutMs = 10 * 60_000,
-): Promise<RawRunResult> {
-  clearOnboardState();
-  return runNemoclawCli(ONBOARD_ARGS, {
-    artifactName,
-    artifacts,
-    env: onboardEnv({
-      NEMOCLAW_POLICY_TIER: "open",
-      NEMOCLAW_SANDBOX_NAME: sandboxName,
-      ...extraEnv,
-    }),
-    redactionValues,
-    timeoutMs,
-  });
-}
-
-function expectOnboardSuccess(result: RawRunResult, label: string): void {
-  const redacted = redactedResultText(result);
-  expect(result.timedOut, `${label} timed out\n${redacted}`).toBe(false);
-  expect(result.exitCode, `${label} failed\n${redacted}`).toBe(0);
-}
-
-function expectOnboardFailure(result: RawRunResult, label: string): void {
-  const redacted = redactedResultText(result);
-  expect(result.timedOut, `${label} timed out\n${redacted}`).toBe(false);
-  expect(result.exitCode, `${label} unexpectedly succeeded\n${redacted}`).not.toBe(0);
-}
-
-function parseJsonBody(body: string, label: string): unknown {
-  try {
-    return JSON.parse(body);
-  } catch (error) {
-    throw new Error(
-      `${label} response was not JSON: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-}
-
-function openAiContent(json: unknown): string {
-  if (!json || typeof json !== "object") return "";
-  const choices = (json as { choices?: unknown }).choices;
-  if (!Array.isArray(choices)) return "";
-  for (const choice of choices) {
-    if (!choice || typeof choice !== "object") continue;
-    const message = (choice as { message?: unknown }).message;
-    if (message && typeof message === "object") {
-      const content = (message as { content?: unknown }).content;
-      if (typeof content === "string" && content.trim()) return content;
-    }
-    const text = (choice as { text?: unknown }).text;
-    if (typeof text === "string" && text.trim()) return text;
-  }
-  return "";
-}
-
-function anthropicContent(json: unknown): string {
-  if (!json || typeof json !== "object") return "";
-  const content = (json as { content?: unknown }).content;
-  if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (
-          part &&
-          typeof part === "object" &&
-          typeof (part as { text?: unknown }).text === "string"
-        ) {
-          return (part as { text: string }).text;
-        }
-        return "";
-      })
-      .join("")
-      .trim();
-  }
-  return openAiContent(json);
-}
-
-async function expectOpenAiChatThroughSandbox(
-  sandbox: SandboxClient,
-  sandboxName: string,
-  model: string,
-  redactionValues: readonly string[],
-  artifactName: string,
-): Promise<void> {
-  const payload = JSON.stringify({
-    model,
-    messages: [{ role: "user", content: "Reply with exactly one word: PONG" }],
-    max_tokens: 50,
-  });
-  const response = await sandbox.exec(
-    sandboxName,
-    [
-      "curl",
-      "-sS",
-      "--max-time",
-      "60",
-      "https://inference.local/v1/chat/completions",
-      "-H",
-      "Content-Type: application/json",
-      "--data-raw",
-      payload,
-    ],
-    {
-      artifactName,
-      env: buildAvailabilityProbeEnv(),
-      redactionValues: [...redactionValues],
-      timeoutMs: 90_000,
-    },
-  );
-  expect(response.exitCode, resultText(response)).toBe(0);
-  const content = openAiContent(parseJsonBody(response.stdout, artifactName));
-  expect(content, `no chat content in response: ${response.stdout.slice(0, 500)}`).not.toBe("");
-}
-
-async function expectAnthropicMessageThroughSandbox(
-  sandbox: SandboxClient,
-  sandboxName: string,
-  model: string,
-  redactionValues: readonly string[],
-): Promise<void> {
-  const payload = JSON.stringify({
-    model,
-    messages: [{ role: "user", content: "Reply with exactly one word: PONG" }],
-    max_tokens: 50,
-  });
-  const response = await sandbox.exec(
-    sandboxName,
-    [
-      "curl",
-      "-sS",
-      "--max-time",
-      "60",
-      "https://inference.local/v1/messages",
-      "-H",
-      "Content-Type: application/json",
-      "--data-raw",
-      payload,
-    ],
-    {
-      artifactName: "anthropic-inference-local-message",
-      env: buildAvailabilityProbeEnv(),
-      redactionValues: [...redactionValues],
-      timeoutMs: 90_000,
-    },
-  );
-  expect(response.exitCode, resultText(response)).toBe(0);
-  const content = anthropicContent(parseJsonBody(response.stdout, "anthropic inference.local"));
-  expect(content, `no Anthropic content in response: ${response.stdout.slice(0, 500)}`).not.toBe(
-    "",
-  );
-}
+// This is the PR-required inference-routing lane. Credential-backed provider
+// smokes live in inference-routing-provider-smoke.test.ts and are never selected
+// by the PR-safe workflow job.
 
 test("TC-INF-06 invalid API key fails with credential classification and cleanup", {
   timeout: 5 * 60_000,
-}, async ({ artifacts, cleanup, host, sandbox, skip }) => {
+  meta: {
+    e2ePhases: [
+      "confirm live inference prerequisites",
+      "clear the invalid-key sandbox",
+      "attempt onboard with an invalid NVIDIA credential",
+      "confirm credential failure and no sandbox residue",
+    ],
+  },
+}, async ({ artifacts, cleanup, host, progress, sandbox, skip }) => {
   await requireLivePrerequisites(host, skip);
-  const sandboxName = inferenceSandboxName("e2e-invalid-key");
+  const sandboxName = inferenceSandboxName("e2e-badkey");
   cleanup.add(`remove inference-routing invalid-key residue for ${sandboxName}`, () =>
     cleanupSandbox(host, sandbox, sandboxName),
   );
+  progress.phase("clear the invalid-key sandbox");
   await cleanupSandbox(host, sandbox, sandboxName);
 
   await artifacts.target.declare({
@@ -563,6 +72,7 @@ test("TC-INF-06 invalid API key fails with credential classification and cleanup
     ],
   });
 
+  progress.phase("attempt onboard with an invalid NVIDIA credential");
   const invalidKey = ["nvapi", "INTENTIONALLY", "INVALID", "KEY", "FOR", "E2E", "TEST"].join("-");
   const result = await onboardSandbox(
     artifacts,
@@ -570,11 +80,13 @@ test("TC-INF-06 invalid API key fails with credential classification and cleanup
     { NVIDIA_INFERENCE_API_KEY: invalidKey },
     [invalidKey],
     "tc-inf-06-onboard-invalid-api-key",
+    progress,
     120_000,
   );
   const raw = resultText(result);
   const redacted = redactedResultText(result);
 
+  progress.phase("confirm credential failure and no sandbox residue");
   expectOnboardFailure(result, "TC-INF-06 invalid-key onboard");
   expect(CREDENTIAL_CLASSIFICATION_PATTERN.test(raw), redacted).toBe(true);
   expect(hasRawNodeStackTrace(raw), redacted).toBe(false);
@@ -584,12 +96,21 @@ test("TC-INF-06 invalid API key fails with credential classification and cleanup
 
 test("TC-INF-07 unreachable endpoint fails with transport classification and cleanup", {
   timeout: 5 * 60_000,
-}, async ({ artifacts, cleanup, host, sandbox, skip }) => {
+  meta: {
+    e2ePhases: [
+      "confirm live inference prerequisites",
+      "clear the unreachable-endpoint sandbox",
+      "attempt onboard against the unreachable endpoint",
+      "confirm transport failure and no sandbox residue",
+    ],
+  },
+}, async ({ artifacts, cleanup, host, progress, sandbox, skip }) => {
   await requireLivePrerequisites(host, skip);
-  const sandboxName = inferenceSandboxName("e2e-unreachable");
+  const sandboxName = inferenceSandboxName("e2e-unreach");
   cleanup.add(`remove inference-routing unreachable residue for ${sandboxName}`, () =>
     cleanupSandbox(host, sandbox, sandboxName),
   );
+  progress.phase("clear the unreachable-endpoint sandbox");
   await cleanupSandbox(host, sandbox, sandboxName);
 
   await artifacts.target.declare({
@@ -602,6 +123,7 @@ test("TC-INF-07 unreachable endpoint fails with transport classification and cle
     ],
   });
 
+  progress.phase("attempt onboard against the unreachable endpoint");
   const nvidiaKey = ["nvapi", "valid", "format", "but", "fake", "key", "1234567890"].join("-");
   const compatibleKey = "fake-key-for-unreachable-test";
   const result = await onboardSandbox(
@@ -616,11 +138,13 @@ test("TC-INF-07 unreachable endpoint fails with transport classification and cle
     },
     [nvidiaKey, compatibleKey],
     "tc-inf-07-onboard-unreachable-endpoint",
+    progress,
     120_000,
   );
   const raw = resultText(result);
   const redacted = redactedResultText(result);
 
+  progress.phase("confirm transport failure and no sandbox residue");
   expectOnboardFailure(result, "TC-INF-07 unreachable-endpoint onboard");
   expect(TRANSPORT_CLASSIFICATION_PATTERN.test(raw), redacted).toBe(true);
   expect(hasRawNodeStackTrace(raw), redacted).toBe(false);
@@ -629,7 +153,14 @@ test("TC-INF-07 unreachable endpoint fails with transport classification and cle
 
 test("TC-INF-10 DNS-backed HTTPS blueprint endpoint fails closed before OpenShell runtime handoff", {
   timeout: 5 * 60_000,
-}, async ({ artifacts, cleanup }) => {
+  meta: {
+    e2ePhases: [
+      "prepare the DNS-backed endpoint blueprint",
+      "apply the blueprint with controlled DNS resolution",
+      "confirm rejection before OpenShell handoff",
+    ],
+  },
+}, async ({ artifacts, cleanup, progress }) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-https-dns-fail-closed-"));
   const workdir = path.join(root, "blueprint");
   const fakeBinDir = path.join(root, "bin");
@@ -681,6 +212,7 @@ const { main } = await import(${JSON.stringify(path.join(REPO_ROOT, "nemoclaw/sr
 await main(["apply"]);
 `;
 
+  progress.phase("apply the blueprint with controlled DNS resolution");
   const result = await runRawCommand(
     process.execPath,
     [
@@ -698,6 +230,7 @@ await main(["apply"]);
         PATH: `${fakeBinDir}${path.delimiter}${process.env.PATH ?? ""}`,
         E2E_API_KEY: "e2e-fake-key",
       },
+      progress,
       redactionValues: ["e2e-fake-key"],
       timeoutMs: 60_000,
     },
@@ -706,323 +239,852 @@ await main(["apply"]);
   const openshellLog = fs.existsSync(commandLogPath) ? fs.readFileSync(commandLogPath, "utf8") : "";
   await artifacts.writeText("tc-inf-10-openshell-commands.jsonl", openshellLog);
 
+  progress.phase("confirm rejection before OpenShell handoff");
   expectOnboardFailure(result, "TC-INF-10 DNS-backed HTTPS fail-closed blueprint apply");
   expect(raw).toMatch(/DNS-backed HTTPS endpoint/);
   expect(openshellLog).toBe("");
 });
 
-test("TC-INF-05 real NVIDIA key is isolated from sandbox env, process list, and filesystem", {
-  timeout: 15 * 60_000,
-}, async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
-  const apiKey =
-    secrets.optional("NVIDIA_INFERENCE_API_KEY") ??
-    skipLive(skip, "NVIDIA_INFERENCE_API_KEY not set — cannot test credential isolation");
+interface RuntimeIdentityE2EScenario {
+  readonly testId: "TC-INF-12" | "TC-INF-13";
+  readonly providerType: string;
+  readonly credentialKey: string;
+  readonly clientIdEnvironmentName: string;
+  readonly refreshTokenEnvironmentName: string;
+  readonly clientSecretEnvironmentName: string;
+  readonly tokenPath: string;
+  readonly resourcePath: string;
+  readonly reviewedResourcePath: string;
+  readonly deniedMethod: "GET" | "POST";
+  readonly deniedPath: string;
+  readonly targetId: string;
+}
+
+const RUNTIME_IDENTITY_E2E_SCENARIOS = [
+  [
+    "12",
+    "",
+    {
+      testId: "TC-INF-12",
+      providerType: "oauth2-runtime-conformance-v1",
+      credentialKey: "E2E_ACCESS_TOKEN",
+      clientIdEnvironmentName: "E2E_CLIENT_ID",
+      refreshTokenEnvironmentName: "E2E_REFRESH_TOKEN",
+      clientSecretEnvironmentName: "E2E_CLIENT_SECRET",
+      tokenPath: "/oauth/token",
+      resourcePath: "/resource",
+      reviewedResourcePath: "/**",
+      deniedMethod: "POST",
+      deniedPath: "/resource",
+      targetId: "runtime-identity-reference-real-oauth-lifecycle",
+    },
+  ],
+  [
+    "13",
+    "Entra Graph ",
+    {
+      testId: "TC-INF-13",
+      providerType: "entra-runtime-v1",
+      credentialKey: "ENTRA_ACCESS_TOKEN",
+      clientIdEnvironmentName: "ENTRA_CLIENT_ID",
+      refreshTokenEnvironmentName: "ENTRA_REFRESH_TOKEN",
+      clientSecretEnvironmentName: "ENTRA_CLIENT_SECRET",
+      tokenPath: "/organizations/oauth2/v2.0/token",
+      resourcePath: "/v1.0/me",
+      reviewedResourcePath: "/v1.0/me",
+      deniedMethod: "GET",
+      deniedPath: "/v1.0/users",
+      targetId: "entra-runtime-identity-real-oauth-lifecycle",
+    },
+  ],
+] as const satisfies readonly (readonly [string, string, RuntimeIdentityE2EScenario])[];
+
+type RuntimeIdentityE2EContext = Pick<
+  E2ETargetFixtures,
+  "artifacts" | "cleanup" | "host" | "progress" | "sandbox"
+> & {
+  skip: (note?: string) => never;
+};
+
+const RUNTIME_IDENTITY_E2E_OPTIONS = {
+  timeout: 20 * 60_000,
+  meta: {
+    e2ePhases: [
+      "confirm live runtime identity prerequisites",
+      "onboard a real OpenShell sandbox",
+      "start the public OAuth issuer and protected resource",
+      "plan the non-secret runtime identity reference",
+      "apply and attach the runtime identity through OpenShell",
+      "prove inference remains live after identity attachment",
+      "call the protected resource with the injected bearer",
+      "reject unreviewed credential delivery before bearer substitution",
+      "rotate the credential and relaunch with its new placeholder",
+      "verify secret-safe status and deterministic rollback",
+    ],
+  },
+} as const;
+
+async function runRuntimeIdentityE2EScenario(
+  _testNumber: string,
+  _providerLabel: string,
+  scenario: RuntimeIdentityE2EScenario,
+  context: RuntimeIdentityE2EContext,
+): Promise<void> {
+  const { artifacts, cleanup, host, progress, sandbox, skip } = context;
+  const artifactPrefix = scenario.testId.toLowerCase();
+  progress.phase("confirm live runtime identity prerequisites");
   await requireLivePrerequisites(host, skip);
-  const sandboxName = inferenceSandboxName("e2e-inf-cred");
-  cleanup.add(`best-effort inference-routing credential-isolation cleanup for ${sandboxName}`, () =>
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-runtime-identity-e2e-"));
+  const workdir = path.join(root, "blueprint");
+  const profileDir = path.join(workdir, "provider-profiles");
+  fs.mkdirSync(profileDir, { recursive: true });
+  cleanup.add(`remove runtime identity E2E temp root ${root}`, () => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  const model = "nemoclaw-e2e-runtime-identity";
+  const inferenceKey = "sk-runtime-identity-TEST-NOT-A-REAL-VALUE";
+  const sandboxName = inferenceSandboxName(`e2e-i${scenario.testId.slice(-2)}`);
+  const providerType = scenario.providerType;
+  const providerName = `e2e-${scenario.providerType}-${String(process.pid)}`;
+  const credentialKey = scenario.credentialKey;
+  const clientId = "e2e-runtime-identity-client-id";
+  const refreshToken = "e2e-runtime-identity-refresh-token-v1";
+  const clientSecret = "e2e-runtime-identity-client-secret";
+  const openshellEnv = {
+    ...buildAvailabilityProbeEnv(),
+    OPENSHELL_GATEWAY: process.env.OPENSHELL_GATEWAY ?? "nemoclaw",
+  };
+
+  cleanup.add(`best-effort runtime identity sandbox cleanup for ${sandboxName}`, () =>
     cleanupSandbox(host, sandbox, sandboxName),
   );
   await cleanupSandbox(host, sandbox, sandboxName);
 
-  await artifacts.target.declare({
-    id: "inference-routing-credential-isolation",
-    contract: [
-      "real NVIDIA_INFERENCE_API_KEY does not appear in sandbox environment",
-      "real NVIDIA_INFERENCE_API_KEY does not appear in sandbox process list when ps is available",
-      "real NVIDIA_INFERENCE_API_KEY does not appear in sampled sandbox filesystem",
-      "sandbox NVIDIA_INFERENCE_API_KEY, when present, is a placeholder rather than the real key",
-    ],
+  const inference = await startFakeOpenAiCompatibleServer({
+    apiKey: inferenceKey,
+    chatContent: "PONG",
+    host: "0.0.0.0",
+    model,
+    port: 8000,
+    progress,
+    publicHost: "localhost",
+    requireAuth: true,
+    requireAuthModels: true,
+  });
+  cleanup.add("close runtime identity inference prerequisite", async () => {
+    try {
+      await artifacts.writeJson(`${artifactPrefix}-inference-requests.json`, inference.requests());
+    } finally {
+      await inference.close();
+    }
   });
 
+  progress.phase("onboard a real OpenShell sandbox");
   const onboard = await onboardSandbox(
     artifacts,
     sandboxName,
-    { NVIDIA_INFERENCE_API_KEY: apiKey },
-    [apiKey],
-    "tc-inf-05-onboard-credential-isolation",
+    {
+      COMPATIBLE_API_KEY: inferenceKey,
+      NEMOCLAW_ENDPOINT_URL: inference.baseUrl,
+      NEMOCLAW_MODEL: model,
+      NEMOCLAW_PREFERRED_API: "openai-completions",
+      NEMOCLAW_PROVIDER: "custom",
+    },
+    [inferenceKey],
+    `${artifactPrefix}-onboard-real-openshell-sandbox`,
+    progress,
+    15 * 60_000,
   );
-  expectOnboardSuccess(onboard, "TC-INF-05 credential-isolation onboard");
-  cleanup.add(`strict inference-routing credential-isolation cleanup for ${sandboxName}`, () =>
+  expectOnboardSuccess(onboard, `${scenario.testId} real OpenShell prerequisite onboard`);
+  cleanup.add(`strict runtime identity sandbox cleanup for ${sandboxName}`, () =>
     cleanupSandbox(host, sandbox, sandboxName, { strict: true }),
   );
 
-  const sandboxEnv = await runOpenShell(["sandbox", "exec", "-n", sandboxName, "--", "env"], {
-    artifactName: "tc-inf-05-sandbox-env",
-    artifacts,
-    env: buildAvailabilityProbeEnv(),
-    redactionValues: [apiKey],
-    timeoutMs: 60_000,
+  // Remove stale fixture-owned objects left by a previously interrupted local
+  // run. Both operations are best-effort and target only this E2E namespace.
+  await sandbox.openshell(["provider", "delete", providerName], {
+    artifactName: `${artifactPrefix}-preclean-provider`,
+    env: openshellEnv,
+    timeoutMs: 30_000,
   });
-  expect(sandboxEnv.exitCode, redactedResultText(sandboxEnv)).toBe(0);
-  expect(sandboxEnv.stdout.includes(apiKey), redactedResultText(sandboxEnv)).toBe(false);
+  await sandbox.openshell(["provider", "profile", "delete", providerType], {
+    artifactName: `${artifactPrefix}-preclean-profile`,
+    env: openshellEnv,
+    timeoutMs: 30_000,
+  });
 
-  const processList = await runOpenShell(
+  const settingsBefore = await sandbox.openshell(["settings", "get", "--global", "--json"], {
+    artifactName: `${artifactPrefix}-provider-policy-setting-before`,
+    env: openshellEnv,
+    timeoutMs: 30_000,
+  });
+  expect(settingsBefore.exitCode, resultText(settingsBefore)).toBe(0);
+  const settingsDocument = JSON.parse(settingsBefore.stdout) as {
+    settings?: Record<string, string>;
+  };
+  const priorProvidersV2Setting = settingsDocument.settings?.providers_v2_enabled;
+  const restoreSettingArgs = new Map<string, string[]>([
+    ["<unset>", ["settings", "delete", "--global", "--key", "providers_v2_enabled", "--yes"]],
     [
-      "sandbox",
-      "exec",
-      "-n",
-      sandboxName,
-      "--",
-      "sh",
-      "-lc",
-      "ps aux 2>/dev/null || ps -ef 2>/dev/null",
+      "false",
+      ["settings", "set", "--global", "--key", "providers_v2_enabled", "--value", "false", "--yes"],
+    ],
+    [
+      "true",
+      ["settings", "set", "--global", "--key", "providers_v2_enabled", "--value", "true", "--yes"],
+    ],
+  ]).get(priorProvidersV2Setting ?? "");
+  expect(restoreSettingArgs).toBeDefined();
+  cleanup.add("restore OpenShell provider-derived policy setting", async () => {
+    const restored = await sandbox.openshell(restoreSettingArgs!, {
+      artifactName: `${artifactPrefix}-provider-policy-setting-restore`,
+      env: openshellEnv,
+      timeoutMs: 30_000,
+    });
+    expect(restored.exitCode, resultText(restored)).toBe(0);
+  });
+  const enableProviderPolicy = await sandbox.openshell(
+    ["settings", "set", "--global", "--key", "providers_v2_enabled", "--value", "true", "--yes"],
+    {
+      artifactName: `${artifactPrefix}-provider-policy-setting-enable`,
+      env: openshellEnv,
+      timeoutMs: 30_000,
+    },
+  );
+  expect(enableProviderPolicy.exitCode, resultText(enableProviderPolicy)).toBe(0);
+
+  progress.phase("start the public OAuth issuer and protected resource");
+  const oauth = await startRuntimeIdentityOAuthServer({
+    clientId,
+    clientSecret,
+    initialRefreshToken: refreshToken,
+    resourcePath: scenario.resourcePath,
+    tokenPath: scenario.tokenPath,
+  });
+  cleanup.add("close runtime identity OAuth fixture", async () => {
+    try {
+      await artifacts.writeJson(
+        `${artifactPrefix}-oauth-token-requests.json`,
+        oauth.tokenRequests(),
+      );
+      await artifacts.writeJson(
+        `${artifactPrefix}-protected-resource-requests.json`,
+        oauth.resourceRequests(),
+      );
+    } finally {
+      await oauth.close();
+    }
+  });
+  const cloudflaredBin = await resolveVerifiedCloudflaredBinary(cleanup, host);
+  const tunnel = await startPublicMcpHttpsTunnel({
+    cloudflaredBin,
+    cleanup,
+    label: "runtime identity OAuth",
+    progress,
+    readinessPath: scenario.resourcePath,
+    readinessStatus: 401,
+    server: oauth,
+  });
+  const endpoint = new URL(tunnel.origin);
+  const runtimeIdentityProfilePolicy = {
+    providerType,
+    clientIdEnvironmentName: scenario.clientIdEnvironmentName,
+    dnsResolution: "identity-platform-controlled",
+    tokenIssuer: {
+      trustedHostnames: [endpoint.hostname],
+      trustedHostSuffixes: [],
+    },
+    credentialDelivery: {
+      method: "GET",
+      path: scenario.reviewedResourcePath,
+      trustedHostnames: [endpoint.hostname],
+      trustedHostSuffixes: [],
+    },
+    trustedBinaries: [
+      "/usr/local/bin/node",
+      "/usr/bin/node",
+      "/usr/local/bin/curl",
+      "/usr/bin/curl",
+    ],
+  };
+  const profileFilename = `${providerType}.yaml`;
+  const profilePath = path.join(profileDir, profileFilename);
+  fs.writeFileSync(
+    profilePath,
+    [
+      `id: ${providerType}`,
+      `display_name: ${scenario.testId} Runtime Identity Conformance`,
+      `description: Deterministic ${scenario.testId} OAuth refresh and bearer-injection conformance profile`,
+      "category: agent",
+      "credentials:",
+      `  - name: ${credentialKey}`,
+      "    description: Short-lived conformance access token",
+      "    env_vars:",
+      `      - ${credentialKey}`,
+      "    required: true",
+      "    auth_style: bearer",
+      "    header_name: authorization",
+      "    refresh:",
+      "      strategy: oauth2_refresh_token",
+      `      token_url: ${tunnel.origin}${scenario.tokenPath}`,
+      "      refresh_before_seconds: 300",
+      "      max_lifetime_seconds: 3600",
+      "      material:",
+      "        - name: client_id",
+      "          required: true",
+      "        - name: refresh_token",
+      "          required: true",
+      "          secret: true",
+      "        - name: client_secret",
+      "          required: false",
+      "          secret: true",
+      "endpoints:",
+      `  - host: ${endpoint.hostname}`,
+      "    port: 443",
+      "    protocol: rest",
+      "    enforcement: enforce",
+      "    rules:",
+      `      - allow: { method: GET, path: "${scenario.reviewedResourcePath}" }`,
+      "binaries:",
+      "  - /usr/local/bin/node",
+      "  - /usr/bin/node",
+      "  - /usr/local/bin/curl",
+      "  - /usr/bin/curl",
+      "inference_capable: false",
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+  fs.writeFileSync(
+    path.join(workdir, "blueprint.yaml"),
+    [
+      'version: "1.0"',
+      "components:",
+      "  sandbox:",
+      "    image: openclaw",
+      `    name: ${sandboxName}`,
+      "  inference:",
+      "    profiles:",
+      "      default:",
+      "        provider_type: openai",
+      "        provider_name: compatible-endpoint",
+      `        model: ${model}`,
+      "  identity:",
+      `    profile_path: provider-profiles/${profileFilename}`,
+      `    provider_type: ${providerType}`,
+      `    provider_name: ${providerName}`,
+      `    credential_key: ${credentialKey}`,
+      `    client_id_env: ${scenario.clientIdEnvironmentName}`,
+      `    refresh_token_env: ${scenario.refreshTokenEnvironmentName}`,
+      `    client_secret_env: ${scenario.clientSecretEnvironmentName}`,
+      "",
+    ].join("\n"),
+    { mode: 0o600 },
+  );
+
+  const redactionValues = [...oauth.secretValues(), inferenceKey];
+  const runnerPath = path.join(REPO_ROOT, "nemoclaw/src/blueprint/runner.ts");
+  const tsxPath = path.join(REPO_ROOT, "node_modules/tsx/dist/cli.mjs");
+  const runnerEnv = {
+    ...openshellEnv,
+    [scenario.clientIdEnvironmentName]: clientId,
+    [scenario.refreshTokenEnvironmentName]: refreshToken,
+    [scenario.clientSecretEnvironmentName]: clientSecret,
+  };
+
+  await artifacts.target.declare({
+    id: scenario.targetId,
+    issue: 6871,
+    contract: [
+      "plan exposes only the provider-neutral, non-secret identity binding",
+      "the blueprint runner imports the profile, creates and attaches the provider through real OpenShell",
+      "apply preserves the already-active provider and model route before attaching identity",
+      "OpenShell exchanges the refresh token at a public HTTPS OAuth endpoint",
+      `credential delivery is restricted to GET ${scenario.reviewedResourcePath}`,
+      "a sandbox request carries only an opaque placeholder and the protected resource receives the minted bearer",
+      "a second refresh uses the rotated refresh token, and a later child launch receives a new placeholder whose request carries the new bearer",
+      "status, persisted state, command artifacts, and request ledgers contain no OAuth secret material",
+      "rollback detaches and deletes the owned provider while preserving the reused sandbox",
+    ],
+    openshellBoundary: "real gateway, provider refresh, attachment, sandbox exec, L7 injection",
+    oauthBoundary: "public DNS and publicly trusted TLS through trycloudflare.com",
+  });
+
+  progress.phase("plan the non-secret runtime identity reference");
+  const plan = await runRawCommand(
+    process.execPath,
+    [
+      tsxPath,
+      "--input-type=module",
+      "--eval",
+      `const { main } = await import(${JSON.stringify(runnerPath)}); await main(["plan"]);`,
     ],
     {
-      artifactName: "tc-inf-05-sandbox-process-list",
+      artifactName: `${artifactPrefix}-runtime-identity-plan`,
       artifacts,
-      env: buildAvailabilityProbeEnv(),
-      redactionValues: [apiKey],
+      cwd: workdir,
+      env: runnerEnv,
+      progress,
+      redactionValues,
       timeoutMs: 60_000,
     },
   );
-  if (processList.exitCode === 0 && processList.stdout.trim()) {
-    expect(processList.stdout.includes(apiKey), redactedResultText(processList)).toBe(false);
-  } else {
-    await artifacts.writeJson("tc-inf-05-process-list-skipped.json", {
-      reason: "ps not available in hardened sandbox",
-      exitCode: processList.exitCode,
-    });
+  const planText = resultText(plan);
+  expect(plan.exitCode, planText).toBe(0);
+  expect(planText).toContain(`"provider_type": "${providerType}"`);
+  expect(planText).toContain(`"provider_name": "${providerName}"`);
+  expect(planText).toContain(`"credential_key": "${credentialKey}"`);
+  for (const forbidden of [
+    scenario.clientIdEnvironmentName,
+    scenario.refreshTokenEnvironmentName,
+    scenario.clientSecretEnvironmentName,
+    ...redactionValues,
+  ]) {
+    expect(planText).not.toContain(forbidden);
   }
 
-  const scanScript = [
-    "const crypto=require('crypto')",
-    "const fs=require('fs')",
-    "const {execFileSync}=require('child_process')",
-    "const len=Number(process.env.KEY_LEN||'0')",
-    "const salt=process.env.SCAN_SALT||''",
-    "const target=process.env.TARGET_HASH||''",
-    "const digest=(value)=>crypto.createHash('sha256').update(salt).update(value).digest('hex')",
-    "if(!len||!salt||!target){console.log('SCAN_CONFIG_MISSING');process.exit(0)}",
-    "let out=''",
-    "try{out=execFileSync('sh',['-lc','find /sandbox /home /tmp -type f -size -1M 2>/dev/null | head -200'],{encoding:'utf8'})}catch{console.log('SCAN_ERROR');process.exit(0)}",
-    "for(const file of out.trim().split(/\\n/).filter(Boolean)){try{const content=fs.readFileSync(file,'utf8');for(let i=0;i<=content.length-len;i++){if(digest(content.slice(i,i+len))===target){console.log('FOUND:'+file);break}}}catch{}}",
-    "console.log('SCAN_DONE')",
-  ].join(";");
-  const leakCanary = `nemoclaw-fs-scan-canary-${crypto.randomUUID()}`;
-  const canaryPath = "/tmp/nemoclaw-fs-scan-canary.txt";
-  const plantCanary = await sandbox.execShell(
-    sandboxName,
-    trustedSandboxShellScript(`printf '%s' '${leakCanary}' > ${canaryPath}`),
+  progress.phase("apply and attach the runtime identity through OpenShell");
+  const apply = await runRawCommand(
+    process.execPath,
+    [
+      tsxPath,
+      "--input-type=module",
+      "--eval",
+      `const { main } = await import(${JSON.stringify(runnerPath)}); await main(["apply"], { runtimeIdentityProfilePolicy: ${JSON.stringify(runtimeIdentityProfilePolicy)} });`,
+    ],
     {
-      artifactName: "tc-inf-05-sandbox-filesystem-canary-plant",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 30_000,
-    },
-  );
-  expect(plantCanary.exitCode, resultText(plantCanary)).toBe(0);
-  const canarySalt = crypto.randomUUID();
-  const canaryScan = await runOpenShell(
-    ["sandbox", "exec", "-n", sandboxName, "--", "node", "-e", scanScript],
-    {
-      artifactName: "tc-inf-05-sandbox-filesystem-canary-scan",
+      artifactName: `${artifactPrefix}-runtime-identity-apply`,
       artifacts,
-      env: rawOpenShellEnv({
-        KEY_LEN: String(leakCanary.length),
-        SCAN_SALT: canarySalt,
-        TARGET_HASH: crypto
-          .createHash("sha256")
-          .update(canarySalt)
-          .update(leakCanary)
-          .digest("hex"),
-      }),
-      timeoutMs: 90_000,
+      cwd: workdir,
+      env: runnerEnv,
+      progress,
+      redactionValues,
+      timeoutMs: 5 * 60_000,
     },
   );
-  expect(canaryScan.stdout, redactedResultText(canaryScan)).toContain(`FOUND:${canaryPath}`);
-
-  const removeCanary = await sandbox.execShell(
-    sandboxName,
-    trustedSandboxShellScript(`rm -f ${canaryPath}`),
+  const applyText = resultText(apply);
+  expect(apply.exitCode, applyText).toBe(0);
+  expect(applyText).toContain(`Sandbox '${sandboxName}' is ready.`);
+  expect(applyText).toContain("Provider 'compatible-endpoint' already exists, reusing.");
+  expect(applyText).toContain(
+    `Inference route 'compatible-endpoint / ${model}' is already active, reusing.`,
+  );
+  for (const secret of redactionValues) expect(applyText).not.toContain(secret);
+  expect(oauth.tokenRequests()).toEqual([
     {
-      artifactName: "tc-inf-05-sandbox-filesystem-canary-remove",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 30_000,
+      method: "POST",
+      path: scenario.tokenPath,
+      grantTypeOk: true,
+      clientIdOk: true,
+      refreshTokenOk: true,
+      clientSecretOk: true,
+      issuedVersion: 1,
     },
-  );
-  expect(removeCanary.exitCode, resultText(removeCanary)).toBe(0);
+  ]);
 
-  const secretScanSalt = crypto.randomUUID();
-  const filesystemScan = await runOpenShell(
-    ["sandbox", "exec", "-n", sandboxName, "--", "node", "-e", scanScript],
-    {
-      artifactName: "tc-inf-05-sandbox-filesystem-scan",
-      artifacts,
-      env: rawOpenShellEnv({
-        KEY_LEN: String(apiKey.length),
-        SCAN_SALT: secretScanSalt,
-        TARGET_HASH: crypto
-          .createHash("sha256")
-          .update(secretScanSalt)
-          .update(apiKey)
-          .digest("hex"),
-      }),
-      redactionValues: [apiKey],
-      timeoutMs: 90_000,
-    },
-  );
-  expect(filesystemScan.stdout).not.toContain("SCAN_CONFIG_MISSING");
-  expect(filesystemScan.stdout).not.toContain("FOUND:");
-  expect(filesystemScan.stdout, redactedResultText(filesystemScan)).toContain("SCAN_DONE");
-
-  const placeholder = await sandbox.execShell(
-    sandboxName,
-    trustedSandboxShellScript("printenv NVIDIA_INFERENCE_API_KEY 2>/dev/null || true"),
-    {
-      artifactName: "tc-inf-05-sandbox-placeholder",
-      env: buildAvailabilityProbeEnv(),
-      redactionValues: [apiKey],
-      timeoutMs: 30_000,
-    },
-  );
-  const placeholderValue = placeholder.stdout.trim();
-  if (!placeholderValue) {
-    await artifacts.writeJson("tc-inf-05-placeholder-skipped.json", {
-      reason:
-        "NVIDIA_INFERENCE_API_KEY not set in sandbox; placeholder injection may not be active",
-    });
-  } else {
-    expect(placeholderValue, "sandbox has the real key, not a placeholder").not.toBe(apiKey);
-  }
-});
-
-test("TC-INF-02 OpenAI provider responds through inference.local", {
-  timeout: 15 * 60_000,
-}, async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
-  if (!shouldRunProviderSmoke("openai")) {
-    skipLive(
-      skip,
-      "set NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE=openai or all to run OpenAI smoke",
-    );
-  }
-  const apiKey = secrets.optional("OPENAI_API_KEY") ?? skipLive(skip, "OPENAI_API_KEY not set");
-  await requireLivePrerequisites(host, skip);
-  const sandboxName = inferenceSandboxName("e2e-openai");
-  const model = process.env.NEMOCLAW_OPENAI_MODEL || "gpt-4o-mini";
-  cleanup.add(`best-effort inference-routing OpenAI cleanup for ${sandboxName}`, () =>
-    cleanupSandbox(host, sandbox, sandboxName),
-  );
-  await cleanupSandbox(host, sandbox, sandboxName);
-
-  await artifacts.target.declare({
-    id: "inference-routing-openai",
-    contract: ["OpenAI provider onboards", "sandbox inference.local routes chat to OpenAI"],
-    model,
+  const runId = /^RUN_ID:(\S+)$/m.exec(apply.stdout)?.[1];
+  expect(runId).toMatch(/^nc-[A-Za-z0-9-]+$/);
+  const stateDir = path.join(os.homedir(), ".nemoclaw", "state", "runs", runId!);
+  const persistedPlan = fs.readFileSync(path.join(stateDir, "plan.json"), "utf8");
+  const parsedPersistedPlan = JSON.parse(persistedPlan) as {
+    inference_provider_created_by_apply?: boolean;
+    identity?: Record<string, unknown>;
+  };
+  expect(parsedPersistedPlan.identity).toMatchObject({
+    provider_type: providerType,
+    provider_name: providerName,
+    credential_key: credentialKey,
+    provider_created: true,
+    attachment_created: true,
   });
+  expect(parsedPersistedPlan).toMatchObject({
+    sandbox_created_by_apply: false,
+    inference_provider_created_by_apply: false,
+  });
+  for (const forbidden of [
+    scenario.clientIdEnvironmentName,
+    scenario.refreshTokenEnvironmentName,
+    scenario.clientSecretEnvironmentName,
+    ...redactionValues,
+  ]) {
+    expect(persistedPlan).not.toContain(forbidden);
+  }
 
-  const onboard = await onboardSandbox(
-    artifacts,
-    sandboxName,
-    { NEMOCLAW_MODEL: model, NEMOCLAW_PROVIDER: "openai", OPENAI_API_KEY: apiKey },
-    [apiKey],
-    "tc-inf-02-onboard-openai",
+  const refreshStatus = await sandbox.openshell(
+    ["provider", "refresh", "status", providerName, "--credential-key", credentialKey],
+    {
+      artifactName: `${artifactPrefix}-provider-refresh-status-v1`,
+      env: openshellEnv,
+      timeoutMs: 30_000,
+    },
   );
-  expectOnboardSuccess(onboard, "TC-INF-02 OpenAI onboard");
-  cleanup.add(`strict inference-routing OpenAI cleanup for ${sandboxName}`, () =>
-    cleanupSandbox(host, sandbox, sandboxName, { strict: true }),
-  );
+  expect(refreshStatus.exitCode, resultText(refreshStatus)).toBe(0);
+  expect(resultText(refreshStatus)).toMatch(/refreshed/i);
+
+  progress.phase("prove inference remains live after identity attachment");
+  const inferenceRequestOffset = inference.requests().length;
   await expectOpenAiChatThroughSandbox(
     sandbox,
     sandboxName,
     model,
-    [apiKey],
-    "openai-inference-local-chat",
+    [inferenceKey],
+    `${artifactPrefix}-inference-after-identity-attach`,
   );
-});
-
-test("TC-INF-03 Anthropic provider responds through inference.local", {
-  timeout: 15 * 60_000,
-}, async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
-  if (!shouldRunProviderSmoke("anthropic")) {
-    skipLive(
-      skip,
-      "set NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE=anthropic or all to run Anthropic smoke",
-    );
-  }
-  const apiKey =
-    secrets.optional("ANTHROPIC_API_KEY") ?? skipLive(skip, "ANTHROPIC_API_KEY not set");
-  await requireLivePrerequisites(host, skip);
-  const sandboxName = inferenceSandboxName("e2e-anthropic");
-  const model = process.env.NEMOCLAW_ANTHROPIC_MODEL || "claude-sonnet-4-6";
-  cleanup.add(`best-effort inference-routing Anthropic cleanup for ${sandboxName}`, () =>
-    cleanupSandbox(host, sandbox, sandboxName),
+  expect(inference.requests().slice(inferenceRequestOffset)).toContainEqual(
+    expect.objectContaining({
+      auth: "ok",
+      hostHeader: "host.openshell.internal:8000",
+      method: "POST",
+      model,
+      path: "/v1/chat/completions",
+    }),
   );
-  await cleanupSandbox(host, sandbox, sandboxName);
 
-  await artifacts.target.declare({
-    id: "inference-routing-anthropic",
-    contract: [
-      "Anthropic provider onboards",
-      "sandbox inference.local routes Messages API to Anthropic",
+  progress.phase("call the protected resource with the injected bearer");
+  let placeholder = "";
+  let placeholderProbeAttempt = 0;
+  await expect
+    .poll(
+      async () => {
+        placeholderProbeAttempt += 1;
+        const probe = await sandbox.exec(sandboxName, ["/usr/bin/printenv", credentialKey], {
+          artifactName: `${artifactPrefix}-placeholder-before-rotation-${placeholderProbeAttempt}`,
+          env: openshellEnv,
+          timeoutMs: 30_000,
+        });
+        placeholder = probe.exitCode === 0 ? probe.stdout.trim() : "";
+        return placeholder;
+      },
+      { interval: 2_000, timeout: 35_000 },
+    )
+    .toMatch(new RegExp(`^openshell:resolve:env:(?:v[0-9]+_)?${credentialKey}$`));
+  expect(placeholder).toMatch(new RegExp(`^openshell:resolve:env:(?:v[0-9]+_)?${credentialKey}$`));
+  for (const secret of redactionValues) expect(placeholder).not.toContain(secret);
+
+  const expectProtectedResourceVersion = async (
+    projectedPlaceholder: string,
+    expectedVersion: number,
+    artifactPrefix: string,
+  ): Promise<void> => {
+    let attempt = 0;
+    await expect
+      .poll(
+        async () => {
+          attempt += 1;
+          const resource = await sandbox.exec(
+            sandboxName,
+            [
+              "/usr/bin/curl",
+              "-fsS",
+              "-H",
+              `Authorization: Bearer ${projectedPlaceholder}`,
+              `${tunnel.origin}${scenario.resourcePath}`,
+            ],
+            {
+              artifactName: `${artifactPrefix}-${attempt}`,
+              env: openshellEnv,
+              timeoutMs: 60_000,
+            },
+          );
+          let response: unknown = null;
+          try {
+            response = JSON.parse(resource.stdout);
+          } catch {
+            response = null;
+          }
+          return { exitCode: resource.exitCode, response };
+        },
+        { interval: 2_000, timeout: 35_000 },
+      )
+      .toEqual({
+        exitCode: 0,
+        response: {
+          authenticated: true,
+          access_token_version: expectedVersion,
+        },
+      });
+  };
+
+  await expectProtectedResourceVersion(placeholder, 1, `${artifactPrefix}-protected-resource-v1`);
+  expect(oauth.resourceRequests()).toEqual([
+    {
+      method: "GET",
+      path: scenario.resourcePath,
+      auth: "ok",
+      accessTokenVersion: 1,
+    },
+  ]);
+
+  progress.phase("reject unreviewed credential delivery before bearer substitution");
+  const admittedRequestCount = oauth.resourceRequests().length;
+  const deniedResource = await sandbox.exec(
+    sandboxName,
+    [
+      "/usr/bin/curl",
+      "-fsS",
+      "-X",
+      scenario.deniedMethod,
+      "-H",
+      `Authorization: Bearer ${placeholder}`,
+      `${tunnel.origin}${scenario.deniedPath}`,
     ],
-    model,
+    {
+      artifactName: `${artifactPrefix}-unreviewed-resource-policy`,
+      env: openshellEnv,
+      timeoutMs: 60_000,
+    },
+  );
+  expect(deniedResource.exitCode, resultText(deniedResource)).not.toBe(0);
+  expect(oauth.resourceRequests()).toHaveLength(admittedRequestCount);
+
+  progress.phase("rotate the credential and relaunch with its new placeholder");
+  const rotate = await sandbox.openshell(
+    ["provider", "refresh", "rotate", providerName, "--credential-key", credentialKey],
+    {
+      artifactName: `${artifactPrefix}-provider-refresh-rotate-v2`,
+      env: openshellEnv,
+      timeoutMs: 60_000,
+    },
+  );
+  expect(rotate.exitCode, resultText(rotate)).toBe(0);
+  expect(oauth.tokenRequests()).toHaveLength(2);
+  expect(oauth.tokenRequests()[1]).toEqual({
+    method: "POST",
+    path: scenario.tokenPath,
+    grantTypeOk: true,
+    clientIdOk: true,
+    refreshTokenOk: true,
+    clientSecretOk: true,
+    issuedVersion: 2,
   });
 
-  const onboard = await onboardSandbox(
-    artifacts,
-    sandboxName,
-    { ANTHROPIC_API_KEY: apiKey, NEMOCLAW_MODEL: model, NEMOCLAW_PROVIDER: "anthropic" },
-    [apiKey],
-    "tc-inf-03-onboard-anthropic",
-  );
-  expectOnboardSuccess(onboard, "TC-INF-03 Anthropic onboard");
-  cleanup.add(`strict inference-routing Anthropic cleanup for ${sandboxName}`, () =>
-    cleanupSandbox(host, sandbox, sandboxName, { strict: true }),
-  );
-  await expectAnthropicMessageThroughSandbox(sandbox, sandboxName, model, [apiKey]);
-});
+  let placeholderAfterRotation = "";
+  let rotationProbeAttempt = 0;
+  await expect
+    .poll(
+      async () => {
+        rotationProbeAttempt += 1;
+        const placeholderAfter = await sandbox.exec(
+          sandboxName,
+          ["/usr/bin/printenv", credentialKey],
+          {
+            artifactName: `${artifactPrefix}-placeholder-after-rotation-${rotationProbeAttempt}`,
+            env: openshellEnv,
+            timeoutMs: 30_000,
+          },
+        );
+        placeholderAfterRotation =
+          placeholderAfter.exitCode === 0 ? placeholderAfter.stdout.trim() : "";
+        return placeholderAfterRotation === placeholder ? "" : placeholderAfterRotation;
+      },
+      { interval: 2_000, timeout: 35_000 },
+    )
+    .toMatch(new RegExp(`^openshell:resolve:env:v[0-9]+_${credentialKey}$`));
+  expect(placeholderAfterRotation).not.toBe(placeholder);
+  for (const secret of redactionValues) expect(placeholderAfterRotation).not.toContain(secret);
 
-test("TC-INF-09 custom OpenAI-compatible endpoint responds through inference.local", {
-  timeout: 15 * 60_000,
-}, async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
-  if (!shouldRunProviderSmoke("compatible")) {
-    skipLive(
+  await expectProtectedResourceVersion(
+    placeholderAfterRotation,
+    2,
+    `${artifactPrefix}-protected-resource-v2`,
+  );
+  expect(oauth.resourceRequests()).toEqual([
+    {
+      method: "GET",
+      path: scenario.resourcePath,
+      auth: "ok",
+      accessTokenVersion: 1,
+    },
+    {
+      method: "GET",
+      path: scenario.resourcePath,
+      auth: "ok",
+      accessTokenVersion: 2,
+    },
+  ]);
+
+  progress.phase("verify secret-safe status and deterministic rollback");
+  const status = await runRawCommand(
+    process.execPath,
+    [
+      tsxPath,
+      "--input-type=module",
+      "--eval",
+      `const { main } = await import(${JSON.stringify(runnerPath)}); await main(["status", "--run-id", ${JSON.stringify(runId)}]);`,
+    ],
+    {
+      artifactName: `${artifactPrefix}-runtime-identity-status`,
+      artifacts,
+      cwd: workdir,
+      env: runnerEnv,
+      progress,
+      redactionValues,
+      timeoutMs: 60_000,
+    },
+  );
+  const statusText = resultText(status);
+  expect(status.exitCode, statusText).toBe(0);
+  expect(statusText).toContain(`"run_id": "${runId}"`);
+  expect(statusText).toContain(`"provider_name": "${providerName}"`);
+  for (const secret of redactionValues) expect(statusText).not.toContain(secret);
+
+  const rollback = await runRawCommand(
+    process.execPath,
+    [
+      tsxPath,
+      "--input-type=module",
+      "--eval",
+      `const { main } = await import(${JSON.stringify(runnerPath)}); await main(["rollback", "--run-id", ${JSON.stringify(runId)}]);`,
+    ],
+    {
+      artifactName: `${artifactPrefix}-runtime-identity-rollback`,
+      artifacts,
+      cwd: workdir,
+      env: runnerEnv,
+      progress,
+      redactionValues,
+      timeoutMs: 2 * 60_000,
+    },
+  );
+  expect(rollback.exitCode, resultText(rollback)).toBe(0);
+  expect(fs.existsSync(path.join(stateDir, "rolled_back"))).toBe(true);
+
+  const providerAfterRollback = await sandbox.openshell(["provider", "get", providerName], {
+    artifactName: `${artifactPrefix}-provider-after-rollback`,
+    env: openshellEnv,
+    timeoutMs: 30_000,
+  });
+  expect(providerAfterRollback.exitCode).not.toBe(0);
+  const reusedSandboxAfterRollback = await sandbox.openshell(["sandbox", "get", sandboxName], {
+    artifactName: `${artifactPrefix}-reused-sandbox-after-rollback`,
+    env: openshellEnv,
+    timeoutMs: 30_000,
+  });
+  expect(reusedSandboxAfterRollback.exitCode, resultText(reusedSandboxAfterRollback)).toBe(0);
+
+  const deleteProfile = await sandbox.openshell(["provider", "profile", "delete", providerType], {
+    artifactName: `${artifactPrefix}-delete-conformance-profile`,
+    env: openshellEnv,
+    timeoutMs: 30_000,
+  });
+  expect(deleteProfile.exitCode, resultText(deleteProfile)).toBe(0);
+}
+
+test.for(RUNTIME_IDENTITY_E2E_SCENARIOS)(
+  "TC-INF-%s %sruntime identity refreshes and injects a delegated bearer through real OpenShell",
+  RUNTIME_IDENTITY_E2E_OPTIONS,
+  async (
+    [testNumber, providerLabel, scenario],
+    { artifacts, cleanup, host, progress, sandbox, skip },
+  ) => {
+    await runRuntimeIdentityE2EScenario(testNumber, providerLabel, scenario, {
+      artifacts,
+      cleanup,
+      host,
+      progress,
+      sandbox,
       skip,
-      "set NEMOCLAW_INFERENCE_ROUTING_PROVIDER_SMOKE=compatible or all to run compatible endpoint smoke",
-    );
-  }
-  const endpointUrl =
-    process.env.NEMOCLAW_ENDPOINT_URL ??
-    skipLive(skip, "Missing NEMOCLAW_ENDPOINT_URL, NEMOCLAW_COMPAT_MODEL, or COMPATIBLE_API_KEY");
-  const model =
-    process.env.NEMOCLAW_COMPAT_MODEL ||
-    process.env.NEMOCLAW_MODEL ||
-    skipLive(skip, "Missing NEMOCLAW_ENDPOINT_URL, NEMOCLAW_COMPAT_MODEL, or COMPATIBLE_API_KEY");
-  const apiKey =
-    secrets.optional("COMPATIBLE_API_KEY") ??
-    skipLive(skip, "Missing NEMOCLAW_ENDPOINT_URL, NEMOCLAW_COMPAT_MODEL, or COMPATIBLE_API_KEY");
+    });
+  },
+);
+
+test("TC-INF-09 Deep Agents Code uses a local compatible endpoint through inference.local (#5744)", {
+  timeout: 20 * 60_000,
+  meta: {
+    e2ePhases: [
+      "confirm compatible-endpoint prerequisites",
+      "start the local compatible endpoint",
+      "onboard Deep Agents Code to the endpoint",
+      "inspect the compatible provider route",
+      "request sandbox chat through inference.local",
+      "request a dcode completion through the route",
+    ],
+  },
+}, async ({ artifacts, cleanup, host, progress, sandbox, skip }) => {
+  const model = "nemoclaw-e2e-compatible";
+  const apiKey = "sk-compatible-TEST-NOT-A-REAL-VALUE";
   await requireLivePrerequisites(host, skip);
-  const sandboxName = inferenceSandboxName("e2e-compat-ep");
+  const sandboxName = inferenceSandboxName("e2e-compat");
   cleanup.add(`best-effort inference-routing compatible-endpoint cleanup for ${sandboxName}`, () =>
     cleanupSandbox(host, sandbox, sandboxName),
   );
   await cleanupSandbox(host, sandbox, sandboxName);
+  progress.phase("start the local compatible endpoint");
+  const fake = await startFakeOpenAiCompatibleServer({
+    apiKey,
+    chatContent: "PONG",
+    host: "0.0.0.0",
+    model,
+    port: 8000,
+    progress,
+    publicHost: "localhost",
+    requireAuth: true,
+    requireAuthModels: true,
+  });
+  cleanup.add("close inference-routing compatible endpoint", async () => {
+    try {
+      await artifacts.writeJson("tc-inf-09-compatible-endpoint-requests.json", fake.requests());
+    } finally {
+      await fake.close();
+    }
+  });
 
   await artifacts.target.declare({
     id: "inference-routing-compatible-endpoint",
     contract: [
-      "custom OpenAI-compatible endpoint onboards",
+      "Deep Agents Code custom OpenAI-compatible endpoint onboards",
       "sandbox inference.local routes chat to compatible endpoint",
+      "dcode returns the compatible endpoint response through the rewritten gateway route",
     ],
-    endpointUrl: redactString(endpointUrl, [apiKey]),
+    endpointUrl: fake.baseUrl,
     model,
   });
 
+  progress.phase("onboard Deep Agents Code to the endpoint");
   const onboard = await onboardSandbox(
     artifacts,
     sandboxName,
     {
       COMPATIBLE_API_KEY: apiKey,
-      NEMOCLAW_ENDPOINT_URL: endpointUrl,
+      NEMOCLAW_AGENT: "langchain-deepagents-code",
+      NEMOCLAW_ENDPOINT_URL: fake.baseUrl,
       NEMOCLAW_MODEL: model,
+      NEMOCLAW_PREFERRED_API: "openai-completions",
       NEMOCLAW_PROVIDER: "custom",
     },
     [apiKey],
     "tc-inf-09-onboard-compatible-endpoint",
+    progress,
+    15 * 60_000,
   );
   expectOnboardSuccess(onboard, "TC-INF-09 compatible-endpoint onboard");
   cleanup.add(`strict inference-routing compatible-endpoint cleanup for ${sandboxName}`, () =>
     cleanupSandbox(host, sandbox, sandboxName, { strict: true }),
   );
+  progress.phase("inspect the compatible provider route");
+  const provider = await sandbox.openshell(
+    ["provider", "get", "-g", "nemoclaw", "compatible-endpoint"],
+    {
+      artifactName: "tc-inf-09-provider-get-compatible-endpoint",
+      env: buildAvailabilityProbeEnv(),
+      timeoutMs: 30_000,
+    },
+  );
+  const providerText = resultText(provider).replace(/\u001b\[[0-9;]*m/g, "");
+  expect(provider.exitCode, providerText).toBe(0);
+  expect(providerText).toContain("Type: openai");
+  expect(providerText).toContain("Credential keys: COMPATIBLE_API_KEY");
+  expect(providerText).toContain("Config keys: OPENAI_BASE_URL");
+  expect(fake.requests()).toContainEqual(
+    expect.objectContaining({
+      auth: "ok",
+      hostHeader: "localhost:8000",
+    }),
+  );
+
+  progress.phase("request sandbox chat through inference.local");
+  const sandboxRequestOffset = fake.requests().length;
   await expectOpenAiChatThroughSandbox(
     sandbox,
     sandboxName,
@@ -1030,4 +1092,391 @@ test("TC-INF-09 custom OpenAI-compatible endpoint responds through inference.loc
     [apiKey],
     "compatible-endpoint-inference-local-chat",
   );
+  expect(fake.requests().slice(sandboxRequestOffset)).toContainEqual(
+    expect.objectContaining({
+      auth: "ok",
+      hostHeader: "host.openshell.internal:8000",
+      method: "POST",
+      model,
+      path: "/v1/chat/completions",
+    }),
+  );
+
+  progress.phase("request a dcode completion through the route");
+  const dcodeRequestOffset = fake.requests().length;
+  const dcode = await runNemoclawCli(
+    [sandboxName, "exec", "--", "dcode", "-n", "Reply with exactly one word: PONG"],
+    {
+      artifactName: "tc-inf-09-dcode-compatible-endpoint",
+      artifacts,
+      env: buildAvailabilityProbeEnv(),
+      progress,
+      redactionValues: [apiKey],
+      timeoutMs: 3 * 60_000,
+    },
+  );
+  const dcodeText = redactedResultText(dcode);
+  expect(dcode.timedOut, `TC-INF-09 dcode timed out\n${dcodeText}`).toBe(false);
+  expect(dcode.exitCode, `TC-INF-09 dcode failed\n${dcodeText}`).toBe(0);
+  expect(dcodeText).toMatch(/\bPONG\b/);
+  expect(fake.requests().slice(dcodeRequestOffset)).toContainEqual(
+    expect.objectContaining({
+      auth: "ok",
+      hostHeader: "host.openshell.internal:8000",
+      method: "POST",
+      model,
+      path: "/v1/chat/completions",
+    }),
+  );
+});
+
+test("TC-INF-11 DNS-backed HTTPS custom endpoint routes through the local pinning adapter (#6141)", {
+  timeout: 20 * 60_000,
+  meta: {
+    e2ePhases: [
+      "confirm live inference prerequisites",
+      "clear the HTTPS pin sandbox",
+      "start the public HTTPS compatible endpoint",
+      "onboard with the placeholder endpoint",
+      "reject credential-bearing endpoint state",
+      "switch to the DNS-backed HTTPS endpoint",
+      "verify pinned route isolation and DNS rebinding",
+      "verify private redirect rejection",
+    ],
+  },
+}, async ({ artifacts, cleanup, host, progress, sandbox, skip }) => {
+  progress.phase("confirm live inference prerequisites");
+  await requireLivePrerequisites(host, skip);
+  const model = "nemoclaw-e2e-https-pin";
+  const apiKey = "sk-https-pin-TEST-NOT-A-REAL-VALUE";
+  const sandboxName = inferenceSandboxName("e2e-https");
+  cleanup.add(`best-effort inference-routing https-pin cleanup for ${sandboxName}`, () =>
+    cleanupSandbox(host, sandbox, sandboxName),
+  );
+  progress.phase("clear the HTTPS pin sandbox");
+  await cleanupSandbox(host, sandbox, sandboxName);
+
+  progress.phase("start the public HTTPS compatible endpoint");
+  const fake = await startFakeHttpsCompatibleServer({ apiKey, chatContent: "PONG", model });
+  cleanup.add("close https-pin fake HTTPS compatible server", async () => {
+    try {
+      await artifacts.writeJson("tc-inf-11-https-pin-endpoint-requests.json", fake.requests());
+    } finally {
+      await fake.close();
+    }
+  });
+
+  // A genuinely public, DNS-resolvable, publicly-trusted-certificate origin
+  // is required: the adapter's SSRF preflight rejects loopback/private
+  // addresses, and only a real TLS trust chain exercises its SNI-pinned
+  // certificate validation. This reuses the same trycloudflare.com quick
+  // tunnel mechanism as the MCP-bridge DNS-rebinding coverage.
+  const cloudflaredBin = await resolveVerifiedCloudflaredBinary(cleanup, host);
+  const tunnel = await startPublicMcpHttpsTunnel({
+    cloudflaredBin,
+    cleanup,
+    label: "https-pin inference routing",
+    progress,
+    readinessPath: "/v1/models",
+    readinessStatus: 401,
+    server: fake,
+  });
+  const endpointUrl = `${tunnel.origin}/v1`;
+  const endpointHostname = new URL(tunnel.origin).hostname;
+
+  await artifacts.target.declare({
+    id: "https-pin-runtime-adapter-dns-backed-endpoint",
+    issue: 6141,
+    contract: [
+      "inference set routes a DNS-backed HTTPS endpoint through the local pinning adapter",
+      "the real upstream hostname is never persisted to the NemoClaw sandbox registry",
+      "credential-bearing query and userinfo endpoints are rejected without changing host state",
+      "OpenShell's own policy view never references the real upstream hostname",
+      "a real chat completion round-trips through the pinned TLS connection to the public endpoint",
+      "a DNS rebind of the upstream hostname after inference set does not redirect adapter traffic",
+      "an upstream redirect to a private target is rejected without relaying Location or reaching the target",
+    ],
+    endpointUrl,
+    model,
+  });
+
+  // Onboarding's own SSRF preflight (assertEndpointResolvesPublic) only
+  // rejects private/internal addresses; it does not fail closed on
+  // DNS-backed HTTPS the way the HTTPS Pin Runtime adapter's call site does,
+  // and onboarding never wires that adapter itself (only
+  // inference-set-route-containment.ts's normalizeCustomEndpointUrl does, on
+  // the `inference set --endpoint-url` path). Onboard with a disposable
+  // plain-HTTP placeholder endpoint first -- the same shape TC-INF-09 already
+  // onboards successfully with -- then switch to the DNS-backed HTTPS
+  // endpoint through `inference set --endpoint-url`, the actual #6141 call
+  // site this test exercises.
+  // Advertise localhost so onboarding exercises its host-bridge rewrite, but
+  // listen beyond host loopback so the resulting sandbox route can reach it.
+  const placeholder = await startFakeOpenAiCompatibleServer({
+    apiKey,
+    chatContent: "placeholder",
+    host: "0.0.0.0",
+    model,
+    port: 8000,
+    progress,
+    publicHost: "localhost",
+    requireAuth: true,
+    requireAuthModels: true,
+  });
+  cleanup.add("close https-pin onboarding placeholder endpoint", () => placeholder.close());
+
+  progress.phase("onboard with the placeholder endpoint");
+  const onboard = await onboardSandbox(
+    artifacts,
+    sandboxName,
+    {
+      COMPATIBLE_API_KEY: apiKey,
+      NEMOCLAW_ENDPOINT_URL: placeholder.baseUrl,
+      NEMOCLAW_MODEL: model,
+      NEMOCLAW_PREFERRED_API: "openai-completions",
+      NEMOCLAW_PROVIDER: "custom",
+    },
+    [apiKey],
+    "tc-inf-11-onboard-https-pin-placeholder",
+    progress,
+    15 * 60_000,
+  );
+  expectOnboardSuccess(onboard, "TC-INF-11 https-pin-endpoint placeholder onboard");
+  cleanup.add(`strict inference-routing https-pin cleanup for ${sandboxName}`, () =>
+    cleanupSandbox(host, sandbox, sandboxName, { strict: true }),
+  );
+
+  progress.phase("reject credential-bearing endpoint state");
+  const userinfoEndpoint = new URL(endpointUrl);
+  userinfoEndpoint.username = "e2e-user";
+  userinfoEndpoint.password = apiKey;
+  for (const [shape, credentialEndpoint] of [
+    ["userinfo", userinfoEndpoint.toString()],
+    ["query", `${endpointUrl}?api_key=${encodeURIComponent(apiKey)}`],
+  ] as const) {
+    const rejected = await runNemoclawCli(
+      [
+        "inference",
+        "set",
+        "--provider",
+        "compatible-endpoint",
+        "--model",
+        model,
+        "--sandbox",
+        sandboxName,
+        "--endpoint-url",
+        credentialEndpoint,
+        "--credential-env",
+        "COMPATIBLE_API_KEY",
+        "--inference-api",
+        "openai-completions",
+      ],
+      {
+        artifactName: `tc-inf-11-reject-${shape}-endpoint`,
+        artifacts,
+        env: { ...buildAvailabilityProbeEnv(), COMPATIBLE_API_KEY: apiKey },
+        progress,
+        redactionValues: [apiKey],
+        timeoutMs: 60_000,
+      },
+    );
+    const rejectedText = redactedResultText(rejected);
+    expect(rejected.exitCode, rejectedText).not.toBe(0);
+    expect(rejectedText).toContain("without userinfo, query, or fragment components");
+    const unchangedRegistry = fs.readFileSync(REGISTRY_FILE, "utf8");
+    expect(unchangedRegistry).not.toContain(apiKey);
+    expect(unchangedRegistry).not.toContain(endpointHostname);
+  }
+
+  progress.phase("switch to the DNS-backed HTTPS endpoint");
+  const inferenceSet = await runNemoclawCli(
+    [
+      "inference",
+      "set",
+      "--provider",
+      "compatible-endpoint",
+      "--model",
+      model,
+      "--sandbox",
+      sandboxName,
+      "--endpoint-url",
+      endpointUrl,
+      "--credential-env",
+      "COMPATIBLE_API_KEY",
+      "--inference-api",
+      "openai-completions",
+    ],
+    {
+      artifactName: "tc-inf-11-inference-set-https-pin-endpoint",
+      artifacts,
+      env: { ...buildAvailabilityProbeEnv(), COMPATIBLE_API_KEY: apiKey },
+      progress,
+      redactionValues: [apiKey],
+      timeoutMs: 60_000,
+    },
+  );
+  expect(
+    inferenceSet.exitCode,
+    `TC-INF-11 inference set https-pin endpoint failed\n${redactedResultText(inferenceSet)}`,
+  ).toBe(0);
+
+  // The real hostname must never reach the NemoClaw sandbox registry on
+  // disk: only the local adapter's host.openshell.internal route is
+  // persisted (#6141 requirement: hostname hidden from the runtime
+  // boundary; credential-bearing URL state is never persisted in plaintext).
+  const registry = JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf8")) as {
+    sandboxes?: Record<string, SandboxEntry>;
+  };
+  const registryEntry = registry.sandboxes?.[sandboxName];
+  expect(registryEntry?.endpointUrl ?? "").toContain(
+    `${HTTPS_PIN_RUNTIME_ADAPTER_BASE_ORIGIN}/route/`,
+  );
+  expect(registryEntry?.endpointUrl ?? "").not.toContain(endpointHostname);
+
+  const provider = await sandbox.openshell(
+    ["provider", "get", "-g", "nemoclaw", "compatible-endpoint"],
+    {
+      artifactName: "tc-inf-11-provider-get-compatible-endpoint",
+      env: buildAvailabilityProbeEnv(),
+      timeoutMs: 30_000,
+    },
+  );
+  const providerText = resultText(provider).replace(/\u001b\[[0-9;]*m/g, "");
+  expect(provider.exitCode, providerText).toBe(0);
+  expect(providerText).toContain("Type: openai");
+  expect(providerText).toContain("Credential keys: COMPATIBLE_API_KEY");
+  expect(providerText).toContain("Config keys: OPENAI_BASE_URL");
+
+  progress.phase("verify pinned route isolation and DNS rebinding");
+  // OpenShell's own network-policy view is a second, independent witness:
+  // it must never learn the real upstream hostname either, only the local
+  // adapter's host.openshell.internal boundary that everything else here
+  // already resolves through.
+  const policy = await sandbox.openshell(["policy", "get", "--full", sandboxName], {
+    artifactName: "tc-inf-11-policy-get-https-pin",
+    env: buildAvailabilityProbeEnv(),
+    timeoutMs: 30_000,
+  });
+  const policyText = resultText(policy).replace(/\u001b\[[0-9;]*m/g, "");
+  expect(policy.exitCode, policyText).toBe(0);
+  expect(policyText).not.toContain(endpointHostname);
+
+  const sandboxRequestOffset = fake.requests().length;
+  // OpenShell 0.0.85 refreshes the sandbox-side inference bundle every five
+  // seconds. Because this switch intentionally keeps the same provider/model
+  // identity while replacing only its endpoint binding, an immediate request
+  // can still use the placeholder route cached before `inference set`. Poll
+  // through two refresh intervals, but accept success only after the real
+  // pinned upstream records the authenticated request.
+  let routeProbeAttempt = 0;
+  await expect
+    .poll(
+      async () => {
+        routeProbeAttempt += 1;
+        await expectOpenAiChatThroughSandbox(
+          sandbox,
+          sandboxName,
+          model,
+          [apiKey],
+          `https-pin-endpoint-inference-local-chat-${routeProbeAttempt}`,
+        );
+        return fake
+          .requests()
+          .slice(sandboxRequestOffset)
+          .some(
+            (request) =>
+              request.auth === "ok" &&
+              request.method === "POST" &&
+              request.path === "/v1/chat/completions",
+          );
+      },
+      { interval: 5_000, timeout: 11_000 },
+    )
+    .toBe(true);
+  expect(fake.requests().slice(sandboxRequestOffset)).toContainEqual(
+    expect.objectContaining({
+      auth: "ok",
+      method: "POST",
+      path: "/v1/chat/completions",
+    }),
+  );
+
+  // The assertions above only prove the *initial* `inference set` reached
+  // the real target. They do not prove the adapter is resistant to a DNS
+  // record changing after the route is already pinned -- the exact
+  // SSRF/DNS-rebinding vulnerability the pinning mechanism exists to close.
+  // Rebind the tunnel hostname to a reserved, unreachable documentation
+  // address (RFC 5737 TEST-NET-1) now that the route is registered: if the
+  // adapter re-resolved DNS per request instead of using the addresses it
+  // already pinned, this chat call would fail to connect instead of
+  // succeeding.
+  const hostsFixture = await setupDnsRebindingHostsFixture(host, sandboxName, endpointHostname);
+  cleanup.add(`restore https-pin DNS rebinding hosts fixture for ${sandboxName}`, () =>
+    restoreDnsRebindingHostsFixture(host, sandboxName, hostsFixture),
+  );
+  await remapDnsRebindingHostname(
+    host,
+    sandboxName,
+    hostsFixture,
+    "192.0.2.1",
+    "tc-inf-11-dns-rebind-after-inference-set",
+  );
+
+  const rebindRequestOffset = fake.requests().length;
+  await expectOpenAiChatThroughSandbox(
+    sandbox,
+    sandboxName,
+    model,
+    [apiKey],
+    "https-pin-endpoint-dns-rebinding-chat",
+  );
+  expect(fake.requests().slice(rebindRequestOffset)).toContainEqual(
+    expect.objectContaining({
+      auth: "ok",
+      method: "POST",
+      path: "/v1/chat/completions",
+    }),
+  );
+
+  await restoreDnsRebindingHostsFixture(host, sandboxName, hostsFixture);
+
+  progress.phase("verify private redirect rejection");
+  const privateTargetRequestOffset = placeholder.requests().length;
+  const redirectTarget = new URL("chat/completions", `${placeholder.baseUrl}/`).toString();
+  fake.setChatRedirect(redirectTarget);
+  const redirectPayload = JSON.stringify({
+    model,
+    messages: [{ role: "user", content: "Reply with exactly one word: PONG" }],
+    max_tokens: 50,
+  });
+  const redirect = await sandbox.exec(
+    sandboxName,
+    [
+      "curl",
+      "-sS",
+      "--include",
+      "--location",
+      "--max-redirs",
+      "3",
+      "--max-time",
+      "60",
+      "https://inference.local/v1/chat/completions",
+      "-H",
+      "Content-Type: application/json",
+      "--data-raw",
+      redirectPayload,
+    ],
+    {
+      artifactName: "tc-inf-11-private-redirect-rejection",
+      env: buildAvailabilityProbeEnv(),
+      redactionValues: [apiKey],
+      timeoutMs: 90_000,
+    },
+  );
+  const redirectText = resultText(redirect);
+  expect(redirect.exitCode, redirectText).toBe(0);
+  expect(redirectText).toMatch(/HTTP\/1\.[01] 502/u);
+  expect(redirectText).toContain("redirect_blocked");
+  expect(redirectText.toLowerCase()).not.toContain("location:");
+  expect(placeholder.requests()).toHaveLength(privateTargetRequestOffset);
 });

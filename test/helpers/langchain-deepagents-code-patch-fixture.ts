@@ -12,6 +12,37 @@ export const agentDir = path.join(process.cwd(), "agents", "langchain-deepagents
 export const patcher = path.join(agentDir, "patch-managed-deepagents-code.py");
 const packageFixtureDirs = new Set<string>();
 
+export function managedAutoApprovalPath(root: string): string {
+  return path.join(root, "managed-auto-approval");
+}
+
+export function writeManagedAutoApproval(root: string, content: string, mode = 0o444): string {
+  const capabilityPath = managedAutoApprovalPath(root);
+  fs.writeFileSync(capabilityPath, content, { mode });
+  fs.chmodSync(capabilityPath, mode);
+  return capabilityPath;
+}
+
+export function managedReasoningEffortPath(root: string): string {
+  return path.join(root, "managed-reasoning-effort");
+}
+
+export function writeManagedReasoningEffort(root: string, content: string, mode = 0o444): string {
+  const capabilityPath = managedReasoningEffortPath(root);
+  fs.writeFileSync(capabilityPath, content, { mode });
+  fs.chmodSync(capabilityPath, mode);
+  return capabilityPath;
+}
+
+export function linkManagedReasoningEffort(root: string, content: string, mode = 0o444): string {
+  const targetPath = path.join(root, "managed-reasoning-effort-target");
+  fs.writeFileSync(targetPath, content, { mode });
+  fs.chmodSync(targetPath, mode);
+  const capabilityPath = managedReasoningEffortPath(root);
+  fs.symlinkSync(targetPath, capabilityPath);
+  return capabilityPath;
+}
+
 export function writeFixtureFile(root: string, relativePath: string, content: string): void {
   const target = path.join(root, relativePath);
   fs.mkdirSync(path.dirname(target), { recursive: true });
@@ -23,6 +54,111 @@ export function createPackageFixture(version = "0.1.34"): string {
   packageFixtureDirs.add(tempDir);
   const packageDir = path.join(tempDir, "deepagents_code");
   writeFixtureFile(packageDir, "__init__.py", '"""Test package."""');
+  writeFixtureFile(
+    tempDir,
+    "httpx/__init__.py",
+    `
+class HTTPError(Exception):
+    pass
+
+
+class RequestError(HTTPError):
+    pass
+
+
+class TransportError(RequestError):
+    pass
+
+
+class TimeoutException(TransportError):
+    pass
+
+
+class ConnectTimeout(TimeoutException):
+    pass
+
+
+class ReadTimeout(TimeoutException):
+    pass
+
+
+class WriteTimeout(TimeoutException):
+    pass
+
+
+class PoolTimeout(TimeoutException):
+    pass
+
+
+class NetworkError(TransportError):
+    pass
+
+
+class ConnectError(NetworkError):
+    pass
+
+
+class ReadError(NetworkError):
+    pass
+
+
+class WriteError(NetworkError):
+    pass
+
+
+class CloseError(NetworkError):
+    pass
+
+
+class ProxyError(TransportError):
+    pass
+`,
+  );
+  writeFixtureFile(tempDir, "langgraph_sdk/__init__.py", '"""Test package."""');
+  writeFixtureFile(
+    tempDir,
+    "langgraph_sdk/errors.py",
+    `
+class LangGraphError(Exception):
+    pass
+
+
+class APIError(LangGraphError):
+    pass
+
+
+class APIStatusError(APIError):
+    pass
+
+
+class APIConnectionError(APIError):
+    pass
+
+
+class APITimeoutError(APIConnectionError):
+    pass
+
+
+class AuthenticationError(APIStatusError):
+    pass
+
+
+class PermissionDeniedError(APIStatusError):
+    pass
+
+
+class NotFoundError(APIStatusError):
+    pass
+
+
+class RateLimitError(APIStatusError):
+    pass
+
+
+class InternalServerError(APIStatusError):
+    pass
+`,
+  );
   writeFixtureFile(
     packageDir,
     "__main__.py",
@@ -44,6 +180,7 @@ from __future__ import annotations
 
 import os
 import sys
+import asyncio
 from types import SimpleNamespace
 
 
@@ -51,6 +188,12 @@ class Parser:
     def parse_args(self):
         argv = sys.argv[1:]
         command = next((arg for arg in argv if not arg.startswith("-") and arg != "none"), None)
+        non_interactive_message = None
+        for index, arg in enumerate(argv):
+            if arg in {"-n", "--non-interactive"} and index + 1 < len(argv):
+                non_interactive_message = argv[index + 1]
+            elif arg.startswith("--non-interactive="):
+                non_interactive_message = arg.split("=", 1)[1]
         tools_command = None
         if command == "tools":
             index = argv.index("tools")
@@ -78,6 +221,11 @@ class Parser:
             no_mcp=False,
             trust_project_mcp=True,
             shell_allow_list=["bash"],
+            non_interactive_message=non_interactive_message,
+            output_format=("json" if "--json" in argv else "text"),
+            quiet=("-q" in argv or "--quiet" in argv),
+            no_stream=("--no-stream" in argv),
+            timeout=None,
         )
 
     def error(self, message):
@@ -93,7 +241,7 @@ def parse_args():
 
 
 def cli_main():
-    parse_args()
+    args = parse_args()
     tracing_flags = (
         "DEEPAGENTS_CODE_LANGSMITH_TRACING",
         "DEEPAGENTS_CODE_LANGSMITH_TRACING_V2",
@@ -108,7 +256,23 @@ def cli_main():
     assert all(os.environ.get(name) == "false" for name in tracing_flags)
     assert os.environ["LANGGRAPH_CLI_NO_ANALYTICS"] == "1"
     assert os.environ["HOME"] == "/sandbox"
-    print("managed-posture-ok")
+    output_format = getattr(args, "output_format", "text")
+    if args.non_interactive_message:
+        from deepagents_code.client.non_interactive import run_non_interactive
+
+        timeout = getattr(args, "timeout", None)
+        exit_code = asyncio.run(
+            asyncio.wait_for(
+                run_non_interactive(
+                            message=args.non_interactive_message,
+                            quiet=args.quiet,
+                            stream=not args.no_stream,
+                ),
+                        timeout=timeout,
+            )
+        )
+        raise SystemExit(exit_code)
+    print(f"managed-posture-ok auto_approve={args.auto_approve}")
 `,
   );
   writeFixtureFile(
@@ -123,14 +287,91 @@ def should_run_onboarding(state_dir=None):
     return True
 `,
   );
-  writeFixtureFile(
-    packageDir,
-    "app.py",
-    fs.readFileSync(
+  const appFixture = fs
+    .readFileSync(
       path.join(process.cwd(), "test", "fixtures", "langchain-deepagents-code", "app.py"),
       "utf8",
-    ),
-  );
+    )
+    .replace(
+      "class DeepAgentsApp:\n",
+      `class _StatusBar:
+    def __init__(self):
+        self.auto_approve = True
+
+    def set_auto_approve(self, *, enabled):
+        self.auto_approve = enabled
+
+
+class _SessionState:
+    def __init__(self):
+        self.thread_id = "thread-1"
+        self.auto_approve = True
+        self.approval_mode_key = "approval/thread-1"
+
+
+class DeepAgentsApp:
+`,
+    )
+    .replace(
+      "        self._auto_approve = True\n        self._status_bar = None\n        self._session_state = None\n",
+      `        self._auto_approve = True
+        self._status_bar = _StatusBar()
+        self._session_state = _SessionState()
+        self._agent = object()
+        self._assistant_id = "agent-1"
+        self.resume_should_fail = False
+        self.resume_should_fail_after_reset = False
+        self.agent_swap_should_fail = False
+        self.agent_swap_should_fail_after_reset = False
+        self.clear_should_fail_early = False
+        self.clear_should_fail_after_reset = False
+`,
+    )
+    .replace(
+      "    async def _on_auto_approve_enabled(self):\n        self._auto_approve = True\n\n    async def action_toggle_auto_approve(self):\n        self._auto_approve = not self._auto_approve\n",
+      `    async def _on_auto_approve_enabled(self):
+        self._auto_approve = True
+        self._status_bar.set_auto_approve(enabled=True)
+        self._session_state.auto_approve = True
+
+    async def action_toggle_auto_approve(self):
+        self._auto_approve = not self._auto_approve
+        self._status_bar.set_auto_approve(enabled=self._auto_approve)
+        self._session_state.auto_approve = self._auto_approve
+
+    async def _resume_thread(self, thread_id):
+        if self.resume_should_fail:
+            return
+        previous_thread_id = self._session_state.thread_id
+        self._session_state.thread_id = thread_id
+        if self.resume_should_fail_after_reset:
+            self._session_state.thread_id = previous_thread_id
+            raise RuntimeError("resume failed after reset")
+
+    async def _restart_server_for_agent_swap(self, agent_name):
+        if self.agent_swap_should_fail:
+            return
+        self._session_state.thread_id = f"{self._session_state.thread_id}-swap"
+        if self.agent_swap_should_fail_after_reset:
+            self._agent = None
+            raise RuntimeError("agent swap failed after reset")
+        self._assistant_id = agent_name
+        self._agent = object()
+`,
+    )
+    .replace(
+      "    async def _handle_command(self, command):\n        self.original_commands.append(command)\n",
+      `    async def _handle_command(self, command):
+        self.original_commands.append(command)
+        if command.lower().strip() in {"/clear", "/force-clear"}:
+            if self.clear_should_fail_early:
+                raise RuntimeError("clear failed before reset")
+            self._session_state.thread_id = f"{self._session_state.thread_id}-clear"
+            if self.clear_should_fail_after_reset:
+                raise RuntimeError("clear failed after reset")
+`,
+    );
+  writeFixtureFile(packageDir, "app.py", appFixture);
   writeFixtureFile(
     packageDir,
     "auth_store.py",
@@ -166,6 +407,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 _dotenv_loaded_values = {}
+CLI_MAX_RETRIES_KEY = "__deepagents_cli_max_retries__"
 
 
 def _preview_dotenv_environ(*, start_path=None):
@@ -194,12 +436,48 @@ def _get_provider_kwargs(provider, *, model_name=None):
   );
   writeFixtureFile(
     packageDir,
+    "tools.py",
+    `
+from __future__ import annotations
+
+from urllib.parse import urljoin, urlparse
+
+_ALLOWED_URL_SCHEMES = frozenset({"http", "https"})
+_MAX_FETCH_REDIRECTS = 5
+
+
+class _UrlValidationError(ValueError):
+    pass
+
+
+def _fetch_with_redirects(url, *, timeout):
+    return {"transport": "direct", "url": url, "timeout": timeout}
+`,
+  );
+  writeFixtureFile(
+    packageDir,
     "model_config.py",
     `
 from __future__ import annotations
 
 
 class ModelConfigError(RuntimeError):
+    pass
+
+
+class NoCredentialsConfiguredError(ModelConfigError):
+    pass
+
+
+class UnknownProviderError(ModelConfigError):
+    pass
+
+
+class MissingCredentialsError(ModelConfigError):
+    pass
+
+
+class MissingProviderPackageError(ModelConfigError):
     pass
 
 
@@ -321,14 +599,58 @@ def _run_single_hook(command, event, payload_bytes):
     `
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 settings = SimpleNamespace(shell_allow_list=["bash"])
+logger = logging.getLogger(__name__)
+
+
+class _Console:
+    def print(self, message):
+        print(message)
+
+
+def escape_markup(value):
+    return value
+
+
+def generate_thread_id():
+    return "thread-1"
+
+
+def _write_text(text):
+    print(text, end="", flush=True)
+
+
+def _write_newline():
+    print()
+
+
+async def _run_non_interactive_impl(*args, **kwargs):
+    del args
+    if kwargs.get("message") == "fixture-json-task":
+        return 0
+    return kwargs
+
+
+async def _run_agent_loop(*args, **kwargs):
+    return await _run_non_interactive_impl(*args, **kwargs)
 
 
 async def run_non_interactive(*args, **kwargs):
-    del args
-    return kwargs
+    console = _Console()
+    thread_id = generate_thread_id()
+    try:
+        result = await _run_agent_loop(*args, **kwargs)
+        return result
+    except Exception as e:
+        logger.exception("Unexpected error during non-interactive execution")
+        console.print(
+            f"\\n[red]Unexpected error ({type(e).__name__}): "
+            f"{escape_markup(str(e))}[/red]"
+        )
+        return 1
 
 
 async def _run_startup_command(command, console, *, quiet):
@@ -624,6 +946,14 @@ export function patchFixture(tempDir: string): void {
     .replace(
       '"/usr/local/share/nemoclaw/dcode-inference-base-url"',
       JSON.stringify(managedBaseUrlFile),
+    )
+    .replace(
+      '"/usr/local/share/nemoclaw/dcode-auto-approval"',
+      JSON.stringify(managedAutoApprovalPath(tempDir)),
+    )
+    .replace(
+      '"/usr/local/share/nemoclaw/dcode-reasoning-effort"',
+      JSON.stringify(managedReasoningEffortPath(tempDir)),
     )
     .replace("_MANAGED_FILE_OWNER_UID = 0", `_MANAGED_FILE_OWNER_UID = ${process.getuid?.() ?? 0}`);
   fs.writeFileSync(helperPath, helper, "utf8");

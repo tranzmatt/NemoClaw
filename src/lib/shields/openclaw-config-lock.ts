@@ -19,6 +19,22 @@ export const OPENCLAW_CONFIG_HASH_PATH = `${OPENCLAW_CONFIG_DIR}/.config-hash`;
 const CONTAINER_HELPER = "/usr/local/lib/nemoclaw/openclaw-config-guard.py";
 const HOST_HELPER = path.resolve(__dirname, "../../../scripts/openclaw-config-guard.py");
 const CONTAINER_TIMEOUT = ["timeout", "--signal=TERM", "--kill-after=5s", "5m"];
+// Must exceed STATE_DIR_GUARD_TIMEOUT_SECONDS (22m) in
+// scripts/openclaw-config-guard.py, which is the guard's whole-action budget
+// for the unseal and its rollback together. The outer docker client timeout in
+// shields/index.ts must exceed this timeout plus its termination grace.
+const RECOVERY_CONTAINER_TIMEOUT = ["timeout", "--signal=TERM", "--kill-after=5s", "25m"];
+const SCHEMA_VALIDATION_TIMEOUT = ["timeout", "--signal=TERM", "--kill-after=5s", "30s"];
+const MAX_SCHEMA_CANDIDATE_BYTES = 16 * 1024 * 1024;
+// OpenClaw resolves relative includes from the config file's directory.
+const SCHEMA_VALIDATION_SCRIPT = `set -eu
+umask 077
+candidate="$(mktemp "${OPENCLAW_CONFIG_DIR}/.nemoclaw-openclaw-config.XXXXXX")"
+trap 'rm -f -- "$candidate"' EXIT HUP INT TERM
+head -c ${MAX_SCHEMA_CANDIDATE_BYTES + 1} > "$candidate"
+candidate_size="$(wc -c < "$candidate")"
+test "$candidate_size" -le ${MAX_SCHEMA_CANDIDATE_BYTES}
+HOME=/sandbox OPENCLAW_CONFIG_PATH="$candidate" /usr/local/bin/openclaw config validate --json`;
 
 export type OpenClawConfigGuardAction =
   | "preflight"
@@ -30,12 +46,15 @@ export type OpenClawConfigGuardAction =
   | "write-config"
   | "recover"
   | "revoke-startup-ready"
-  | "publish-startup-ready";
+  | "publish-startup-ready"
+  | "unlock-failed-startup";
 
 export type OpenClawConfigGuardOptions = {
   expectedConfigSha256?: string;
   input?: string;
   startupOwner?: boolean;
+  /** Agent state lock plan, required by `unlock-failed-startup`. */
+  planJson?: string;
 };
 
 type GuardIssue = {
@@ -53,14 +72,19 @@ type GuardSummary = {
   files?: string[];
   chattrApplied?: boolean;
   configSha256?: string;
+  hashSynthesized?: boolean;
+  resealedDrift?: boolean;
   recovery?: string;
   originalLocked?: boolean;
 };
 
 export type OpenClawConfigGuardResult = {
   issues: string[];
+  issueCodes?: string[];
   chattrApplied: boolean;
   configSha256?: string;
+  hashSynthesized?: boolean;
+  resealedDrift?: boolean;
   recovery?: string;
   originalLocked?: boolean;
 };
@@ -76,6 +100,7 @@ const GUARD_ACTIONS = new Set<OpenClawConfigGuardAction>([
   "recover",
   "revoke-startup-ready",
   "publish-startup-ready",
+  "unlock-failed-startup",
 ]);
 
 function executionFailure(label: string, result: PrivilegedExecResult): string {
@@ -89,6 +114,100 @@ function executionFailure(label: string, result: PrivilegedExecResult): string {
 
 function stringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function printableExcerpt(value: string, maxLength: number): string {
+  return [...value.slice(0, maxLength)]
+    .map((character) => (/^[\x20-\x7e]$/.test(character) ? character : " "))
+    .join("")
+    .trim();
+}
+
+function schemaIssuePaths(payload: unknown): string[] {
+  if (!payload || typeof payload !== "object") return [];
+  const issues = (payload as { issues?: unknown }).issues;
+  if (!Array.isArray(issues)) return [];
+  const paths: string[] = [];
+  for (const issue of issues.slice(0, 8)) {
+    if (!issue || typeof issue !== "object") continue;
+    const path = (issue as { path?: unknown }).path;
+    if (typeof path !== "string") continue;
+    const sanitized = printableExcerpt(path, 256);
+    if (sanitized && !paths.includes(sanitized)) paths.push(sanitized);
+  }
+  return paths;
+}
+
+function hasSchemaIssues(payload: unknown): boolean {
+  return (
+    !!payload &&
+    typeof payload === "object" &&
+    Array.isArray((payload as { issues?: unknown }).issues)
+  );
+}
+
+export function validateOpenClawConfigCandidate(
+  privileged: PrivilegedExec,
+  input: string,
+): string[] {
+  if (Buffer.byteLength(input, "utf8") > MAX_SCHEMA_CANDIDATE_BYTES) {
+    return [
+      "OpenClaw config candidate exceeds the 16 MiB size limit; existing config was not changed",
+    ];
+  }
+  const result = privileged.run(
+    [
+      ...SCHEMA_VALIDATION_TIMEOUT,
+      "/usr/bin/setpriv",
+      "--reuid=gateway",
+      "--regid=gateway",
+      "--init-groups",
+      "--",
+      "sh",
+      "-c",
+      SCHEMA_VALIDATION_SCRIPT,
+    ],
+    input,
+  );
+  let payload: unknown;
+  try {
+    payload = JSON.parse(result.stdout.trim());
+  } catch {
+    payload = null;
+  }
+  const validatorCompleted = result.signal === null && !result.error;
+  if (
+    validatorCompleted &&
+    result.status === 0 &&
+    payload &&
+    typeof payload === "object" &&
+    (payload as { valid?: unknown }).valid === true
+  ) {
+    return [];
+  }
+
+  const paths = schemaIssuePaths(payload);
+  if (
+    validatorCompleted &&
+    result.status === 1 &&
+    payload &&
+    typeof payload === "object" &&
+    (payload as { valid?: unknown }).valid === false &&
+    hasSchemaIssues(payload)
+  ) {
+    const location = paths.length > 0 ? ` at ${paths.join(", ")}` : "";
+    return [
+      `OpenClaw config schema rejected the candidate${location}; existing config was not changed`,
+    ];
+  }
+
+  const reason =
+    result.signal !== null || result.status === 124 || result.status === 137
+      ? "timed out or was terminated"
+      : "could not run";
+  return [
+    `OpenClaw config schema validation ${reason}; existing config was not changed. Rebuild the sandbox if its OpenClaw runtime does not support config validate --json`,
+  ];
 }
 
 export function parseOpenClawConfigGuardOutput(
@@ -132,6 +251,8 @@ export function parseOpenClawConfigGuardOutput(
       (record.files === undefined || stringArray(record.files)) &&
       (record.chattrApplied === undefined || typeof record.chattrApplied === "boolean") &&
       (record.configSha256 === undefined || typeof record.configSha256 === "string") &&
+      (record.hashSynthesized === undefined || typeof record.hashSynthesized === "boolean") &&
+      (record.resealedDrift === undefined || typeof record.resealedDrift === "boolean") &&
       (record.recovery === undefined || typeof record.recovery === "string") &&
       (record.originalLocked === undefined || typeof record.originalLocked === "boolean")
     ) {
@@ -192,14 +313,22 @@ export function parseOpenClawConfigGuardOutput(
   return {
     issues: [
       ...issues.map(
-        (issue) => `OpenClaw config guard ${action} [${issue.code}] ${issue.path}: ${issue.detail}`,
+        (issue) =>
+          `OpenClaw config guard ${action} [${printableExcerpt(issue.code, 64)}] ${printableExcerpt(issue.path, 256)}: ${printableExcerpt(issue.detail, 2048)}`,
       ),
       ...contractIssues,
     ],
+    ...(issues.length > 0
+      ? { issueCodes: issues.map((issue) => printableExcerpt(issue.code, 64)) }
+      : {}),
     chattrApplied: summary?.status === "ok" && summary.chattrApplied === true,
     ...(summary?.status === "ok" && summary.configSha256
       ? { configSha256: summary.configSha256 }
       : {}),
+    ...(summary?.status === "ok" && summary.hashSynthesized === true
+      ? { hashSynthesized: true }
+      : {}),
+    ...(summary?.status === "ok" && summary.resealedDrift === true ? { resealedDrift: true } : {}),
     ...(summary?.status === "ok" && summary.recovery ? { recovery: summary.recovery } : {}),
     ...(summary?.status === "ok" && typeof summary.originalLocked === "boolean"
       ? { originalLocked: summary.originalLocked }
@@ -235,13 +364,21 @@ export function runOpenClawConfigGuard(
       chattrApplied: false,
     };
   }
+  if (action === "unlock-failed-startup" && !options.planJson) {
+    return {
+      issues: ["OpenClaw config guard unlock-failed-startup requires planJson"],
+      chattrApplied: false,
+    };
+  }
 
   const capability = privileged.run(["test", "-r", CONTAINER_HELPER]);
+  const timeoutPrefix =
+    action === "unlock-failed-startup" ? RECOVERY_CONTAINER_TIMEOUT : CONTAINER_TIMEOUT;
   let command: string[];
   let input: string | undefined;
   if (capability.status === 0 && capability.signal === null && !capability.error) {
     command = [
-      ...CONTAINER_TIMEOUT,
+      ...timeoutPrefix,
       "python3",
       "-I",
       CONTAINER_HELPER,
@@ -262,6 +399,16 @@ export function runOpenClawConfigGuard(
         chattrApplied: false,
       };
     }
+    if (action === "unlock-failed-startup") {
+      // Needs the in-image state guard and the installed helper. An injected
+      // copy satisfies neither, so refuse instead of half-running it.
+      return {
+        issues: [
+          "OpenClaw config guard is absent in the sandbox; rebuild before recovering a failed startup",
+        ],
+        chattrApplied: false,
+      };
+    }
     try {
       input = readHostHelper();
     } catch (error) {
@@ -273,15 +420,7 @@ export function runOpenClawConfigGuard(
         chattrApplied: false,
       };
     }
-    command = [
-      ...CONTAINER_TIMEOUT,
-      "python3",
-      "-I",
-      "-",
-      action,
-      "--config-dir",
-      OPENCLAW_CONFIG_DIR,
-    ];
+    command = [...timeoutPrefix, "python3", "-I", "-", action, "--config-dir", OPENCLAW_CONFIG_DIR];
   } else {
     return {
       issues: [executionFailure("OpenClaw config guard capability probe failed", capability)],
@@ -293,6 +432,7 @@ export function runOpenClawConfigGuard(
     command.push("--expected-config-sha256", options.expectedConfigSha256);
   }
   if (options.startupOwner) command.push("--startup-owner");
+  if (options.planJson) command.push("--plan-json", options.planJson);
 
   return parseOpenClawConfigGuardOutput(action, privileged.run(command, input));
 }

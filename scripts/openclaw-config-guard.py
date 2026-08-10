@@ -50,8 +50,13 @@ Action = Literal[
     "publish-startup-ready",
     "write-config",
     "recover",
+    "unlock-failed-startup",
 ]
 StartupIdentity = tuple[int, str, int]
+# One action only. It unseals both layers in a single mutex window, so the
+# multi-step host sequence can never mutate state on stale evidence (#8304).
+STARTUP_FAILURE_RECOVERY_ACTIONS = frozenset({"unlock-failed-startup"})
+INSTALLED_STATE_DIR_GUARD = "/usr/local/lib/nemoclaw/state-dir-guard.py"
 CONFIG_FILES = ("openclaw.json", ".config-hash")
 PRODUCTION_CONFIG_DIR = "/sandbox/.openclaw"
 MAX_FILE_BYTES = {
@@ -73,6 +78,18 @@ OPENSHELL_SUPERVISOR_ARGV0 = b"/opt/openshell/bin/openshell-sandbox"
 NODE_BINARY_PATH = "/usr/local/bin/node"
 JSON5_MODULE_PATH = "/opt/nemoclaw/node_modules/json5"
 JSON5_VALIDATION_TIMEOUT_SECONDS = 5
+# Whole-action budget for `unlock-failed-startup`. The recursive state guard
+# caps each transition at ten minutes. Give the forward transition that full
+# allowance, then reserve another full allowance plus two minutes of overhead
+# for the config relock and fail-closed recursive relock.
+# Keep the total below RECOVERY_CONTAINER_TIMEOUT in
+# src/lib/shields/openclaw-config-lock.ts, or the host can kill the guard before
+# the rollback finishes.
+STATE_DIR_GUARD_FORWARD_SECONDS = 10 * 60
+STATE_DIR_GUARD_ROLLBACK_SECONDS = 12 * 60
+STATE_DIR_GUARD_TIMEOUT_SECONDS = (
+    STATE_DIR_GUARD_FORWARD_SECONDS + STATE_DIR_GUARD_ROLLBACK_SECONDS
+)
 INSTALLED_HELPER_PATH = "/usr/local/lib/nemoclaw/openclaw-config-guard.py"
 COPY_BUFFER_BYTES = 1024 * 1024
 STABLE_READ_ATTEMPTS = 3
@@ -621,7 +638,17 @@ def _release_mutation_mutex(mutex: MutationMutex) -> None:
 
 
 def _cmdline_is_nemoclaw_start(raw: bytes) -> bool:
-    return any(argument in NEMOCLAW_START_ARGV for argument in raw.split(b"\0"))
+    normalized = raw.rstrip(b"\0")
+    arguments = tuple(normalized.split(b"\0")) if normalized else ()
+    # Docker appends CMD arguments after ENTRYPOINT. Authenticate the canonical
+    # startup script position while allowing those opaque trailing arguments.
+    direct = bool(arguments) and arguments[0] in NEMOCLAW_START_ARGV
+    bash = (
+        len(arguments) >= 2
+        and arguments[0] in {b"bash", b"/bin/bash", b"/usr/bin/bash"}
+        and arguments[1] in NEMOCLAW_START_ARGV
+    )
+    return direct or bash
 
 
 def _cmdline_is_openshell_supervisor(raw: bytes) -> bool:
@@ -912,7 +939,10 @@ def _pinned_process_matches_supervised_nonroot_start(
         second_namespace_inode = _proc_pid_namespace_inode(proc_pid_fd)
         pinned_after = os.fstat(proc_pid_fd)
         expected_namespace_inode = supervisor_identity[1]
-        namespace_matches = (
+        # A readable inode proves whether the child shares the supervisor's PID
+        # namespace. Landlock may hide one or both namespace links, so retain
+        # stable equality as the fail-closed evidence available in that case.
+        same_namespace_matches = (
             expected_namespace_inode is None
             and first_namespace_inode == second_namespace_inode
         ) or (
@@ -920,6 +950,35 @@ def _pinned_process_matches_supervised_nonroot_start(
             and first_namespace_inode == expected_namespace_inode
             and second_namespace_inode == expected_namespace_inode
         )
+        nested_namespace_matches = (
+            first_namespace_inode == second_namespace_inode
+            and (
+                expected_namespace_inode is None
+                or (
+                    first_namespace_inode is not None
+                    and first_namespace_inode != expected_namespace_inode
+                )
+            )
+        )
+        same_namespace_pid_matches = (
+            first_status is not None
+            and second_status is not None
+            and first_status[1][-1] == numeric_pid
+            and second_status[1][-1] == numeric_pid
+        )
+        nested_namespace_pid_matches = (
+            first_status is not None
+            and second_status is not None
+            and first_status[1][-1] == 1
+            and second_status[1][-1] == 1
+        )
+        # In a nested workload PID namespace, the direct child is kernel-owned
+        # PID 1 there even though procfs names it by its outer numeric PID.
+        # The remaining pinned start-time, UID, PPID, cmdline, and fd checks
+        # apply identically to both supported topologies below.
+        topology_matches = (
+            same_namespace_matches and same_namespace_pid_matches
+        ) or (nested_namespace_matches and nested_namespace_pid_matches)
         return bool(
             first_start_time is not None
             and second_start_time is not None
@@ -930,11 +989,10 @@ def _pinned_process_matches_supervised_nonroot_start(
             and second_status is not None
             and first_status[0] == expected_effective_uid
             and second_status[0] == expected_effective_uid
-            and first_status[1][-1] == numeric_pid
-            and second_status[1][-1] == numeric_pid
+            and first_cmdline == second_cmdline
             and _cmdline_is_nemoclaw_start(first_cmdline)
             and _cmdline_is_nemoclaw_start(second_cmdline)
-            and namespace_matches
+            and topology_matches
             and pinned_before.st_dev == pinned_after.st_dev
             and pinned_before.st_ino == pinned_after.st_ino
         )
@@ -945,14 +1003,15 @@ def _pinned_process_matches_supervised_nonroot_start(
             os.close(proc_pid_fd)
 
 
-def _openshell_supervised_nonroot_start_is_live(
+def _openshell_supervised_nonroot_start_census(
     expected_root_uid: int,
     expected_sandbox_uid: int,
-    required_pid: int | None = None,
-) -> bool:
+) -> tuple[int, int | None] | None:
+    """Return a stable OpenShell start-child census, or ``None`` on uncertainty."""
+
     supervisor_identity = _openshell_supervisor_identity(expected_root_uid)
     if supervisor_identity is None:
-        return False
+        return None
     proc_root_fd = -1
     try:
         proc_root_fd = _open_proc_root()
@@ -965,7 +1024,7 @@ def _openshell_supervised_nonroot_start_is_live(
                     continue
                 observed += 1
                 if observed > MAX_PROC_ENTRIES:
-                    return False
+                    return None
                 if _pinned_process_matches_supervised_nonroot_start(
                     proc_root_fd,
                     entry.name,
@@ -975,18 +1034,42 @@ def _openshell_supervised_nonroot_start_is_live(
                     matches += 1
                     matched_pid = int(entry.name, 10)
                     if matches > 1:
-                        return False
-        return bool(
-            matches == 1
-            and (required_pid is None or matched_pid == required_pid)
-            and _openshell_supervisor_identity(expected_root_uid)
-            == supervisor_identity
-        )
+                        return matches, None
+        if _openshell_supervisor_identity(expected_root_uid) != supervisor_identity:
+            return None
+        return matches, matched_pid
     except OSError:
-        return False
+        return None
     finally:
         if proc_root_fd >= 0:
             os.close(proc_root_fd)
+
+
+def _openshell_supervised_nonroot_start_is_live(
+    expected_root_uid: int,
+    expected_sandbox_uid: int,
+    required_pid: int | None = None,
+) -> bool:
+    census = _openshell_supervised_nonroot_start_census(
+        expected_root_uid, expected_sandbox_uid
+    )
+    return bool(
+        census is not None
+        and census[0] == 1
+        and (required_pid is None or census[1] == required_pid)
+    )
+
+
+def _openshell_supervised_nonroot_start_is_absent(
+    expected_root_uid: int,
+    expected_sandbox_uid: int,
+) -> bool:
+    """Return whether a stable OpenShell supervisor has no start child."""
+
+    census = _openshell_supervised_nonroot_start_census(
+        expected_root_uid, expected_sandbox_uid
+    )
+    return census is not None and census[0] == 0
 
 
 def _pid1_effective_uid() -> int | None:
@@ -1284,7 +1367,14 @@ def _revoke_startup_ready(identity: Identity) -> None:
 
 def _validate_action_readiness(
     action: Action, startup_owner: bool, identity: Identity
-) -> None:
+) -> bool:
+    """Authorize ``action`` and report whether only the failed-startup path allowed it.
+
+    A ``True`` result is provisional: it rests on a live procfs census taken
+    before the mutation mutex, so the caller must reconfirm it under the mutex
+    with ``_reconfirm_startup_failure_recovery`` before any effect.
+    """
+
     startup_action = action in {"revoke-startup-ready", "publish-startup-ready"}
     if startup_action:
         if not _pid1_is_nemoclaw_start() or not startup_owner or os.getppid() != 1:
@@ -1293,7 +1383,7 @@ def _validate_action_readiness(
                 STARTUP_READY_PATH,
                 f"{action} is restricted to the PID 1 startup transaction",
             )
-        return
+        return False
     installed_current = os.path.realpath(__file__) == os.path.realpath(
         INSTALLED_HELPER_PATH
     )
@@ -1302,34 +1392,49 @@ def _validate_action_readiness(
         # A source helper injected into an older image, and the local unit
         # harness, retain their explicit compatibility path. Current images
         # use the installed helper and authenticate a namespace remap below.
-        return
+        return False
     protocol_active, startup_ready = _startup_lease_state(identity)
     if not pid1_is_nemoclaw_start and not protocol_active:
         if (
             installed_current
+            # The recovery action is authorized by the escape below and by
+            # nothing else.
+            and action not in STARTUP_FAILURE_RECOVERY_ACTIONS
             and _startup_markers_absent(identity)
             and _openshell_supervised_nonroot_start_is_live(
                 identity.root_uid, identity.sandbox_uid
             )
         ):
             # OpenShell is the container PID 1 and launches the configured
-            # image command as one non-root child in the same PID namespace.
-            # That degraded topology cannot publish root-owned readiness
-            # markers, so authenticate the stable supervisor/child pair while
-            # refusing any stale or malformed marker left by a strict startup.
-            return
-        if installed_current:
-            raise GuardError(
-                "startup-not-ready",
-                STARTUP_READY_PATH,
-                "installed config guard requires NemoClaw PID 1",
+            # image command as one non-root child, either in the supervisor's
+            # PID namespace or as PID 1 in a nested workload PID namespace.
+            # When Landlock hides namespace inode links, the stable direct-child
+            # and NSpid evidence selects the same two topologies. They cannot
+            # publish root-owned readiness markers, so authenticate the stable
+            # supervisor/child pair while refusing stale or malformed markers.
+            return False
+        if (
+            installed_current
+            and action in STARTUP_FAILURE_RECOVERY_ACTIONS
+            and _startup_markers_absent(identity)
+            and _openshell_supervised_nonroot_start_is_absent(
+                identity.root_uid, identity.sandbox_uid
             )
-        return
+        ):
+            # Provisional: a child can still appear after this scan, so main()
+            # reconfirms under the mutation mutex before any effect (#8304).
+            return True
+        # The early return above leaves `installed_current` true here.
+        raise GuardError(
+            "startup-not-ready",
+            STARTUP_READY_PATH,
+            "installed config guard requires NemoClaw PID 1",
+        )
     # Source injected into an older image retains compatibility until that
     # image explicitly opts in. The trusted installed helper requires the
     # protocol from its very first exec, closing the pre-revoke boot race.
     if not installed_current and not protocol_active:
-        return
+        return False
     if installed_current and not protocol_active:
         # The supported --user sandbox entrypoint cannot create a root-owned
         # readiness capability. It also explicitly disables gateway privilege
@@ -1339,7 +1444,7 @@ def _validate_action_readiness(
         # capability opts even a non-root PID 1 into the strict lease below.
         pid1_euid = _pid1_effective_uid()
         if pid1_euid is not None and pid1_euid != identity.root_uid:
-            return
+            return False
     early_recover = action == "recover" and not startup_ready
     if early_recover:
         if not startup_owner or os.getppid() != 1:
@@ -1348,7 +1453,7 @@ def _validate_action_readiness(
                 STARTUP_READY_PATH,
                 f"{action} is restricted to the PID 1 startup transaction",
             )
-        return
+        return False
     if action in {
         "lock",
         "unlock",
@@ -1361,6 +1466,146 @@ def _validate_action_readiness(
             STARTUP_READY_PATH,
             "OpenClaw startup is not ready for host config mutations",
         )
+    return False
+
+
+def _reconfirm_startup_failure_recovery(action: Action, identity: Identity) -> None:
+    """Re-prove a failed startup while the mutation mutex is held.
+
+    The first scan runs before the mutex. Repeating it here binds the
+    authorization to the effect.
+    """
+
+    if _startup_markers_absent(identity) and _openshell_supervised_nonroot_start_is_absent(
+        identity.root_uid, identity.sandbox_uid
+    ):
+        return
+    raise GuardError(
+        "startup-not-ready",
+        STARTUP_READY_PATH,
+        f"{action} lost its failed-startup authorization before taking effect",
+    )
+
+
+def _run_state_dir_guard(
+    action: str,
+    config_dir: str,
+    plan_json: str,
+    mutation_lock_fd: int,
+    deadline: float,
+) -> None:
+    """Run the recursive state-dir guard under this process's mutation mutex.
+
+    The child takes the same mutex, so pass the held descriptor: it inherits
+    the lock instead of deadlocking on it.
+    """
+
+    if not os.path.isfile(INSTALLED_STATE_DIR_GUARD):
+        raise GuardError(
+            "state-dir-guard-missing",
+            INSTALLED_STATE_DIR_GUARD,
+            "recursive state guard is required for failed-startup recovery",
+        )
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise GuardError(
+            "state-dir-transition-timeout",
+            config_dir,
+            f"no recovery budget left for state-dir {action}",
+        )
+    try:
+        completed = subprocess.run(  # noqa: S603
+            [
+                sys.executable,
+                "-I",
+                INSTALLED_STATE_DIR_GUARD,
+                action,
+                "--config-dir",
+                config_dir,
+                "--plan-json",
+                plan_json,
+                "--transition-lock-fd",
+                str(mutation_lock_fd),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=remaining,
+            check=False,
+            pass_fds=(mutation_lock_fd,),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GuardError(
+            "state-dir-transition-timeout",
+            config_dir,
+            f"state-dir {action} exceeded the remaining recovery budget",
+        ) from exc
+    except subprocess.SubprocessError as exc:
+        raise GuardError(
+            "state-dir-transition-failed",
+            config_dir,
+            f"state-dir {action} could not complete: {exc}",
+        ) from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr.strip() or completed.stdout.strip())[:400]
+        raise GuardError(
+            "state-dir-transition-failed",
+            config_dir,
+            f"state-dir {action} failed: {detail}",
+        )
+
+
+def _run_failed_startup_unlock(
+    opened: OpenConfig,
+    identity: Identity,
+    config_dir: str,
+    plan_json: str,
+    mutation_lock_fd: int,
+    *,
+    quarantine_untrusted: bool,
+) -> None:
+    """Unseal both OpenClaw state layers or restore their locked posture.
+
+    The forward transition cannot consume the rollback reserve. Both deadlines
+    remain within the host's whole-action timeout.
+    """
+
+    rollback_deadline = time.monotonic() + STATE_DIR_GUARD_TIMEOUT_SECONDS
+    unlock_deadline = rollback_deadline - STATE_DIR_GUARD_ROLLBACK_SECONDS
+
+    try:
+        _run_state_dir_guard(
+            "unlock", config_dir, plan_json, mutation_lock_fd, unlock_deadline
+        )
+        _transition(
+            "unlock",
+            opened,
+            identity,
+            quarantine_untrusted=quarantine_untrusted,
+        )
+    except (GuardError, OSError) as exc:
+        rollback_errors: list[str] = []
+        try:
+            _transition(
+                "lock",
+                opened,
+                identity,
+                quarantine_untrusted=quarantine_untrusted,
+            )
+        except (GuardError, OSError) as rollback_exc:
+            rollback_errors.append(f"config lock: {rollback_exc}")
+        try:
+            _run_state_dir_guard(
+                "lock", config_dir, plan_json, mutation_lock_fd, rollback_deadline
+            )
+        except (GuardError, OSError) as rollback_exc:
+            rollback_errors.append(f"state-dir lock: {rollback_exc}")
+
+        detail = str(exc)
+        if rollback_errors:
+            detail += "; rollback issues: " + "; ".join(rollback_errors)
+        if isinstance(exc, GuardError):
+            raise GuardError(exc.code, exc.path, detail) from exc
+        raise GuardError("operation-failed", config_dir, detail) from exc
 
 
 def _write_secondary_journal(record: dict[str, object], identity: Identity) -> None:
@@ -2898,6 +3143,32 @@ def _verify_locked_files(
             )
 
 
+def _is_resealable_config_hash_permissions_drift(
+    snapshots: tuple[FileSnapshot, FileSnapshot], identity: Identity
+) -> bool:
+    config, hash_record = snapshots
+    blocking_flags = FS_IMMUTABLE_FL | FS_APPEND_FL
+    config_stays_locked = (
+        config.uid == identity.root_uid
+        and config.gid == identity.root_gid
+        and config.mode == 0o444
+        and not (
+            config.inode_flags is not None
+            and config.inode_flags & blocking_flags
+        )
+    )
+    hash_has_known_reconciler_posture = (
+        hash_record.uid == identity.sandbox_uid
+        and hash_record.gid == identity.sandbox_gid
+        and hash_record.mode == 0o660
+        and not (
+            hash_record.inode_flags is not None
+            and hash_record.inode_flags & blocking_flags
+        )
+    )
+    return config_stays_locked and hash_has_known_reconciler_posture
+
+
 def _verify_locked_posture(
     opened: OpenConfig,
     snapshots: tuple[FileSnapshot, FileSnapshot],
@@ -3221,6 +3492,54 @@ def _preflight_restart(opened: OpenConfig, identity: Identity) -> None:
     _assert_config_binding(opened)
 
 
+_hash_synthesized = False
+
+# Set True when a lock transition re-seals a perms-only drift on an already-locked
+# config (an in-sandbox reconciler re-permissioned a canonical file after the
+# lock: #4663 / #7985). Surfaced in the result JSON so the host can report the
+# self-heal instead of leaving it invisible.
+_resealed_drift = False
+
+
+def _write_hash_record(opened: OpenConfig, config_data: bytes, identity: Identity) -> None:
+    digest = hashlib.sha256(config_data).hexdigest()
+    _force_replace_bytes(
+        opened,
+        ".config-hash",
+        f"{digest}  openclaw.json\n".encode("ascii"),
+        identity,
+    )
+
+
+def _repair_absent_hash_for_lock(opened: OpenConfig, identity: Identity) -> None:
+    """Synthesize a truly absent .config-hash before lock-from-mutable capture.
+
+    On lock-from-mutable the canonical pair is regenerated from openclaw.json
+    bytes regardless of the stored hash content, so an absent sidecar carries
+    less signal than the tolerated stale-content case. The repair fires only on
+    true ENOENT under the frozen tree: a planted symlink, directory, fifo, or
+    hardlink at the name is seen as existing and falls through to the existing
+    fail-closed rejections.
+    """
+
+    global _hash_synthesized
+    try:
+        os.stat(".config-hash", dir_fd=opened.config_fd, follow_symlinks=False)
+        return
+    except FileNotFoundError:
+        pass
+    _verify_dir_posture(
+        opened.config_fd,
+        opened.config_path,
+        identity.root_uid,
+        identity.root_gid,
+        0o700,
+    )
+    config = _snapshot_file(opened, "openclaw.json")
+    _write_hash_record(opened, config.data, identity)
+    _hash_synthesized = True
+
+
 def _force_fail_closed_lock(opened: OpenConfig, identity: Identity) -> list[str]:
     errors: list[str] = []
     targets: tuple[FileSnapshot, FileSnapshot] | None = None
@@ -3248,22 +3567,37 @@ def _force_fail_closed_lock(opened: OpenConfig, identity: Identity) -> list[str]
             except Exception as force_exc:
                 errors.append(f"forced fresh pair: {force_exc}")
         else:
-            # No bounded pair could be captured. Sever each canonical path
-            # rather than retaining an attacker-held writable inode.
-            for name in CONFIG_FILES:
-                try:
-                    os.rename(
-                        name,
-                        f".nemoclaw-rejected-{name.lstrip('.')}-{secrets.token_hex(16)}",
-                        src_dir_fd=opened.config_fd,
-                        dst_dir_fd=opened.config_fd,
+            published = False
+            try:
+                config = _snapshot_file(opened, "openclaw.json")
+                _force_replace_bytes(opened, "openclaw.json", config.data, identity)
+                _write_hash_record(opened, config.data, identity)
+                _snapshot_pair(opened)
+                published = True
+            except Exception as publish_exc:
+                errors.append(f"config-only publish: {publish_exc}")
+            if not published:
+                # No bounded config could be republished. Sever each canonical
+                # path rather than retaining an attacker-held writable inode.
+                for name in CONFIG_FILES:
+                    rejected = (
+                        f".nemoclaw-rejected-{name.lstrip('.')}-{secrets.token_hex(16)}"
                     )
-                except FileNotFoundError:
-                    # A concurrently absent canonical name is already severed.
-                    pass
-                except Exception as file_exc:
-                    errors.append(f"{name}: {file_exc}")
-            os.fsync(opened.config_fd)
+                    try:
+                        os.rename(
+                            name,
+                            rejected,
+                            src_dir_fd=opened.config_fd,
+                            dst_dir_fd=opened.config_fd,
+                        )
+                    except FileNotFoundError:
+                        # A concurrently absent canonical name is already severed.
+                        pass
+                    except Exception as file_exc:
+                        errors.append(f"{name}: {file_exc}")
+                    else:
+                        errors.append(f"{name}: quarantined as {rejected}")
+                os.fsync(opened.config_fd)
     try:
         _commit_locked_dirs(opened, identity)
     except Exception as exc:
@@ -3326,6 +3660,7 @@ def _transition(
     *,
     quarantine_untrusted: bool = False,
 ) -> None:
+    global _resealed_drift
     if action == "lock":
         if _has_clamped_locked_dir_posture(opened, identity):
             pair = _snapshot_pair(opened)
@@ -3335,13 +3670,40 @@ def _transition(
             # A restart journal may still need rootfs-authenticated cleanup.
             _settle_pending_transaction_for_lock(opened, identity)
             pair = _snapshot_pair(opened)
-            _verify_locked_files(opened, pair, identity)
-            return
+            try:
+                _verify_locked_files(opened, pair, identity)
+                return
+            except GuardError as verify_error:
+                if verify_error.code != "config-not-locked" or not (
+                    _is_resealable_config_hash_permissions_drift(pair, identity)
+                ):
+                    raise
+                # The config remains root-owned and read-only, while the
+                # in-sandbox reconciler re-permissioned only .config-hash after
+                # the lock (#4663 / #7985). Re-seal below instead of failing
+                # closed: the root-owned directory prevents replacement, the
+                # config cannot be written, and _snapshot_pair verified that the
+                # sidecar still authenticates those config bytes.
+                # Source: the writer is the upstream OpenClaw in-sandbox gateway/
+                # doctor perm-normalizer, which NemoClaw does not own, so the
+                # correct fix is this host-authenticated relock re-seal, not a
+                # change to that writer, which this repo cannot make. Removal
+                # condition: delete this path once the lock is durably immutable on
+                # every platform (chattr +i, unavailable on overlayfs today) or the
+                # upstream reconciler stops re-permissioning an already-locked
+                # config; either fully closes the #4663 relock settle-window race
+                # that this branch only narrows.
+                _resealed_drift = True
         freeze_started = False
         try:
             freeze_started = True
-            _freeze(opened, identity)
+            _freeze(
+                opened,
+                identity,
+                quarantine_reserved=quarantine_untrusted,
+            )
             _settle_pending_transaction_for_lock(opened, identity)
+            _repair_absent_hash_for_lock(opened, identity)
             source = _snapshot_raw_pair(opened)
             targets, _digest = _canonical_targets(source, identity, locked=True)
             _install_stored_pair(opened, targets)
@@ -3360,11 +3722,35 @@ def _transition(
                 raise GuardError(exc.code, exc.path, detail) from exc
             raise GuardError("transition-failed", opened.config_path, detail) from exc
 
+    if _is_mutable_dir_posture(opened, identity):
+        # Unlock is idempotent, mirroring the already-locked short-circuits in
+        # the lock branch above. A config already in the exact mutable posture
+        # is the unlock target: on some platforms (DGX Spark/Station, macOS) an
+        # in-sandbox OpenClaw reconciler re-permissions the config back to
+        # sandbox-owned mutable *after* a host lock returns, and a freshly
+        # onboarded or snapshot-restored sandbox boots mutable before the lock
+        # settles. Requiring the locked posture there rejected a legitimate
+        # `shields down` with config-not-locked even though the config already
+        # holds the mutable target posture. Verify the exact mutable posture
+        # and treat the transition as a no-op instead of failing.
+        pair = _snapshot_raw_pair(opened)
+        _verify_mutable_posture(opened, pair, identity)
+        _validate_runtime_config_json5(
+            pair[0].data,
+            posixpath.join(opened.config_path, "openclaw.json"),
+            identity,
+        )
+        _assert_config_binding(opened)
+        return
     pair = _snapshot_pair(opened)
     _verify_locked_posture(opened, pair, identity, allow_blocking_flags=True)
     snapshots: list[FileSnapshot] = []
     try:
-        _freeze(opened, identity)
+        _freeze(
+            opened,
+            identity,
+            quarantine_reserved=quarantine_untrusted,
+        )
         snapshots.extend(_snapshot_pair(opened))
         targets, _digest = _canonical_targets(
             (snapshots[0], snapshots[1]), identity, locked=False
@@ -3954,11 +4340,13 @@ def _parser() -> argparse.ArgumentParser:
             "publish-startup-ready",
             "write-config",
             "recover",
+            "unlock-failed-startup",
         ),
     )
     parser.add_argument("--config-dir", default=PRODUCTION_CONFIG_DIR)
     parser.add_argument("--expected-config-sha256", default="")
     parser.add_argument("--startup-owner", action="store_true")
+    parser.add_argument("--plan-json", default=None)
     return parser
 
 
@@ -3987,9 +4375,26 @@ def main(argv: list[str] | None = None) -> int:
                 f"helper is restricted to {PRODUCTION_CONFIG_DIR}",
             )
         identity = _production_identity()
-        _validate_action_readiness(action, args.startup_owner, identity)
+        startup_failure_recovery = _validate_action_readiness(
+            action, args.startup_owner, identity
+        )
+        if action == "unlock-failed-startup" and not startup_failure_recovery:
+            # Never let this action inherit the ordinary lease path.
+            raise GuardError(
+                "failed-startup-not-proven",
+                STARTUP_READY_PATH,
+                "unlock-failed-startup requires a proven terminal startup failure",
+            )
         read_only = action in {"preflight", "preflight-restart"}
         mutex = _acquire_mutation_mutex(action, identity, exclusive=not read_only)
+        if startup_failure_recovery:
+            _reconfirm_startup_failure_recovery(action, identity)
+        if action == "unlock-failed-startup" and args.plan_json is None:
+            raise GuardError(
+                "invalid-state-lock-plan",
+                "--plan-json",
+                "unlock-failed-startup requires the agent state lock plan",
+            )
 
         if action in {"revoke-startup-ready", "publish-startup-ready"}:
             if action == "revoke-startup-ready":
@@ -4136,6 +4541,19 @@ def main(argv: list[str] | None = None) -> int:
                 recovery, new_digest, original_locked = _recover_any_transaction(
                     opened, identity, pending_journal
                 )
+        elif action == "unlock-failed-startup":
+            # Every check that can refuse this action has already run, so no
+            # refusal can leave state unsealed under a locked config.
+            _run_failed_startup_unlock(
+                opened,
+                identity,
+                args.config_dir,
+                args.plan_json,
+                mutex.fd,
+                quarantine_untrusted=untrusted_reserved_entry,
+            )
+            new_digest = None
+            recovery = None
         else:
             _transition(
                 action,
@@ -4157,6 +4575,8 @@ def main(argv: list[str] | None = None) -> int:
                     "files": list(CONFIG_FILES),
                     "chattrApplied": False,
                     **({"configSha256": new_digest} if new_digest is not None else {}),
+                    **({"hashSynthesized": True} if _hash_synthesized else {}),
+                    **({"resealedDrift": True} if _resealed_drift else {}),
                     **({"recovery": recovery} if recovery is not None else {}),
                     **(
                         {"originalLocked": original_locked}

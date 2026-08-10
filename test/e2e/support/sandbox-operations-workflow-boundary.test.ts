@@ -11,11 +11,7 @@ import {
   readSandboxOperationsWorkflow,
   validateSandboxOperationsWorkflow,
 } from "../../../tools/e2e/sandbox-operations-workflow-boundary.mts";
-import {
-  evaluateE2eWorkflowDispatchSelectors,
-  readFreeStandingJobsInventory,
-  validateE2eWorkflowBoundary,
-} from "../../../tools/e2e/workflow-boundary.mts";
+import { validateE2eWorkflowBoundary } from "../../../tools/e2e/workflow-boundary.mts";
 
 const WORKFLOW_PATH = join(process.cwd(), ".github", "workflows", "e2e.yaml");
 const PREPARE_STEP_SOURCE = [
@@ -49,29 +45,18 @@ function mutateSandboxOperationsJob(source: string, mutate: (jobSource: string) 
 }
 
 describe("sandbox operations workflow boundary", () => {
-  it("runs by default and through either selective dispatch input", () => {
-    const inventory = readFreeStandingJobsInventory();
-    expect(validateE2eWorkflowBoundary()).toEqual([]);
-    expect(inventory.targetToJob.get("sandbox-operations")).toBe("sandbox-operations");
+  it("rejects a workflow that restores the retired sandbox-rlimits-connect job", () => {
+    const workflow = readSandboxOperationsWorkflow();
+    workflow.jobs["sandbox-rlimits-connect"] = structuredClone(workflow.jobs["sandbox-operations"]);
 
-    for (const selector of [{ targets: "sandbox-operations" }, { jobs: "sandbox-operations" }]) {
-      expect(evaluateE2eWorkflowDispatchSelectors(selector)).toMatchObject({
-        valid: true,
-        liveTargetsRun: false,
-        selectedFreeStandingJobs: ["sandbox-operations"],
-      });
-    }
-    expect(evaluateE2eWorkflowDispatchSelectors({}).selectedFreeStandingJobs).toContain(
-      "sandbox-operations",
+    expect(validateSandboxOperationsWorkflow(workflow)).toContain(
+      "sandbox-rlimits-connect must remain consolidated into sandbox-operations",
     );
   });
 
   it("accepts shared guarded Docker authentication without a job-specific configure step", () => {
     const workflow = readSandboxOperationsWorkflow();
     const steps = workflow.jobs["sandbox-operations"].steps!;
-    expect(steps.some((step) => step.name === "Configure isolated Docker auth directory")).toBe(
-      false,
-    );
 
     const authenticate = steps.find((step) => step.name === "Authenticate to Docker Hub")!;
     authenticate.env = {
@@ -117,9 +102,25 @@ describe("sandbox operations workflow boundary", () => {
     ).toContain("sandbox-operations must not configure Docker auth at job scope");
 
     const workspaceAuth = readSandboxOperationsWorkflow();
-    workspaceAuth.jobs["sandbox-operations"].env!.DOCKER_CONFIG = "${{ github.workspace }}/docker";
-    expect(validateSandboxOperationsWorkflow(workspaceAuth)).toContain(
-      "sandbox-operations must not configure Docker auth at job scope",
+    const workspaceAuthJob = workspaceAuth.jobs["sandbox-operations"];
+    workspaceAuthJob["runs-on"] = "self-hosted";
+    workspaceAuthJob["timeout-minutes"] = 30;
+    workspaceAuthJob.env!.E2E_ARTIFACT_DIR = "/tmp/sandbox-operations";
+    workspaceAuthJob.env!.DOCKER_CONFIG = "${{ github.workspace }}/docker";
+    const checkout = workspaceAuthJob.steps!.find((step) =>
+      step.uses?.startsWith("actions/checkout@"),
+    )!;
+    checkout.uses = "actions/checkout@v6";
+    checkout.with!["persist-credentials"] = true;
+    expect(validateSandboxOperationsWorkflow(workspaceAuth)).toEqual(
+      expect.arrayContaining([
+        "sandbox-operations must run on ubuntu-latest",
+        "sandbox-operations must retain its 60 minute recovery budget",
+        "sandbox-operations must use its isolated artifact directory",
+        "sandbox-operations must not configure Docker auth at job scope",
+        "sandbox-operations checkout must pin a full action SHA",
+        "sandbox-operations checkout must disable persisted credentials",
+      ]),
     );
 
     const unsanitizedInstall = readSandboxOperationsWorkflow();
@@ -148,7 +149,7 @@ describe("sandbox operations workflow boundary", () => {
 
     expect(
       validateCentralWorkflowMutation((source) =>
-        source.replace("permissions:\n  contents: read", "permissions:\n  contents: write"),
+        source.replace("  contents: read", "  contents: write"),
       ),
     ).toContain("workflow permissions.contents must be read");
   });

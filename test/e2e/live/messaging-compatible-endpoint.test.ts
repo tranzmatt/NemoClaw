@@ -3,7 +3,7 @@
 
 /**
  *
- * This stays intentionally direct: the the contract is the real
+ * This stays intentionally direct: the contract is the real
  * Docker/OpenShell/nemoclaw boundary with a local OpenAI-compatible endpoint
  * mock, Telegram messaging config, sandbox inference.local routing, and an
  * OpenClaw agent turn through the compatible endpoint proxy path.
@@ -33,6 +33,7 @@ import {
 } from "../support/messaging-endpoint-classifiers.ts";
 import {
   cleanupMessagingState,
+  cleanupOwnedGatewayRuntimeStrict,
   commandEnv,
   parseOpenClawAgentText,
   stopGatewayRuntime,
@@ -60,10 +61,6 @@ const HOP_BY_HOP_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
-function nodeEvalArg(source: string): string {
-  const encoded = Buffer.from(source, "utf8").toString("base64");
-  return `eval(Buffer.from(${JSON.stringify(encoded)}, "base64").toString("utf8"))`;
-}
 
 interface MockRequestLog {
   method: string;
@@ -263,36 +260,6 @@ async function startCompatibleMock(
   throw new Error("compatible endpoint mock failed to answer /v1/models");
 }
 
-async function hostAddressForSandbox(host: HostCliClient): Promise<string> {
-  const probe = await host.command(
-    "bash",
-    [
-      "-lc",
-      [
-        'ip_addr="$(ip route get 1.1.1.1 2>/dev/null | awk \'{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}\')"',
-        'if [ -n "$ip_addr" ]; then echo "$ip_addr"; exit 0; fi',
-        "ip_addr=\"$(hostname -I 2>/dev/null | awk '{print $1}')\"",
-        'if [ -n "$ip_addr" ]; then echo "$ip_addr"; exit 0; fi',
-        'if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then',
-        "  for iface in en0 en1 bridge100; do",
-        '    ip_addr="$(ipconfig getifaddr "$iface" 2>/dev/null || true)"',
-        '    if [ -n "$ip_addr" ]; then echo "$ip_addr"; exit 0; fi',
-        "  done",
-        "  ip_addr=\"$(ifconfig 2>/dev/null | awk '/inet / && $2 !~ /^127\\./ {print $2; exit}')\"",
-        '  if [ -n "$ip_addr" ]; then echo "$ip_addr"; exit 0; fi',
-        "fi",
-        "echo 127.0.0.1",
-      ].join("\n"),
-    ],
-    {
-      artifactName: "host-ip-for-compatible-endpoint",
-      env: commandEnv(),
-      timeoutMs: 30_000,
-    },
-  );
-  return probe.stdout.trim().split(/\s+/)[0] || "127.0.0.1";
-}
-
 async function sourceCliAvailable(host: HostCliClient): Promise<boolean> {
   if (!fs.existsSync(CLI_DIST_ENTRYPOINT)) return false;
   const result = await host.command(
@@ -442,15 +409,11 @@ console.log(JSON.stringify({
 }));
 process.exit(errors.length ? 1 : 0);
 `;
-  const result = await sandbox.exec(
-    SANDBOX_NAME,
-    ["node", "-e", nodeEvalArg(script), COMPAT_MODEL],
-    {
-      artifactName: "openclaw-config-compatible-endpoint",
-      env: commandEnv(),
-      timeoutMs: 60_000,
-    },
-  );
+  const result = await sandbox.exec(SANDBOX_NAME, ["node", "-e", script, COMPAT_MODEL], {
+    artifactName: "openclaw-config-compatible-endpoint",
+    env: commandEnv(),
+    timeoutMs: 60_000,
+  });
   expect(result.exitCode, resultText(result)).toBe(0);
 }
 
@@ -472,7 +435,7 @@ sock.setTimeout(1000, () => finish("TIMEOUT", 1));
 `;
   let last: ShellProbeResult | undefined;
   for (let attempt = 1; attempt <= 30; attempt += 1) {
-    last = await sandbox.exec(SANDBOX_NAME, ["node", "-e", nodeEvalArg(script)], {
+    last = await sandbox.exec(SANDBOX_NAME, ["node", "-e", script], {
       artifactName: `gateway-ready-compatible-endpoint-${attempt}`,
       env: commandEnv(),
       timeoutMs: 5_000,
@@ -564,7 +527,18 @@ async function assertOpenClawAgentTurn(
 
 test("messaging compatible endpoint routes Telegram-enabled OpenClaw through inference.local", {
   timeout: TEST_TIMEOUT_MS,
-}, async ({ artifacts, cleanup, host, sandbox, skip }) => {
+  meta: {
+    e2ePhases: [
+      "confirm Docker and register messaging cleanup",
+      "clear prior messaging state and start the compatible endpoint",
+      "confirm host reachability to the compatible endpoint",
+      "onboard Telegram-enabled OpenClaw",
+      "inspect the provider route and OpenClaw configuration",
+      "prove inference.local and agent traffic",
+      "record authenticated traffic and proxy-header results",
+    ],
+  },
+}, async ({ artifacts, cleanup, host, progress, sandbox, skip }) => {
   const docker = await host.command("docker", ["info"], {
     artifactName: "prereq-docker-info-messaging-compatible-endpoint",
     env: commandEnv(),
@@ -596,22 +570,51 @@ test("messaging compatible endpoint routes Telegram-enabled OpenClaw through inf
     ],
   });
 
-  cleanup.add(`destroy messaging compatible endpoint state ${SANDBOX_NAME}`, () =>
-    cleanupMessagingState(host, SANDBOX_NAME),
+  const cleanupEnv = commandEnv();
+  cleanup.trackDisposable("clean up messaging-compatible owned gateway runtime", () =>
+    cleanupOwnedGatewayRuntimeStrict(host, "cleanup-owned-gateway-runtime-nemoclaw"),
   );
+  cleanup.trackGateway(host, "nemoclaw", {
+    artifactName: "cleanup-openshell-gateway-runtime-nemoclaw",
+    env: cleanupEnv,
+    timeoutMs: 90_000,
+  });
+  cleanup.trackForward(host, 18789, {
+    artifactName: "cleanup-openshell-forward-stop-18789",
+    env: cleanupEnv,
+    timeoutMs: 30_000,
+  });
+  cleanup.trackDisposable(`delete OpenShell sandbox ${SANDBOX_NAME}`, () =>
+    sandbox.cleanupSandbox(SANDBOX_NAME, {
+      artifactName: `cleanup-openshell-sandbox-delete-${SANDBOX_NAME}`,
+      env: cleanupEnv,
+      timeoutMs: 60_000,
+    }),
+  );
+  cleanup.trackSandbox(host, SANDBOX_NAME, {
+    artifactName: `cleanup-nemoclaw-destroy-${SANDBOX_NAME}`,
+    env: cleanupEnv,
+    timeoutMs: 120_000,
+  });
+  progress.phase("clear prior messaging state and start the compatible endpoint");
   await cleanupMessagingState(host, SANDBOX_NAME);
 
   const compatibleMock = await startCompatibleMock(MOCK_PORT, COMPAT_MODEL, COMPATIBLE_KEY);
-  cleanup.add("stop compatible endpoint mock", async () => {
+  cleanup.trackDisposable("stop compatible endpoint mock", async () => {
     await artifacts.writeJson("compatible-endpoint-mock-requests.json", compatibleMock.requests);
     await compatibleMock.close();
   });
 
-  const hostAddress = await hostAddressForSandbox(host);
-  const endpointUrl = `http://${hostAddress}:${new URL(compatibleMock.localBaseUrl).port}/v1`;
+  const endpointUrl = `http://host.openshell.internal:${new URL(compatibleMock.localBaseUrl).port}/v1`;
+  progress.phase("confirm host reachability to the compatible endpoint");
   const hostReachability = await host.command(
     "curl",
-    ["-sf", "-H", `Authorization: Bearer ${COMPATIBLE_KEY}`, `${endpointUrl}/models`],
+    [
+      "-sf",
+      "-H",
+      `Authorization: Bearer ${COMPATIBLE_KEY}`,
+      `${compatibleMock.localBaseUrl}/models`,
+    ],
     {
       artifactName: "compatible-endpoint-host-reachability",
       env: commandEnv(),
@@ -621,10 +624,12 @@ test("messaging compatible endpoint routes Telegram-enabled OpenClaw through inf
   );
   expect(hostReachability.exitCode, resultText(hostReachability)).toBe(0);
 
+  progress.phase("onboard Telegram-enabled OpenClaw");
   const { result: onboard, runner } = await runCompatibleOnboard(host, endpointUrl);
   expect(onboard.exitCode, resultText(onboard)).toBe(0);
   expect(resultText(onboard)).toContain("Compatible endpoint responds through inference.local");
 
+  progress.phase("inspect the provider route and OpenClaw configuration");
   const provider = await host.command("openshell", ["provider", "get", "compatible-endpoint"], {
     artifactName: "openshell-provider-get-compatible-endpoint",
     env: commandEnv(),
@@ -633,10 +638,12 @@ test("messaging compatible endpoint routes Telegram-enabled OpenClaw through inf
   expect(provider.exitCode, resultText(provider)).toBe(0);
 
   await assertOpenClawConfigShape(sandbox);
+  progress.phase("prove inference.local and agent traffic");
   await assertGatewayReady(sandbox);
   await assertSandboxInference(sandbox);
   await assertOpenClawAgentTurn(sandbox, compatibleMock);
 
+  progress.phase("record authenticated traffic and proxy-header results");
   expect(
     compatibleMock.requests.some(
       (request) => request.path === "/v1/chat/completions" && request.auth === "ok",

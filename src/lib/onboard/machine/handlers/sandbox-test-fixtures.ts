@@ -1,10 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { vi } from "vitest";
+import { expect, vi } from "vitest";
 
 import type { SandboxMessagingPlan } from "../../../messaging/manifest";
+import { decisionSelected } from "../../../state/onboard-checkpoint-decision";
+import { deriveCheckpointFromSession } from "../../../state/onboard-checkpoint-migrate";
+import type { CheckpointProviderBinding } from "../../../state/onboard-checkpoint-types";
+import type { CheckpointSandboxRecreateTransaction } from "../../../state/onboard-checkpoint-types";
 import { createSession, type Session, type SessionUpdates } from "../../../state/onboard-session";
+import type { BaselineExclusionEntry, SandboxRemovalReceipt } from "../../../state/registry";
+import {
+  advanceSandboxRecreateTransaction,
+  fingerprintSandboxRecreateValue,
+  recordSandboxRecreateTargetCreated,
+  type SandboxRecreateObservation,
+} from "../../sandbox-recreate-transaction";
 import type { SandboxStateOptions } from "./sandbox";
 
 export function makeMinimalPlan(
@@ -75,6 +86,64 @@ export async function withEnv<T>(key: string, value: string, run: () => Promise<
   }
 }
 
+type UpdateSession = (mutator: (value: Session) => Session | void) => Session;
+
+export function bindJournaledRecreate(
+  session: Session,
+  sandboxName = "saved",
+  agent = "openclaw",
+  updateSession: UpdateSession = (mutator) => mutator(session) ?? session,
+) {
+  session.steps.sandbox.status = "complete";
+  session.machine.state = "agent_setup";
+  session.checkpoint = {
+    ...deriveCheckpointFromSession(session),
+    sandboxIdentity: decisionSelected({ name: sandboxName, agent }),
+    gatewayAuthority: decisionSelected({
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+      mode: "nemoclaw-managed",
+      source: "standalone",
+      endpoint: null,
+      stateDir: null,
+      supervisor: null,
+      requiredCapabilities: [],
+    }),
+  };
+  let observation: SandboxRecreateObservation = {
+    state: "ready",
+    liveIdentityFingerprint: fingerprintSandboxRecreateValue("openshell-source-id"),
+  };
+  return {
+    observe: () => observation,
+    completeCreate: vi.fn(async (...args: unknown[]) => {
+      const transaction = updateSession((current) => current).checkpoint?.sandboxRecreate;
+      expect(transaction).toBeDefined();
+      const ownedTransaction = transaction as CheckpointSandboxRecreateTransaction;
+      const createIntent = args.at(-1) as
+        | { recreate?: boolean; recreateTransaction?: { id?: string } }
+        | undefined;
+      expect(createIntent?.recreate).toBe(true);
+      expect(createIntent?.recreateTransaction?.id).toBe(ownedTransaction.id);
+      for (const phase of ["deleting", "deleted", "creating"] as const) {
+        updateSession((current) => {
+          advanceSandboxRecreateTransaction(current, ownedTransaction.id, phase);
+          return current;
+        });
+      }
+      observation = {
+        state: "ready",
+        liveIdentityFingerprint: fingerprintSandboxRecreateValue("openshell-target-id"),
+      };
+      updateSession((current) => {
+        recordSandboxRecreateTargetCreated(current, ownedTransaction.id, observation);
+        return current;
+      });
+      return sandboxName;
+    }),
+  };
+}
+
 type Gpu = { type: string } | null;
 type Agent = { displayName?: string; name?: string } | null;
 type WebSearchConfig = { fetchEnabled: true; provider?: "brave" | "tavily" };
@@ -93,8 +162,9 @@ export function createDeps(
       ResourceProfile
     >["deps"]
   > = {},
+  initialSession: Session = createSession(),
 ) {
-  let session = createSession();
+  let session = initialSession;
   const calls = {
     checkGatewayRouteCompatibility: vi.fn(() => ({ ok: true as const })),
     note: vi.fn(),
@@ -104,18 +174,63 @@ export function createDeps(
     }),
     persistMessaging: vi.fn(),
     clearPlanEnv: vi.fn(),
-    removeSandbox: vi.fn(),
-    repairSandbox: vi.fn(),
+    removeSandbox: vi.fn((): SandboxRemovalReceipt | null => null),
+    restoreSandboxRegistryEntryIfMissing: vi.fn(() => false),
     validateBrave: vi.fn(async () => "brave-key"),
     isBackToSelection: vi.fn(() => false),
     configureWebSearch: vi.fn(async () => null as WebSearchConfig | null),
     startStep: vi.fn(async () => undefined),
     getRecordedChannels: vi.fn(() => null),
+    showMessagingStage: vi.fn(),
     setupMessaging: vi.fn(async () => [] as string[]),
+    stageCredentialProviders: vi.fn(async () => [] as CheckpointProviderBinding[]),
     promptName: vi.fn(async () => "my-assistant"),
     selectResourceProfile: vi.fn(async () => null as ResourceProfile | null),
     stopStale: vi.fn(),
+    planRegisteredExtraProviders: vi.fn(() => ({
+      extraProviders: [] as string[],
+      staleExtraProviders: [] as string[],
+    })),
+    resolveCreateIntent: vi.fn(
+      async (input: {
+        sandboxName: string;
+        inferenceProvider?: string | null;
+        extraProviders: readonly string[];
+        staleExtraProviders: readonly string[];
+        baselineExclusions?: readonly BaselineExclusionEntry[];
+      }) => ({
+        sandboxName: input.sandboxName,
+        inferenceProvider: input.inferenceProvider ?? null,
+        activeMessagingChannels: [],
+        messagingProviderRequests: [],
+        reusableMessagingProviders: [],
+        extraProviders: [...input.extraProviders],
+        staleExtraProviders: [...input.staleExtraProviders],
+        hermesToolGateways: [],
+        policy: {
+          basePolicyPath: "/repo/policy.yaml",
+          activeMessagingChannels: [],
+          options: {
+            directGpu: false,
+            additionalPresets: [],
+            policyTier: null,
+            baselineExclusions:
+              input.baselineExclusions?.map((exclusion) => ({ ...exclusion })) ?? [],
+          },
+        },
+        gpuCreateArgs: [],
+        resourceCreateArgs: [],
+        gpuRoutePlan: "none" as const,
+        sandboxGpuLogMessage: null,
+        disabledChannelNames: [],
+        extraPlaceholderKeys: [],
+      }),
+    ),
     createSandbox: vi.fn(async () => "my-assistant"),
+    retireReplacedSandboxWorkload: vi.fn(() => ({
+      status: "skipped" as const,
+      reason: "replacement-unproven" as const,
+    })),
     updateSandbox: vi.fn(),
     complete: vi.fn(async (_stepName: string, updates: SessionUpdates) => {
       Object.assign(session, updates);
@@ -129,7 +244,14 @@ export function createDeps(
       throw new Error(`exit ${code}`);
     }),
     withGatewayRouteMutationLock: vi.fn(),
+    withDashboardPortReservationLock: vi.fn(),
   };
+  const runWithDashboardPortReservationLock =
+    overrides.withDashboardPortReservationLock ??
+    (async <T>(operation: () => Promise<T> | T): Promise<T> => {
+      calls.withDashboardPortReservationLock(operation);
+      return await operation();
+    });
   const runWithGatewayRouteMutationLock = async <T>(
     gatewayName: string,
     operation: () => Promise<T> | T,
@@ -146,11 +268,14 @@ export function createDeps(
       resolvePath: (value: string) => `/abs/${value}`,
       agentSupportsWebSearch: () => true,
       note: calls.note,
+      cliName: () => "nemoclaw",
       updateSession: calls.updateSession,
       getStoredMessagingChannelConfig: () => null,
       hydrateMessagingChannelConfig: (config: MessagingChannelConfig | null) => config,
       messagingChannelConfigsEqual: () => true,
       getSandboxReuseState: () => "missing",
+      getSandboxRecreateObservation: () =>
+        ({ state: "missing", liveIdentityFingerprint: null }) as const,
       getDcodeSelectionDrift: () => ({ changed: false, unknown: false }),
       hasSandboxGpuDrift: () => false,
       getSandboxHermesToolGateways: () => [],
@@ -170,22 +295,28 @@ export function createDeps(
       stringSetsEqual: (left: string[], right: string[]) =>
         left.length === right.length && left.every((value) => right.includes(value)),
       removeSandboxFromRegistry: calls.removeSandbox,
-      repairRecordedSandbox: calls.repairSandbox,
+      restoreSandboxRegistryEntryIfMissing: calls.restoreSandboxRegistryEntryIfMissing,
       ensureValidatedWebSearchCredential: calls.validateBrave,
       isBackToSelection: calls.isBackToSelection,
       configureWebSearch: calls.configureWebSearch,
       startRecordedStep: calls.startStep,
       getRecordedMessagingChannelsForResume: calls.getRecordedChannels,
+      showMessagingStage: calls.showMessagingStage,
       setupMessagingChannels: calls.setupMessaging,
       readMessagingPlanFromEnv: () => null,
       writePlanToEnv: () => undefined,
       clearPlanEnv: calls.clearPlanEnv,
-      getRegistrySandboxMessagingPlan: () => null,
+      getRegistrySandboxMessagingAuthority: () => ({ authoritative: false, plan: null }),
+      providerMatchesGatewayCredential: () => true,
+      stageSandboxCredentialProviders: calls.stageCredentialProviders,
       promptValidatedSandboxName: calls.promptName,
       selectResourceProfileForSandbox: calls.selectResourceProfile,
       stopStaleDashboardListenersForSandbox: calls.stopStale,
       listRegistrySandboxes: () => ({ sandboxes: [{ name: "old" }] }),
+      planRegisteredExtraProviders: calls.planRegisteredExtraProviders,
+      resolveSandboxCreateIntent: calls.resolveCreateIntent,
       createSandbox: calls.createSandbox,
+      retireReplacedSandboxWorkload: calls.retireReplacedSandboxWorkload,
       updateSandboxRegistry: calls.updateSandbox,
       getSandboxAgentRegistryFields: () => ({ agent: null }),
       recordStepComplete: calls.complete,
@@ -198,6 +329,7 @@ export function createDeps(
       ...overrides,
       checkGatewayRouteCompatibility:
         overrides.checkGatewayRouteCompatibility ?? calls.checkGatewayRouteCompatibility,
+      withDashboardPortReservationLock: runWithDashboardPortReservationLock,
       withGatewayRouteMutationLock: runWithGatewayRouteMutationLock,
     },
     getSession: () => session,
@@ -226,12 +358,14 @@ export function baseOptions(
     resume: false,
     fresh: false,
     resumeAgentChanged: false,
+    recreateSandbox: () => false,
     gatewayName: "nemoclaw",
     session,
     sandboxName: null,
     model: "model",
     provider: "provider",
     endpointUrl: null,
+    compatibleEndpointReasoning: null,
     credentialEnv: null,
     nimContainer: null,
     webSearchConfig: null,

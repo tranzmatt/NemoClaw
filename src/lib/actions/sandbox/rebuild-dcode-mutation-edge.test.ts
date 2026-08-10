@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   configureDcodeSession,
   makeDcodeSandboxEntry,
-} from "../../../../test/helpers/rebuild-dcode-flow-support";
+} from "../../../../test/helpers/rebuild-dcode-flow-helpers";
+import { expectNoSandboxDelete } from "../../../../test/helpers/rebuild-delete-assertions";
 import {
   createRebuildFlowHarness,
   resetRebuildFlowTestEnvironment,
@@ -31,9 +32,13 @@ describe("rebuildSandbox DCode flow: mutation edge", () => {
     configureDcodeSession(harness);
 
     await expect(
-      harness.rebuildSandbox("alpha", ["--yes", "--tool-disclosure", "direct"], {
-        throwOnError: true,
-      }),
+      harness.rebuildSandbox(
+        "alpha",
+        ["--yes", "--tool-disclosure", "direct", "--dcode-auto-approval", "thread-opt-in"],
+        {
+          throwOnError: true,
+        },
+      ),
     ).resolves.toBeUndefined();
 
     expect(harness.preflightDcodeRouteSpy).toHaveBeenCalledTimes(4);
@@ -41,6 +46,7 @@ describe("rebuildSandbox DCode flow: mutation edge", () => {
     expect(harness.prepareManagedDcodeRebuildImageSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         compatibleEndpointReasoning: null,
+        dcodeAutoApprovalMode: "thread-opt-in",
         toolDisclosure: "direct",
         webSearchConfig: null,
       }),
@@ -48,9 +54,12 @@ describe("rebuildSandbox DCode flow: mutation edge", () => {
     expect(harness.onboardSpy).toHaveBeenCalledWith(
       expect.objectContaining({
         agent: "langchain-deepagents-code",
+        dcodeAutoApprovalMode: "thread-opt-in",
+        dcodeAutoApprovalRequestedExplicitly: true,
         toolDisclosure: "direct",
         preparedDcodeRebuild: expect.objectContaining({
           buildContext: harness.preparedDcodeBuildContext,
+          dcodeAutoApprovalMode: "thread-opt-in",
           gatewayName: "nemoclaw",
         }),
       }),
@@ -65,7 +74,7 @@ describe("rebuildSandbox DCode flow: mutation edge", () => {
     const warningProbeOrder =
       harness.warnUnpreservedUserManagedFilesSpy.mock.invocationCallOrder[0];
     const deleteCall = harness.runOpenshellSpy.mock.calls.findIndex(
-      ([args]) => Array.isArray(args) && args.join(" ") === "sandbox delete alpha",
+      ([args]) => Array.isArray(args) && args.join(" ") === "sandbox delete -g nemoclaw alpha",
     );
     const deleteOrder = harness.runOpenshellSpy.mock.invocationCallOrder[deleteCall];
     const onboardOrder = harness.onboardSpy.mock.invocationCallOrder[0];
@@ -111,10 +120,7 @@ describe("rebuildSandbox DCode flow: mutation edge", () => {
       [detached],
       [scrubbed],
     );
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
     expect(harness.onboardSpy).not.toHaveBeenCalled();
     expect(harness.relockSpy).toHaveBeenCalledWith("alpha", expect.any(Object), true, "nemoclaw");
   });

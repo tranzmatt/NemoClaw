@@ -25,6 +25,13 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       order: 40,
     },
   ],
+  completion: [
+    {
+      group: "Getting Started",
+      order: 1.75,
+      flags: "[bash|zsh|fish]",
+    },
+  ],
   "credentials:add": [
     {
       group: "Credentials",
@@ -341,11 +348,20 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       flags: "[--follow] [--tail <lines>|-n <lines>] [--since <duration>]",
     },
   ],
+  "sandbox:policy:get": [
+    {
+      group: "Policy Presets",
+      order: 16,
+      description: "Export round-trippable base policy YAML",
+      flags: "[--raw]",
+    },
+  ],
   "sandbox:policy:add": [
     {
       group: "Policy Presets",
       order: 17,
-      flags: "(--yes, -y, --dry-run, --from-file <path>, --from-dir <path>)",
+      flags:
+        "(--yes, -y, --dry-run, --from-file <path>, --from-dir <path>, --trusted-private-host <host>)",
     },
   ],
   "sandbox:policy:explain": [
@@ -371,6 +387,24 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       flags: "(--yes, -y, --dry-run)",
     },
   ],
+  "sandbox:policy:exclude": [
+    {
+      group: "Policy Presets",
+      order: 21,
+      usage: "nemoclaw <name> policy exclude <key>",
+      description: "Exclude a baseline policy entry (persisted, replayed on rebuild)",
+      flags: "(--force, --yes, -y, --dry-run)",
+    },
+  ],
+  "sandbox:policy:restore": [
+    {
+      group: "Policy Presets",
+      order: 22,
+      usage: "nemoclaw <name> policy restore <key>",
+      description: "Restore a previously excluded baseline entry",
+      flags: "(--force, --yes, -y, --dry-run)",
+    },
+  ],
   "sandbox:rebuild": [
     {
       group: "Sandbox Management",
@@ -382,6 +416,18 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
     {
       group: "Sandbox Management",
       order: 3.5,
+    },
+  ],
+  "sandbox:stop": [
+    {
+      group: "Sandbox Management",
+      order: 3.6,
+    },
+  ],
+  "sandbox:start": [
+    {
+      group: "Sandbox Management",
+      order: 3.7,
     },
   ],
   "sandbox:share:mount": [
@@ -541,11 +587,18 @@ const PUBLIC_DISPLAY_LAYOUT: Record<string, readonly PublicDisplayLayout[]> = {
       flags: "[--json]",
     },
   ],
+  launch: [
+    {
+      group: "Sandbox Management",
+      order: 2.6,
+      usage: "nemoclaw launch <name>",
+    },
+  ],
   update: [
     {
       group: "Upgrade",
       order: 40,
-      flags: "(--check, --fresh, --yes|-y)",
+      flags: "(--check, --fresh, --allow-downgrade, --yes|-y)",
     },
   ],
   "upgrade-sandboxes": [

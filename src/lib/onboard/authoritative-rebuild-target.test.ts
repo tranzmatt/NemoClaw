@@ -9,6 +9,10 @@ import {
   rebuildProviderFlowOptions,
   resolveAuthoritativeOnboardGatewayBinding,
 } from "./authoritative-rebuild-target";
+import {
+  mintProviderRecoveryReceipt,
+  type ProviderRecoveryReceiptTarget,
+} from "./rebuild-route-handoff";
 
 const target = {
   sandboxName: "alpha",
@@ -21,8 +25,11 @@ const originalGateway = process.env.OPENSHELL_GATEWAY;
 
 function deps(overrides: Partial<AuthoritativeRebuildTargetDeps> = {}) {
   return {
+    resolveBaselinePolicy: vi.fn(() => ({})),
+    bindGatewayAuthority: vi.fn(),
     runFatalRuntimePreflight: vi.fn(),
     ensureOpenshell: vi.fn(),
+    assertGatewayReadiness: vi.fn(),
     inferenceRouteReady: vi.fn(() => true),
     captureForwardList: vi.fn(() => "alpha 127.0.0.1 18789 42 active"),
     checkPort: vi.fn(async () => ({ ok: true })),
@@ -101,18 +108,80 @@ describe("prepared provider reconfiguration handoff", () => {
     resume: true,
     recreateSandbox: true,
     onboardLockAlreadyHeld: true,
+    targetGatewayName: "nemoclaw-8081",
+    targetGatewayPort: 8081,
+    endpointSource: "onboard" as const,
     rebuildProviderReconfigure: providerTarget,
   };
 
   it("accepts an exact handoff only for a locked authoritative rebuild resume (#6114)", () => {
-    expect(rebuildProviderFlowOptions(authorizedOptions, providerTarget)).toEqual({
+    expect(rebuildProviderFlowOptions(authorizedOptions, providerTarget)).toMatchObject({
       authoritativeResumeConfig: true,
       forceInferenceSetup: true,
     });
-    expect(rebuildProviderFlowOptions({}, providerTarget)).toEqual({
+    expect(rebuildProviderFlowOptions({}, providerTarget)).toMatchObject({
       authoritativeResumeConfig: false,
       forceInferenceSetup: false,
     });
+  });
+
+  it("authorizes incomplete-session recovery only for the locked rebuild context", () => {
+    const recoveryOptions = { ...authorizedOptions, rebuildProviderReconfigure: undefined };
+    expect(rebuildProviderFlowOptions(recoveryOptions, providerTarget)).toMatchObject({
+      authoritativeResumeConfig: true,
+      forceInferenceSetup: false,
+    });
+    for (const options of [
+      { ...recoveryOptions, resume: false },
+      { ...recoveryOptions, recreateSandbox: false },
+      { ...recoveryOptions, onboardLockAlreadyHeld: false },
+    ]) {
+      expect(() => rebuildProviderFlowOptions(options, providerTarget)).toThrow(
+        "requires a preflighted locked rebuild resume",
+      );
+    }
+  });
+
+  it("activates a matching provider-recovery receipt and binds it to the session", () => {
+    const receiptTarget: ProviderRecoveryReceiptTarget = {
+      sandboxName: "alpha",
+      gatewayName: "nemoclaw-8081",
+      provider: "compatible-endpoint",
+      model: "nvidia/model",
+      route: {
+        provider: "compatible-endpoint",
+        model: "nvidia/model",
+        endpointUrl: "https://inference.example.test/v1",
+        endpointSource: "onboard",
+        preferredInferenceApi: "openai-completions",
+        source: "registry",
+      },
+    };
+    const receipt = mintProviderRecoveryReceipt(receiptTarget, {
+      nonce: "n-alpha",
+      expiresAtMs: Number.MAX_SAFE_INTEGER,
+    });
+    const flowContext = {
+      ...providerTarget,
+      preferredInferenceApi: "openai-completions",
+      session: { sessionId: "sess-alpha" },
+    };
+
+    const activated = rebuildProviderFlowOptions(
+      { ...authorizedOptions, endpointSource: "onboard", providerRecoveryReceipt: receipt },
+      flowContext,
+    );
+    expect(activated.providerRecoveryReceipt?.sessionId).toBe("sess-alpha");
+
+    const wrongSandbox = rebuildProviderFlowOptions(
+      {
+        ...authorizedOptions,
+        providerRecoveryReceipt: receipt,
+        rebuildProviderReconfigure: undefined,
+      },
+      { ...flowContext, sandboxName: "beta" },
+    );
+    expect(wrongSandbox.providerRecoveryReceipt).toBeNull();
   });
 
   it("rejects an unauthorized or mismatched handoff (#6114)", () => {
@@ -121,7 +190,7 @@ describe("prepared provider reconfiguration handoff", () => {
         { ...authorizedOptions, onboardLockAlreadyHeld: false },
         providerTarget,
       ),
-    ).toThrow("requires an authoritative locked rebuild resume");
+    ).toThrow("requires a preflighted locked rebuild resume");
     expect(() =>
       rebuildProviderFlowOptions(authorizedOptions, {
         ...providerTarget,
@@ -132,6 +201,36 @@ describe("prepared provider reconfiguration handoff", () => {
 });
 
 describe("authoritative rebuild target preflight", () => {
+  it("binds process-local gateway authority before readiness and install (#7411)", async () => {
+    const calls: string[] = [];
+    const targetDeps = deps({
+      bindGatewayAuthority: vi.fn(() => calls.push("bind")),
+      runFatalRuntimePreflight: vi.fn(() => calls.push("readiness")),
+      ensureOpenshell: vi.fn(() => calls.push("install")),
+      assertGatewayReadiness: vi.fn(() => calls.push("post-install-readiness")),
+    });
+
+    await preflightAuthoritativeRebuildTarget(target, targetDeps);
+
+    expect(calls).toEqual(["bind", "readiness", "install", "post-install-readiness"]);
+    expect(targetDeps.bindGatewayAuthority).toHaveBeenCalledOnce();
+    expect(targetDeps.assertGatewayReadiness).toHaveBeenCalledOnce();
+  });
+
+  it("rejects an unreadable replacement baseline before runtime probes (#7194)", async () => {
+    const targetDeps = deps({ resolveBaselinePolicy: vi.fn(() => null) });
+
+    await expect(preflightAuthoritativeRebuildTarget(target, targetDeps)).rejects.toThrow(
+      "Could not read the baseline policy",
+    );
+
+    expect(targetDeps.runFatalRuntimePreflight).not.toHaveBeenCalled();
+    expect(targetDeps.bindGatewayAuthority).not.toHaveBeenCalled();
+    expect(targetDeps.ensureOpenshell).not.toHaveBeenCalled();
+    expect(targetDeps.assertGatewayReadiness).not.toHaveBeenCalled();
+    expect(targetDeps.inferenceRouteReady).not.toHaveBeenCalled();
+  });
+
   it("pins the requested gateway for route and forward checks, then restores it", async () => {
     process.env.OPENSHELL_GATEWAY = "before";
     const seen: string[] = [];
@@ -214,5 +313,49 @@ describe("authoritative rebuild target preflight", () => {
       ),
     ).rejects.toThrow("fatal runtime gate");
     expect(process.env.OPENSHELL_GATEWAY).toBe("before");
+  });
+
+  it("awaits async runtime readiness before OpenShell and route checks", async () => {
+    let releaseRuntime!: () => void;
+    const runtimeReady = new Promise<void>((resolve) => {
+      releaseRuntime = resolve;
+    });
+    const calls: string[] = [];
+    const targetDeps = deps({
+      runFatalRuntimePreflight: vi.fn(async () => {
+        calls.push("runtime-start");
+        await runtimeReady;
+        calls.push("runtime-end");
+      }),
+      ensureOpenshell: vi.fn(() => calls.push("openshell")),
+      assertGatewayReadiness: vi.fn(() => calls.push("gateway")),
+      inferenceRouteReady: vi.fn(() => {
+        calls.push("route");
+        return true;
+      }),
+    });
+
+    const pending = preflightAuthoritativeRebuildTarget(target, targetDeps);
+    await vi.waitFor(() => expect(calls).toEqual(["runtime-start"]));
+    expect(targetDeps.ensureOpenshell).not.toHaveBeenCalled();
+
+    releaseRuntime();
+    await pending;
+    expect(calls).toEqual(["runtime-start", "runtime-end", "openshell", "gateway", "route"]);
+  });
+
+  it("stops rebuild checks when async runtime readiness rejects", async () => {
+    const targetDeps = deps({
+      runFatalRuntimePreflight: vi.fn(async () => {
+        throw new Error("gateway readiness changed");
+      }),
+    });
+
+    await expect(preflightAuthoritativeRebuildTarget(target, targetDeps)).rejects.toThrow(
+      "gateway readiness changed",
+    );
+    expect(targetDeps.ensureOpenshell).not.toHaveBeenCalled();
+    expect(targetDeps.assertGatewayReadiness).not.toHaveBeenCalled();
+    expect(targetDeps.inferenceRouteReady).not.toHaveBeenCalled();
   });
 });

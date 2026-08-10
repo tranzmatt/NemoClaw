@@ -10,7 +10,13 @@ import {
   spawnSync,
 } from "node:child_process";
 
+import { redirectInheritedChildStdoutToStderr } from "../../cli/stdout-guard";
 import { buildSubprocessEnv } from "../../subprocess-env";
+
+export {
+  openshellSandboxSshHost,
+  resolveOpenshellSandboxSshHost,
+} from "./sandbox-ssh-host";
 
 export type OpenshellSpawnSync = (
   command: string,
@@ -56,6 +62,18 @@ export interface CaptureOpenshellAsyncOptions extends CaptureOpenshellOptions {
   spawnImpl?: OpenshellSpawn;
 }
 
+export interface CaptureSandboxSshConfigOptions extends CaptureOpenshellOptions {
+  /**
+   * Gateway the sandbox is recorded against (`resolveSandboxGatewayName`).
+   * `sandbox get` and `sandbox ssh-config` resolve against OpenShell's mutable
+   * current selection when no gateway is given, so a caller that knows the
+   * sandbox's own binding must pass it — otherwise the lookup can land on a
+   * sibling gateway and report the sandbox as missing (#7429). Omitted keeps
+   * the ambient-selection behavior for callers that have no binding to supply.
+   */
+  gatewayName?: string;
+}
+
 export interface CaptureOpenshellResult {
   status: number | null;
   output: string;
@@ -75,6 +93,8 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+const SEMVER_PATTERN = /(?:^|[^0-9.])([0-9]+\.[0-9]+\.[0-9]+)(?![0-9.])/;
+
 export function parseVersionFromText(value = "", versionCommand?: string): string | null {
   const text = String(value || "");
   const commandToken = versionCommand?.trim().split(/\s+/, 1)[0] ?? "";
@@ -88,13 +108,13 @@ export function parseVersionFromText(value = "", versionCommand?: string): strin
       executableSeen = true;
       const versionMatch = line
         .slice(executableMatch.index + executableMatch[0].length)
-        .match(/([0-9]+\.[0-9]+\.[0-9]+)/);
+        .match(SEMVER_PATTERN);
       if (versionMatch) return versionMatch[1];
     }
     if (executableSeen) return null;
   }
 
-  const match = text.match(/([0-9]+\.[0-9]+\.[0-9]+)/);
+  const match = text.match(SEMVER_PATTERN);
   return match ? match[1] : null;
 }
 
@@ -185,7 +205,7 @@ export function runOpenshellCommand(
     cwd: opts.cwd,
     env: openshellSpawnEnv(opts),
     encoding: "utf-8",
-    stdio: opts.stdio ?? "inherit",
+    stdio: redirectInheritedChildStdoutToStderr(opts.stdio ?? "inherit"),
     input: opts.input,
     timeout: opts.timeout,
   });
@@ -229,22 +249,39 @@ export function captureOpenshellCommand(
     return handleSpawnError(binary, args, result.error, opts);
   }
   return {
-    status: result.status ?? 1,
+    status: result.status ?? (result.signal ? null : 1),
     output: captureOutput(result, opts),
     ...maybeCapturedStreams(result.stdout || "", result.stderr || "", opts),
+    ...(result.signal ? { signal: result.signal } : {}),
   };
+}
+
+/**
+ * Insert `-g <gateway>` after the subcommand pair, matching the placement
+ * `gatewayScopedArgs` already uses in `actions/sandbox/gateway-state.ts`.
+ * Duplicated rather than imported: an adapter must not depend on the actions
+ * layer.
+ */
+function gatewayScopedArgs(args: string[], gatewayName?: string): string[] {
+  if (!gatewayName) return args;
+  return [...args.slice(0, 2), "-g", gatewayName, ...args.slice(2)];
 }
 
 export function captureSandboxSshConfigCommand(
   binary: string,
   sandboxName: string,
-  opts: CaptureOpenshellOptions = {},
+  opts: CaptureSandboxSshConfigOptions = {},
 ): CaptureOpenshellResult {
-  const sandboxGet = captureOpenshellCommand(binary, ["sandbox", "get", sandboxName], {
-    ...opts,
-    ignoreError: true,
-    includeStderr: true,
-  });
+  const { gatewayName, ...spawnOpts } = opts;
+  const sandboxGet = captureOpenshellCommand(
+    binary,
+    gatewayScopedArgs(["sandbox", "get", sandboxName], gatewayName),
+    {
+      ...spawnOpts,
+      ignoreError: true,
+      includeStderr: true,
+    },
+  );
   if (sandboxGet.status !== 0) {
     const output = sandboxGet.output || `failed to query sandbox '${sandboxName}'`;
     const sandboxMissing = /\bnot[- ]?found\b/i.test(output);
@@ -253,7 +290,13 @@ export function captureSandboxSshConfigCommand(
       output: sandboxMissing ? `sandbox '${sandboxName}' not found` : output,
     };
   }
-  return captureOpenshellCommand(binary, ["sandbox", "ssh-config", sandboxName], opts);
+  // Pin every hop to the same gateway so `get` and `ssh-config` cannot
+  // disagree about which one owns the sandbox.
+  return captureOpenshellCommand(
+    binary,
+    gatewayScopedArgs(["sandbox", "ssh-config", sandboxName], gatewayName),
+    spawnOpts,
+  );
 }
 
 export function captureOpenshellCommandAsync(

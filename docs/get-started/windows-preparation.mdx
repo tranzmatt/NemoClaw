@@ -1,22 +1,23 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "Prepare Windows for NemoClaw"
-sidebar-title: "(Windows Only) Windows Prerequisites"
+title: "Prepare a Windows Machine to Install NemoClaw"
+sidebar-title: "Additional Setup for Windows Machines"
 description: "Prepare a Windows machine for NemoClaw before running the Quickstart: enable WSL 2, install Ubuntu, and configure Docker Desktop."
 description-agent: "Covers Windows-only preparation steps required before the Quickstart. Use when preparing a Windows machine for NemoClaw, enabling WSL 2, configuring Docker Desktop for Windows, or troubleshooting a Windows-specific install error."
 keywords: ["nemoclaw windows wsl2 setup", "nemoclaw install windows docker desktop"]
 content:
   type: "reference"
 ---
-import { AgentOnly } from "../_components/AgentGuide";
-
 Run NemoClaw inside Windows Subsystem for Linux (WSL 2) on Windows.
 <AgentOnly variant="openclaw">
 Complete these steps before following the [Quickstart](../quickstart).
 </AgentOnly>
 <AgentOnly variant="hermes">
 Complete these steps before following [Quickstart with Hermes](../quickstart).
+</AgentOnly>
+<AgentOnly variant="deepagents">
+Complete these steps before following [Quickstart with Deep Agents](../quickstart).
 </AgentOnly>
 Linux and macOS users do not need this page and can go directly to the Quickstart.
 
@@ -37,6 +38,11 @@ Verify the following before you begin:
 <AgentOnly variant="hermes">
 
 - Hardware requirements are the same as [Quickstart with Hermes](../quickstart).
+
+</AgentOnly>
+<AgentOnly variant="deepagents">
+
+- Hardware requirements are the same as [Quickstart with Deep Agents](../quickstart).
 
 </AgentOnly>
 
@@ -150,7 +156,8 @@ If you see "Cannot connect to the Docker daemon", confirm that Docker Desktop is
 
 ## Set Up Local Inference with Ollama (Optional)
 
-If you plan to select Ollama as your inference provider during onboarding, use one Ollama instance that WSL can reach.
+If you plan to select Ollama as your inference provider during onboarding, use one Ollama instance.
+It can run inside WSL or on Windows through Docker Desktop.
 Run this command to install Ollama inside WSL.
 
 ```bash
@@ -162,17 +169,27 @@ You can also start it yourself beforehand with `ollama serve`.
 
 You can also use Ollama for Windows.
 During onboarding, NemoClaw can use an already-running Windows-host daemon, start or restart an installed daemon, or install Ollama on the Windows host.
-If the installer offers express install on WSL, accepting it selects this Windows-host Ollama path automatically.
-When Ollama runs on the Windows host, NemoClaw detects it from WSL through `host.docker.internal` and pulls missing models through the Ollama HTTP API.
+If the installer offers express install on WSL, accepting it selects a local Ollama path automatically based on the container runtime: the Windows-host Ollama path only when it detects Docker Desktop WSL integration, and WSL-local Ollama otherwise.
+The Windows-host Ollama path requires Docker Desktop WSL integration; the express prompt appears on WSL regardless of the container runtime.
+When the installer must read the Docker configuration file to determine the effective Docker context and Node.js is unavailable, it defers provider selection until after it installs Node.js.
+It then reads the configuration and applies the same runtime check.
+The express selection does not waive system readiness.
+With native Docker Engine inside WSL, or when the Docker runtime is unavailable or cannot be probed, the installer skips onboarding until Docker Desktop WSL integration is available.
+After you fix the runtime, rerun the installer or run `$$nemoclaw onboard`.
+An installed Windows-host Ollama that Docker Desktop cannot reach leaves the WSL-local install available, in both the onboarding menu and a requested `install-ollama` provider.
+When containers cannot reach host loopback, onboarding fronts that WSL-local daemon with the sandbox auth proxy.
+You can still decline the express prompt (or set `NEMOCLAW_NO_EXPRESS=1`) to choose a provider manually; the onboarding menu labels the Windows-host actions as requiring Docker Desktop integration.
+When Ollama runs on the Windows host, NemoClaw checks it from Docker Desktop through `host.docker.internal` and pulls missing models through the Ollama HTTP API.
+A direct request from WSL can fail because Docker Desktop defines this hostname in its container network context.
 Do not run both the Windows and WSL Ollama instances on port `11434` at the same time.
 Use one instance, or move one of them to a different port before running `$$nemoclaw onboard`.
 On Windows on Arm N1X systems with a Snapdragon X processor, let NemoClaw choose the Ollama starter model automatically.
 It selects the compute-constrained `qwen3.5:9b` path instead of recommending the 30B and 35B starter models.
 <AgentOnly variant="openclaw">
-For the selection boundary and remaining N1X limitations, refer to [Use a Local Inference Server](/user-guide/openclaw/inference/use-local-inference).
+For the selection boundary and remaining N1X limitations, refer to [Use Ollama for Local Inference](/user-guide/openclaw/inference/local-inference/set-up-ollama).
 </AgentOnly>
 <AgentOnly variant="hermes">
-For the selection boundary and remaining N1X limitations, refer to [Use a Local Inference Server](/user-guide/hermes/inference/use-local-inference).
+For the selection boundary and remaining N1X limitations, refer to [Use Ollama for Local Inference](/user-guide/hermes/inference/local-inference/set-up-ollama).
 </AgentOnly>
 
 ## Next Step
@@ -188,6 +205,11 @@ Then continue with the [Quickstart](../quickstart) to install NemoClaw and launc
 If you prepared Windows manually, open a WSL terminal.
 Type `wsl` in PowerShell, or open Ubuntu from Windows Terminal.
 Then continue with [Quickstart with Hermes](../quickstart) to install NemoClaw and launch your first Hermes sandbox.
+</AgentOnly>
+<AgentOnly variant="deepagents">
+If you prepared Windows manually, open a WSL terminal.
+Type `wsl` in PowerShell, or open Ubuntu from Windows Terminal.
+Then continue with [Quickstart with Deep Agents](../quickstart) to install NemoClaw and launch your first sandbox.
 </AgentOnly>
 
 All NemoClaw commands run inside WSL, not in PowerShell.

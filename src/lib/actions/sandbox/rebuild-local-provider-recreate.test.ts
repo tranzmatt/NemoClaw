@@ -18,6 +18,10 @@ import { createLocalInferenceRouteApplier } from "../../onboard/local-inference-
 
 const requireDist = createRequire(import.meta.url);
 const openshellRuntime = requireDist("../../adapters/openshell/runtime.js") as {
+  captureOpenshell(
+    args: string[],
+    options?: Record<string, unknown>,
+  ): { status: number | null; output?: string; stdout?: string; stderr?: string };
   runOpenshell(
     args: string[],
     options?: Record<string, unknown>,
@@ -111,6 +115,7 @@ const localProviderScenarios = [
           applyLocalInferenceRoute,
           run: () => ({ status: 0 }),
           VLLM_LOCAL_CREDENTIAL_ENV: "NEMOCLAW_VLLM_LOCAL_TOKEN",
+          getManagedVllmProviderBinding: () => null,
           ...unusedCommonInferenceDeps,
         },
       ),
@@ -144,6 +149,7 @@ describe("rebuild local-provider recreation", () => {
     credentialEnv,
     setup,
   }) => {
+    let sourceDeleted = false;
     let harness!: RebuildFlowHarness;
     let setupResult: SetupResult | undefined;
     harness = createRebuildFlowHarness({
@@ -163,11 +169,27 @@ describe("rebuild local-provider recreation", () => {
     });
     harness.session.provider = provider;
     harness.session.model = model;
-    harness.runOpenshellSpy.mockImplementation((args: string[]) => ({
-      status: args[0] === "provider" && args[1] === "get" ? 1 : 0,
-      stdout: "",
-      stderr: "",
-    }));
+    harness.runOpenshellSpy.mockImplementation((args: string[]) => {
+      sourceDeleted ||= args.join(" ") === "sandbox delete -g nemoclaw alpha";
+      return args[0] === "sandbox" && args[1] === "get"
+        ? {
+            status: 1,
+            stdout: "",
+            stderr: "sandbox alpha not found",
+          }
+        : {
+            status: args[0] === "provider" && args[1] === "get" ? 1 : 0,
+            stdout: "",
+            stderr: "",
+          };
+    });
+    const liveSource = "Name: alpha\nId: sbx-alpha-source\nPhase: Ready\n";
+    harness.captureOpenshellSpy.mockImplementation((args: unknown) => {
+      const argv = Array.isArray(args) ? args.map(String) : [];
+      return argv.join(" ") === "sandbox get -g nemoclaw alpha" && !sourceDeleted
+        ? { status: 0, output: liveSource, stdout: liveSource, stderr: "" }
+        : { status: 1, output: "", stdout: "", stderr: "Error: sandbox alpha not found" };
+    });
 
     await expect(
       harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),
@@ -175,7 +197,7 @@ describe("rebuild local-provider recreation", () => {
 
     const calls = harness.runOpenshellSpy.mock.calls.map((call) => call[0] as string[]);
     const deleteCall = calls.findIndex(
-      (args) => args[0] === "sandbox" && args[1] === "delete" && args[2] === "alpha",
+      (args) => args.join(" ") === "sandbox delete -g nemoclaw alpha",
     );
     const providerLookup = calls.findIndex(
       (args) => args[0] === "provider" && args[1] === "get" && args[2] === provider,
@@ -214,6 +236,7 @@ describe("rebuild local-provider recreation", () => {
     expect(harness.restoreSandboxStateSpy).toHaveBeenCalledWith(
       "alpha",
       "/tmp/nemoclaw-rebuild-backup",
+      { targetAgentType: "openclaw" },
     );
   });
 });

@@ -10,21 +10,40 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { runRealOpenClawDeviceSelfApprovalProof } from "./helpers/openclaw-real-device-self-approval-proof";
+import { runRealOpenClawMcpStartRetryProof } from "./helpers/openclaw-real-mcp-start-retry-proof";
 
 const REPO_ROOT = path.join(import.meta.dirname, "..");
 const DOCKERFILE = path.join(REPO_ROOT, "Dockerfile");
-const PATCH_OPENCLAW_CHAT_SEND = path.join(REPO_ROOT, "scripts", "patch-openclaw-chat-send.js");
+const PATCH_OPENCLAW_CHAT_SEND = path.join(REPO_ROOT, "scripts", "patch-openclaw-chat-send.mts");
 const PATCH_OPENCLAW_ISSUE_4434_DIAGNOSTICS = path.join(
   REPO_ROOT,
   "scripts",
-  "patch-openclaw-issue-4434-diagnostics.ts",
+  "patch-openclaw-issue-4434-diagnostics.mts",
 );
+const PATCH_OPENCLAW_SHARED_STATE_PERMISSIONS = path.join(
+  REPO_ROOT,
+  "scripts",
+  "patch-openclaw-shared-state-permissions.mts",
+);
+const PATCH_OPENCLAW_GATEWAY_DAEMON_DIALBACK = path.join(
+  REPO_ROOT,
+  "scripts",
+  "openclaw",
+  "patch-gateway-daemon-dialback.mts",
+);
+const PATCH_OPENCLAW_MCP_RELIABILITY = path.join(
+  REPO_ROOT,
+  "scripts",
+  "patch-openclaw-mcp-reliability.mts",
+);
+const OPENCLAW_VERSION_EXTRACTOR = path.join(REPO_ROOT, "scripts", "extract-semver.sh");
+const REAL_OPENCLAW_NODE_ENV = "NEMOCLAW_REAL_OPENCLAW_NODE";
 // Focused patch scripts also scan the full generated dist. APFS cold-cache
 // reads can exceed one minute, so keep them bounded without using unit-fixture
 // timings as the real-artifact limit.
 const PATCH_COMMAND_TIMEOUT_MS = 120_000;
 // The compiled-dist classifier performs several full-tree grep/sed passes.
-// A cold 2026.6.10 materialization can exceed three minutes on macOS while the
+// A cold 2026.7.1 materialization can exceed three minutes on macOS while the
 // same patch completes normally; keep this bounded below the 12-minute CI job.
 const DOCKERFILE_PATCH_TIMEOUT_MS = 300_000;
 
@@ -116,15 +135,68 @@ function requireSpawnSuccess(
   requireRuntimeEqual(String(result.status), "0", detail ? `${label}: ${detail}` : label);
 }
 
+interface RealOpenClawNodeRuntime {
+  executable: string;
+  version: string;
+}
+
+function resolveRealOpenClawNodeRuntime(
+  env: NodeJS.ProcessEnv = process.env,
+): RealOpenClawNodeRuntime {
+  const configured = env[REAL_OPENCLAW_NODE_ENV]?.trim();
+  const executable = configured || process.execPath;
+  path.isAbsolute(executable) ||
+    runtimeMismatch(executable, "an absolute path", REAL_OPENCLAW_NODE_ENV);
+
+  let executableStat: fs.Stats;
+  try {
+    executableStat = fs.statSync(executable);
+    fs.accessSync(executable, fs.constants.X_OK);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    runtimeMismatch(detail, "an executable regular file", REAL_OPENCLAW_NODE_ENV);
+  }
+  executableStat.isFile() ||
+    runtimeMismatch(executable, "an executable regular file", REAL_OPENCLAW_NODE_ENV);
+
+  const versionProbe = spawnSync(executable, ["--version"], {
+    encoding: "utf-8",
+    timeout: 10_000,
+  });
+  requireSpawnSuccess(versionProbe, `probe ${REAL_OPENCLAW_NODE_ENV}`);
+  const version = versionProbe.stdout.trim();
+  const match =
+    version.match(/^v(\d+)\.(\d+)\.(\d+)$/u) ??
+    runtimeMismatch(version, "a stable Node version", REAL_OPENCLAW_NODE_ENV);
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  const supportedNode22 = major === 22 && (minor > 22 || (minor === 22 && patch >= 3));
+  supportedNode22 ||
+    runtimeMismatch(
+      version,
+      "Node >=22.22.3 <23 (the Dockerfile runtime is Node 22.23.1)",
+      REAL_OPENCLAW_NODE_ENV,
+    );
+
+  return { executable, version };
+}
+
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-function runDockerfilePatchBlock(dist: string, tmp: string, version: string) {
-  const command = dockerRunCommandBetween(
+function dockerfilePatchCommand(dist: string): string {
+  return dockerRunCommandBetween(
     "# Patch OpenClaw media fetch for proxy-only sandbox",
     "# Patch OpenClaw chat.send gateway behavior",
-  ).replaceAll("/usr/local/lib/node_modules/openclaw/dist", dist);
+  )
+    .replaceAll("/usr/local/lib/node_modules/openclaw/dist", dist)
+    .replaceAll("/usr/local/lib/nemoclaw/extract-semver", shellQuote(OPENCLAW_VERSION_EXTRACTOR));
+}
+
+function runDockerfilePatchBlock(dist: string, tmp: string, version: string) {
+  const command = dockerfilePatchCommand(dist);
   const scriptPath = path.join(tmp, "patch-openclaw-dist.sh");
   fs.writeFileSync(
     scriptPath,
@@ -220,6 +292,42 @@ function materializeReviewedTarball(
 }
 
 describe("OpenClaw real patched-dist materialization guard", () => {
+  it("maps container-only patch helpers to their repository fixtures", () => {
+    const command = dockerfilePatchCommand("/tmp/reviewed-openclaw-dist");
+
+    expect(command).not.toContain("/usr/local/lib/nemoclaw/extract-semver");
+    expect(command).toContain(shellQuote(OPENCLAW_VERSION_EXTRACTOR));
+  });
+
+  it("rejects an unsupported explicit real-dist Node runtime before OpenClaw starts", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openclaw-node-runtime-"));
+    try {
+      const fakeNode = path.join(tmp, "node");
+      fs.writeFileSync(fakeNode, "#!/bin/sh\nprintf 'v22.22.2\\n'\n", { mode: 0o700 });
+
+      expect(() => resolveRealOpenClawNodeRuntime({ [REAL_OPENCLAW_NODE_ENV]: fakeNode })).toThrow(
+        /Node >=22\.22\.3 <23/,
+      );
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("accepts an explicit absolute Node runtime in the reviewed production lane", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openclaw-node-runtime-"));
+    try {
+      const fakeNode = path.join(tmp, "node");
+      fs.writeFileSync(fakeNode, "#!/bin/sh\nprintf 'v22.23.1\\n'\n", { mode: 0o700 });
+
+      expect(resolveRealOpenClawNodeRuntime({ [REAL_OPENCLAW_NODE_ENV]: fakeNode })).toEqual({
+        executable: fakeNode,
+        version: "v22.23.1",
+      });
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("rejects drifted tarball integrity before install can start", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openclaw-drifted-dist-"));
     let installStarted = false;
@@ -234,7 +342,8 @@ describe("OpenClaw real patched-dist materialization guard", () => {
         };
       };
 
-      expect(() => {
+      let failure: unknown;
+      try {
         materializeReviewedTarball(
           "https://registry.npmjs.org/openclaw/-/openclaw-drifted.tgz",
           tmp,
@@ -242,7 +351,12 @@ describe("OpenClaw real patched-dist materialization guard", () => {
           fakePack,
         );
         installStarted = true;
-      }).toThrow(/OpenClaw tarball SRI/);
+      } catch (caught) {
+        failure = caught;
+      }
+
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(/OpenClaw tarball SRI/);
       expect(installStarted).toBe(false);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -259,7 +373,8 @@ describe("OpenClaw real patched-dist materialization guard", () => {
         stderr: "",
       });
 
-      expect(() => {
+      let failure: unknown;
+      try {
         materializeReviewedTarball(
           "https://registry.npmjs.org/openclaw/-/openclaw-unsafe.tgz",
           tmp,
@@ -267,7 +382,12 @@ describe("OpenClaw real patched-dist materialization guard", () => {
           fakePack,
         );
         installStarted = true;
-      }).toThrow(/unsafe archive filename/);
+      } catch (caught) {
+        failure = caught;
+      }
+
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(/unsafe archive filename/);
       expect(installStarted).toBe(false);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -279,9 +399,13 @@ describe.skipIf(process.env.NEMOCLAW_REAL_OPENCLAW_DIST_HARNESS !== "1")(
   "OpenClaw real patched-dist harness",
   () => {
     it("materializes the reviewed tarball and applies NemoClaw's Dockerfile OpenClaw patches", async () => {
+      const nodeRuntime = resolveRealOpenClawNodeRuntime();
+      console.info(
+        `OpenClaw real patched-dist Node runtime: ${nodeRuntime.version} (${nodeRuntime.executable})`,
+      );
       const version = readRequiredDockerArg("OPENCLAW_VERSION");
-      const integrity = readRequiredDockerArg("OPENCLAW_2026_6_10_INTEGRITY");
-      const tarballUrl = readRequiredDockerArg("OPENCLAW_2026_6_10_TARBALL");
+      const integrity = readRequiredDockerArg("OPENCLAW_2026_7_1_INTEGRITY");
+      const tarballUrl = readRequiredDockerArg("OPENCLAW_2026_7_1_TARBALL");
       const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openclaw-real-dist-"));
       try {
         const tarballPath = materializeReviewedTarball(tarballUrl, tmp, integrity);
@@ -350,10 +474,14 @@ describe.skipIf(process.env.NEMOCLAW_REAL_OPENCLAW_DIST_HARNESS !== "1")(
           "embedded-agent retry persistence patch preimage count",
         );
 
-        const chatPatch = spawnSync(process.execPath, [PATCH_OPENCLAW_CHAT_SEND, dist], {
-          encoding: "utf-8",
-          timeout: PATCH_COMMAND_TIMEOUT_MS,
-        });
+        const chatPatch = spawnSync(
+          nodeRuntime.executable,
+          ["--experimental-strip-types", PATCH_OPENCLAW_CHAT_SEND, dist],
+          {
+            encoding: "utf-8",
+            timeout: PATCH_COMMAND_TIMEOUT_MS,
+          },
+        );
         requireSpawnSuccess(chatPatch, "apply chat.send compatibility patch");
         requireRuntimeIncludes(
           chatPatch.stdout,
@@ -361,10 +489,14 @@ describe.skipIf(process.env.NEMOCLAW_REAL_OPENCLAW_DIST_HARNESS !== "1")(
           "chat.send patch output",
         );
 
-        const audit = spawnSync(process.execPath, [PATCH_OPENCLAW_CHAT_SEND, "--audit", dist], {
-          encoding: "utf-8",
-          timeout: PATCH_COMMAND_TIMEOUT_MS,
-        });
+        const audit = spawnSync(
+          nodeRuntime.executable,
+          ["--experimental-strip-types", PATCH_OPENCLAW_CHAT_SEND, "--audit", dist],
+          {
+            encoding: "utf-8",
+            timeout: PATCH_COMMAND_TIMEOUT_MS,
+          },
+        );
         requireSpawnSuccess(audit, "audit chat.send compatibility patch");
         requireRuntimeIncludes(audit.stdout, "chat.send runtime:", "chat.send audit");
         requireRuntimeIncludes(audit.stdout, "get-reply runtime:", "get-reply audit");
@@ -385,14 +517,14 @@ describe.skipIf(process.env.NEMOCLAW_REAL_OPENCLAW_DIST_HARNESS !== "1")(
           "embedded-agent retry persistence marker count",
         );
         const embeddedAgentSyntax = spawnSync(
-          process.execPath,
+          nodeRuntime.executable,
           ["--check", retryPersistenceTargets[0] as string],
           { encoding: "utf-8", timeout: PATCH_COMMAND_TIMEOUT_MS },
         );
         requireSpawnSuccess(embeddedAgentSyntax, "validate patched embedded-agent syntax");
 
         const issue4434Patch = spawnSync(
-          process.execPath,
+          nodeRuntime.executable,
           ["--experimental-strip-types", PATCH_OPENCLAW_ISSUE_4434_DIAGNOSTICS, dist],
           {
             encoding: "utf-8",
@@ -407,7 +539,7 @@ describe.skipIf(process.env.NEMOCLAW_REAL_OPENCLAW_DIST_HARNESS !== "1")(
         );
 
         const issue4434Audit = spawnSync(
-          process.execPath,
+          nodeRuntime.executable,
           ["--experimental-strip-types", PATCH_OPENCLAW_ISSUE_4434_DIAGNOSTICS, "--audit", dist],
           {
             encoding: "utf-8",
@@ -426,12 +558,221 @@ describe.skipIf(process.env.NEMOCLAW_REAL_OPENCLAW_DIST_HARNESS !== "1")(
           "#4434 patch state audit",
         );
 
-        // This proof installs the reviewed shrinkwrapped runtime dependencies
-        // with lifecycle scripts disabled. Keep it after every shape-only dist
-        // scan so dependency materialization cannot perturb their timing.
+        const gatewayDialbackPatch = spawnSync(
+          nodeRuntime.executable,
+          ["--experimental-strip-types", PATCH_OPENCLAW_GATEWAY_DAEMON_DIALBACK, dist],
+          { encoding: "utf-8", timeout: PATCH_COMMAND_TIMEOUT_MS },
+        );
+        requireSpawnSuccess(gatewayDialbackPatch, "apply gateway daemon self-dialback patch");
+        requireRuntimeIncludes(
+          gatewayDialbackPatch.stdout,
+          "patched OpenClaw gateway daemon self-dialback (3 files)",
+          "gateway daemon self-dialback patch output",
+        );
+
+        const gatewayDialbackAudit = spawnSync(
+          nodeRuntime.executable,
+          ["--experimental-strip-types", PATCH_OPENCLAW_GATEWAY_DAEMON_DIALBACK, "--audit", dist],
+          { encoding: "utf-8", timeout: PATCH_COMMAND_TIMEOUT_MS },
+        );
+        requireSpawnSuccess(gatewayDialbackAudit, "audit gateway daemon self-dialback patch");
+        requireRuntimeIncludes(
+          gatewayDialbackAudit.stdout,
+          "audited OpenClaw gateway daemon self-dialback (3 files)",
+          "gateway daemon self-dialback audit output",
+        );
+        const gatewayDialbackTargets = fs
+          .readdirSync(dist)
+          .filter((file) => file.endsWith(".js"))
+          .map((file) => path.join(dist, file))
+          .filter((file) =>
+            fs.readFileSync(file, "utf-8").includes("nemoclaw: keep gateway-daemon"),
+          );
+        requireRuntimeEqual(
+          String(gatewayDialbackTargets.length),
+          "2",
+          "gateway daemon self-dialback transport target count",
+        );
+        const gatewayToolTarget = fs
+          .readdirSync(dist)
+          .filter((file) => file.endsWith(".js"))
+          .map((file) => path.join(dist, file))
+          .filter((file) =>
+            fs
+              .readFileSync(file, "utf-8")
+              .includes("nemoclaw: classify gateway-daemon tool RPC as local"),
+          );
+        requireRuntimeEqual(
+          String(gatewayToolTarget.length),
+          "1",
+          "gateway daemon self-dialback tool target count",
+        );
+
+        const sharedStatePatch = spawnSync(
+          nodeRuntime.executable,
+          ["--experimental-strip-types", PATCH_OPENCLAW_SHARED_STATE_PERMISSIONS, dist],
+          { encoding: "utf-8", timeout: PATCH_COMMAND_TIMEOUT_MS },
+        );
+        requireSpawnSuccess(sharedStatePatch, "apply shared-state permission patch");
+        requireRuntimeIncludes(
+          sharedStatePatch.stdout,
+          "SQLite state permissions patched",
+          "shared-state patch output",
+        );
+
+        const sharedStateAudit = spawnSync(
+          nodeRuntime.executable,
+          ["--experimental-strip-types", PATCH_OPENCLAW_SHARED_STATE_PERMISSIONS, dist],
+          { encoding: "utf-8", timeout: PATCH_COMMAND_TIMEOUT_MS },
+        );
+        requireSpawnSuccess(sharedStateAudit, "audit shared-state permission patch");
+        requireRuntimeIncludes(
+          sharedStateAudit.stdout,
+          "SQLite state permissions already-patched",
+          "shared-state patch idempotence",
+        );
+
+        const sharedStateTargets = fs
+          .readdirSync(dist)
+          .filter((file) => /^openclaw-state-db-.+\.js$/.test(file))
+          .map((file) => path.join(dist, file))
+          .filter((file) =>
+            fs.readFileSync(file, "utf-8").includes("/* nemoclaw: group-shared OpenClaw state */"),
+          );
+        requireRuntimeEqual(
+          String(sharedStateTargets.length),
+          "1",
+          "shared-state patch target count",
+        );
+        const agentStateTargets = fs
+          .readdirSync(dist)
+          .filter((file) => /^openclaw-agent-db-.+\.js$/.test(file))
+          .map((file) => path.join(dist, file))
+          .filter((file) =>
+            fs
+              .readFileSync(file, "utf-8")
+              .includes("/* nemoclaw: group-shared OpenClaw agent state */"),
+          );
+        requireRuntimeEqual(
+          String(agentStateTargets.length),
+          "1",
+          "per-agent state patch target count",
+        );
+        const privateStoreTargets = fs
+          .readdirSync(dist)
+          .filter((file) => /^secret-file-.+\.js$/.test(file))
+          .map((file) => path.join(dist, file))
+          .filter((file) => {
+            const source = fs.readFileSync(file, "utf-8");
+            return (
+              source.includes("const PRIVATE_SECRET_DIR_MODE = 448;") &&
+              source.includes("const PRIVATE_SECRET_FILE_MODE = 384;")
+            );
+          });
+        requireRuntimeEqual(
+          String(privateStoreTargets.length),
+          "1",
+          "owner-only private-store target count",
+        );
+        requireRuntimeEqual(
+          String(
+            privateStoreTargets.some((file) =>
+              fs
+                .readFileSync(file, "utf-8")
+                .includes("/* nemoclaw: group-shared OpenClaw private store */"),
+            ),
+          ),
+          "false",
+          "generic private-store sharing marker",
+        );
+        const stateMigrationTargets = fs
+          .readdirSync(dist)
+          .filter((file) => /^state-migrations-.+\.js$/.test(file))
+          .map((file) => path.join(dist, file))
+          .filter((file) =>
+            fs
+              .readFileSync(file, "utf-8")
+              .includes("/* nemoclaw: ignore legacy OpenClaw update-check state */"),
+          );
+        requireRuntimeEqual(
+          String(stateMigrationTargets.length),
+          "1",
+          "legacy update-check migration patch target count",
+        );
+        const fileStoreTargets = fs
+          .readdirSync(dist)
+          .filter((file) => /^file-store-.+\.js$/.test(file))
+          .map((file) => path.join(dist, file))
+          .filter((file) => {
+            const source = fs.readFileSync(file, "utf-8");
+            return (
+              source.includes("function fileStore(options) {") &&
+              source.includes("function fileStoreSync(options) {") &&
+              source.includes("const dirMode = options.dirMode ?? 448;") &&
+              source.includes("const mode = options.mode ?? 384;")
+            );
+          });
+        requireRuntimeEqual(
+          String(fileStoreTargets.length),
+          "1",
+          "owner-only file-store defaults target count",
+        );
+        requireRuntimeEqual(
+          String(
+            fileStoreTargets.some((file) =>
+              fs
+                .readFileSync(file, "utf-8")
+                .includes("/* nemoclaw: group-shared OpenClaw file-store defaults */"),
+            ),
+          ),
+          "false",
+          "generic file-store sharing marker",
+        );
+        const modelsConfigTargets = fs
+          .readdirSync(dist)
+          .filter((file) => /^models-config-.+\.js$/.test(file))
+          .map((file) => path.join(dist, file))
+          .filter((file) =>
+            fs
+              .readFileSync(file, "utf-8")
+              .includes("/* nemoclaw: group-shared OpenClaw models file */"),
+          );
+        requireRuntimeEqual(
+          String(modelsConfigTargets.length),
+          "1",
+          "generated models file mode patch target count",
+        );
+        for (const target of [
+          ...gatewayDialbackTargets,
+          ...gatewayToolTarget,
+          ...sharedStateTargets,
+          ...agentStateTargets,
+          ...privateStoreTargets,
+          ...stateMigrationTargets,
+          ...fileStoreTargets,
+          ...modelsConfigTargets,
+        ]) {
+          const syntax = spawnSync(nodeRuntime.executable, ["--check", target], {
+            encoding: "utf-8",
+            timeout: PATCH_COMMAND_TIMEOUT_MS,
+          });
+          requireSpawnSuccess(syntax, `validate reviewed OpenClaw dist syntax: ${target}`);
+        }
+
+        // These proofs install the reviewed shrinkwrapped runtime dependencies
+        // with lifecycle scripts disabled. Keep them after every shape-only
+        // dist scan so dependency materialization cannot perturb their timing.
+        runRealOpenClawMcpStartRetryProof({
+          dist,
+          nodeExecutable: nodeRuntime.executable,
+          patchScript: PATCH_OPENCLAW_MCP_RELIABILITY,
+          timeoutMs: PATCH_COMMAND_TIMEOUT_MS,
+        });
+
         await runRealOpenClawDeviceSelfApprovalProof({
           dist,
-          patchScript: path.join(REPO_ROOT, "scripts", "patch-openclaw-device-self-approval.ts"),
+          nodeExecutable: nodeRuntime.executable,
+          patchScript: path.join(REPO_ROOT, "scripts", "patch-openclaw-device-self-approval.mts"),
           timeoutMs: PATCH_COMMAND_TIMEOUT_MS,
           tmp,
         });

@@ -130,4 +130,67 @@ describe("onboard tool-disclosure flow", () => {
     expect(mocks.updateSession).not.toHaveBeenCalled();
     expect(mocks.removeSandbox).not.toHaveBeenCalled();
   });
+
+  it("keeps a pending route reservation for the current sandbox so a resumed onboard can recover", () => {
+    const result = prepareSandboxToolDisclosure(
+      "alpha",
+      null,
+      false,
+      () => ({
+        existingEntry: {
+          name: "alpha",
+          toolDisclosure: "progressive",
+          pendingRouteReservation: true,
+        },
+        preservedMcpState: undefined,
+        liveExists: false,
+      }),
+      "progressive",
+    );
+
+    expect(result).toMatchObject({ effectiveToolDisclosure: "progressive" });
+    expect(mocks.updateSession).toHaveBeenCalledOnce();
+    expect(mocks.removeSandbox).not.toHaveBeenCalled();
+  });
+
+  it("keeps baseline-exclusion retry metadata when absent replacement creation fails (#7194)", () => {
+    const baselineExclusions = [
+      {
+        version: 1 as const,
+        agent: "openclaw",
+        key: "openclaw_docs",
+        digest: "baseline-digest",
+        acknowledgedAt: "2026-07-19T00:00:00.000Z",
+        appliedAgentVersion: "2026.6.10",
+      },
+    ];
+    const retryEntry = {
+      name: "alpha",
+      toolDisclosure: "progressive" as const,
+      baselineExclusions,
+    };
+    let registryEntry: typeof retryEntry | null = retryEntry;
+    mocks.removeSandbox.mockImplementation(() => {
+      registryEntry = null;
+    });
+
+    expect(() => {
+      prepareSandboxToolDisclosure(
+        "alpha",
+        null,
+        true,
+        () => ({
+          existingEntry: registryEntry,
+          preservedMcpState: undefined,
+          liveExists: false,
+        }),
+        "progressive",
+      );
+      throw new Error("injected create failure");
+    }).toThrow("injected create failure");
+
+    expect(registryEntry?.baselineExclusions).toEqual(baselineExclusions);
+    expect(mocks.updateSession).toHaveBeenCalledOnce();
+    expect(mocks.removeSandbox).not.toHaveBeenCalled();
+  });
 });

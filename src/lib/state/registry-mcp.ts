@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { isObjectRecord } from "../core/json-types";
 import { isBlockedMcpUrlTargetHost, MCP_SERVER_URL_MAX_LENGTH } from "../security/mcp-url-target";
+import {
+  canonicalizeTrustedPrivateEndpointPins,
+  normalizeTrustedPrivateHost,
+} from "../security/trusted-private-endpoint";
 
 export interface McpBridgeEntry {
   server: string;
@@ -9,6 +14,15 @@ export interface McpBridgeEntry {
   adapter?: string;
   url: string;
   env: string[];
+  /** Exact URL host explicitly admitted for routed private access. */
+  trustedPrivateHost?: string;
+  /**
+   * Immutable validated private address pins recorded when the bridge was
+   * added. After strict registry normalization, this durable host state is the
+   * operator-approved replay authority; lifecycle commands never widen it
+   * from ambient DNS.
+   */
+  allowedIps?: string[];
   providerName?: string;
   /** Immutable OpenShell ObjectMeta.id captured after provider creation. */
   providerId?: string;
@@ -50,10 +64,6 @@ const MCP_SAFE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
 const MCP_PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 const MCP_ADAPTERS = new Set(["mcporter", "hermes-config", "deepagents-config"]);
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 export function serializeSandboxMcpStateForDisk(value: unknown): SandboxMcpState | undefined {
   const state = normalizeSandboxMcpState(value);
   if (!state) return undefined;
@@ -61,9 +71,9 @@ export function serializeSandboxMcpStateForDisk(value: unknown): SandboxMcpState
 }
 
 export function normalizeSandboxMcpState(value: unknown): SandboxMcpState | undefined {
-  if (!isRecord(value)) return undefined;
+  if (!isObjectRecord(value)) return undefined;
   const bridgesValue = value.bridges;
-  if (!isRecord(bridgesValue)) return undefined;
+  if (!isObjectRecord(bridgesValue)) return undefined;
   const bridges: Record<string, McpBridgeEntry> = {};
   for (const [name, rawEntry] of Object.entries(bridgesValue)) {
     const entry = normalizeMcpBridgeEntry(name, rawEntry);
@@ -104,7 +114,7 @@ export function normalizeSandboxMcpState(value: unknown): SandboxMcpState | unde
   };
 }
 
-function normalizeMcpUrl(value: string): string | null {
+function normalizeMcpUrl(value: string, trustedPrivateHost?: string): string | null {
   if (value.length > MCP_SERVER_URL_MAX_LENGTH) return null;
   let parsed: URL;
   try {
@@ -114,7 +124,12 @@ function normalizeMcpUrl(value: string): string | null {
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
   if (!parsed.hostname || parsed.username || parsed.password) return null;
-  if (isBlockedMcpUrlTargetHost(parsed.hostname)) return null;
+  if (
+    isBlockedMcpUrlTargetHost(parsed.hostname) &&
+    parsed.hostname.toLowerCase() !== trustedPrivateHost
+  ) {
+    return null;
+  }
   if (parsed.hash) parsed.hash = "";
   if (!parsed.pathname) parsed.pathname = "/";
   const normalized = parsed.toString();
@@ -122,12 +137,47 @@ function normalizeMcpUrl(value: string): string | null {
 }
 
 function normalizeMcpBridgeEntry(server: string, value: unknown): McpBridgeEntry | null {
-  if (!isRecord(value)) return null;
+  if (!isObjectRecord(value)) return null;
   const serverName = typeof value.server === "string" && value.server ? value.server : server;
   if (!MCP_SERVER_RE.test(serverName)) return null;
-  const url = typeof value.url === "string" ? normalizeMcpUrl(value.url) : null;
+  let trustedPrivateHost: string | undefined;
+  if (value.trustedPrivateHost !== undefined) {
+    if (typeof value.trustedPrivateHost !== "string") return null;
+    try {
+      trustedPrivateHost = normalizeTrustedPrivateHost(value.trustedPrivateHost);
+    } catch {
+      return null;
+    }
+    if (trustedPrivateHost !== value.trustedPrivateHost) return null;
+  }
+  const url = typeof value.url === "string" ? normalizeMcpUrl(value.url, trustedPrivateHost) : null;
   const policyName = typeof value.policyName === "string" ? value.policyName : "";
   if (!url || !MCP_SAFE_NAME_RE.test(policyName)) return null;
+  if (trustedPrivateHost && new URL(url).hostname.toLowerCase() !== trustedPrivateHost) return null;
+  let allowedIps: string[] | undefined;
+  const rawAllowedIps = value.allowedIps;
+  if (trustedPrivateHost) {
+    if (!Array.isArray(rawAllowedIps)) return null;
+    let canonicalPins: readonly string[];
+    try {
+      canonicalPins = canonicalizeTrustedPrivateEndpointPins(
+        trustedPrivateHost,
+        rawAllowedIps as readonly string[],
+        { requireAllPrivate: true },
+      ).addresses;
+    } catch {
+      return null;
+    }
+    if (
+      canonicalPins.length !== rawAllowedIps.length ||
+      canonicalPins.some((address, index) => address !== rawAllowedIps[index])
+    ) {
+      return null;
+    }
+    allowedIps = [...canonicalPins];
+  } else if (rawAllowedIps !== undefined) {
+    return null;
+  }
   const rawEnv = value.env;
   const env =
     Array.isArray(rawEnv) &&
@@ -159,6 +209,7 @@ function normalizeMcpBridgeEntry(server: string, value: unknown): McpBridgeEntry
     ...(adapter ? { adapter } : {}),
     url,
     env,
+    ...(trustedPrivateHost ? { trustedPrivateHost, allowedIps } : {}),
     ...(providerName ? { providerName } : {}),
     ...(providerId ? { providerId } : {}),
     policyName,

@@ -12,10 +12,15 @@ import { buildProcessTokenProbe } from "../fixtures/process-token-probe.ts";
 import {
   buildSandboxNodeInvocation,
   buildSandboxShellInvocation,
+  isNvidiaEndpointRateLimitFailure,
   OPENSHELL_EXEC_ARGUMENT_LIMIT_BYTES,
   parseRuntimeProofPort,
 } from "../live/messaging-providers-helpers.ts";
-import { SLACK_INSTALLED_RUNTIME_PROOF_SOURCE } from "../live/messaging-providers-slack-runtime-proof.ts";
+import {
+  parseInstalledSlackProof,
+  SLACK_INSTALLED_RUNTIME_PROOF_SOURCE,
+  SLACK_MANAGED_NPM_PROJECT_DISCOVERY_SOURCE,
+} from "../live/messaging-providers-slack-runtime-proof.ts";
 import { TELEGRAM_INSTALLED_RUNTIME_PROOF_SOURCE } from "../live/messaging-providers-telegram-runtime-proof.ts";
 
 const FAKE_TELEGRAM_API = path.resolve(import.meta.dirname, "../lib/fake-telegram-api.cjs");
@@ -138,6 +143,33 @@ describe("messaging provider installed-runtime proofs", () => {
     expect(() => parseRuntimeProofPort(rawPort)).toThrow(/runtime proof port/u);
   });
 
+  it("classifies only rate-limited NVIDIA endpoint validation failures", () => {
+    expect(
+      isNvidiaEndpointRateLimitFailure(
+        "NVIDIA Endpoints endpoint validation failed.\nChat Completions API validation returned HTTP 429",
+      ),
+    ).toBe(true);
+    expect(
+      isNvidiaEndpointRateLimitFailure(
+        "NVIDIA Endpoints endpoint validation failed: too many requests",
+      ),
+    ).toBe(true);
+    expect(
+      isNvidiaEndpointRateLimitFailure(
+        [
+          "Using Other OpenAI-compatible endpoint with model: nvidia/nvidia/nemotron-3-ultra",
+          "No GITHUB_TOKEN (60 req/hr rate limit — set it for better rates)",
+          "Docker GPU patch failed: spawnSync docker ETIMEDOUT",
+        ].join("\n"),
+      ),
+    ).toBe(false);
+    expect(
+      isNvidiaEndpointRateLimitFailure(
+        "NVIDIA Endpoints endpoint validation failed: invalid credential",
+      ),
+    ).toBe(false);
+  });
+
   it("keeps the Slack allow, deny, feedback, and send contract on installed exports", () => {
     expectValidModuleSource(SLACK_INSTALLED_RUNTIME_PROOF_SOURCE);
     expect(SLACK_INSTALLED_RUNTIME_PROOF_SOURCE).toContain("prepareSlackMessage");
@@ -152,12 +184,113 @@ describe("messaging provider installed-runtime proofs", () => {
     expect(SLACK_INSTALLED_RUNTIME_PROOF_SOURCE).toContain("/api/chat.postMessage");
   });
 
-  it("requires the reviewed Slack pipeline/runtime proof in the default 2026.6.10 live lane", () => {
+  it("finds Slack only in its canonical managed npm project", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-slack-managed-project-"));
+    const projectsDir = path.join(dir, "npm", "projects");
+    const slackProject = path.join(projectsDir, "openclaw-slack-reviewed");
+    const unrelatedProject = path.join(projectsDir, "unrelated-plugin");
+    const malformedProject = path.join(projectsDir, "malformed-plugin");
+    const slackPackageRoot = path.join(slackProject, "node_modules", "@openclaw", "slack");
+
+    try {
+      fs.mkdirSync(slackPackageRoot, { recursive: true });
+      fs.writeFileSync(
+        path.join(slackProject, "package.json"),
+        JSON.stringify({ dependencies: { "@openclaw/slack": "2026.7.1" } }),
+      );
+      fs.mkdirSync(path.join(unrelatedProject, "node_modules", "@openclaw", "slack"), {
+        recursive: true,
+      });
+      fs.writeFileSync(
+        path.join(unrelatedProject, "package.json"),
+        JSON.stringify({ dependencies: { "@openclaw/discord": "2026.6.10" } }),
+      );
+      fs.mkdirSync(malformedProject, { recursive: true });
+      fs.writeFileSync(path.join(malformedProject, "package.json"), "not json");
+
+      const source = [
+        'import fs from "node:fs";',
+        'import path from "node:path";',
+        SLACK_MANAGED_NPM_PROJECT_DISCOVERY_SOURCE,
+        "const candidates = [];",
+        "addManagedNpmProjectSlackCandidates(",
+        "  process.env.NEMOCLAW_TEST_PROJECTS_DIR,",
+        "  (candidate) => candidates.push(path.resolve(candidate)),",
+        ");",
+        "process.stdout.write(JSON.stringify(candidates));",
+      ].join("\n");
+      const result = spawnSync(process.execPath, ["--input-type=module", "-"], {
+        encoding: "utf8",
+        env: { ...process.env, NEMOCLAW_TEST_PROJECTS_DIR: projectsDir },
+        input: source,
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(JSON.parse(result.stdout)).toEqual([path.resolve(slackPackageRoot)]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports loader stderr without accepting stderr as a Slack proof (#6467)", () => {
+    const proof = JSON.stringify({
+      ok: true,
+      proof: "openclaw-pipeline-runtime",
+      allowedReplyTarget: "channel:C0E2ESLACK",
+      deniedPrepared: true,
+      deniedFeedbackMethod: "chat.postEphemeral",
+      deniedFeedbackCount: 1,
+      messageId: "1710000000.000201",
+      channelId: "C0E2ESLACK",
+    });
+    const stderr = [
+      "[channels] [slack] provider failed to start: this[#customizations].loadSync is not a function",
+      proof,
+    ].join("\n");
+
+    expect(() => parseInstalledSlackProof("", stderr)).toThrow(
+      /stderr:.*loadSync is not a function/su,
+    );
+  });
+
+  it("continues to accept only a complete Slack proof from stdout (#6467)", () => {
+    const proof = {
+      ok: true as const,
+      proof: "openclaw-pipeline-runtime" as const,
+      allowedReplyTarget: "channel:C0E2ESLACK",
+      deniedPrepared: true as const,
+      deniedFeedbackMethod: "chat.postEphemeral" as const,
+      deniedFeedbackCount: 1 as const,
+      messageId: "1710000000.000201",
+      channelId: "C0E2ESLACK",
+    };
+
+    expect(parseInstalledSlackProof(`diagnostic\n${JSON.stringify(proof)}`, "warning")).toEqual(
+      proof,
+    );
+  });
+
+  it("requires the reviewed Slack pipeline/runtime proof in the default 2026.7.1 live lane", () => {
     expect(LIVE_MESSAGING_PROVIDERS_SOURCE).toContain(
       'installedSlackProof.proof === "openclaw-pipeline-runtime"',
     );
     expect(LIVE_MESSAGING_PROVIDERS_SOURCE).not.toContain(
       'installedSlackProof.proof === "openclaw-private-helper"',
+    );
+  });
+
+  it("requires channel-list output without suppressing loader failures (#6467)", () => {
+    expect(LIVE_MESSAGING_PROVIDERS_SOURCE).toContain(
+      '"timeout 45 openclaw channels list --all --json --no-color"',
+    );
+    expect(LIVE_MESSAGING_PROVIDERS_SOURCE).toContain(
+      "OpenClaw channels list did not emit channel state",
+    );
+    expect(LIVE_MESSAGING_PROVIDERS_SOURCE).not.toContain(
+      "OpenClaw channels list returned no output",
+    );
+    expect(LIVE_MESSAGING_PROVIDERS_SOURCE).not.toContain(
+      "openclaw channels list --all --json --no-color 2>/dev/null || true",
     );
   });
 

@@ -12,7 +12,10 @@ import YAML from "yaml";
 import { testTimeout } from "../../helpers/timeouts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import {
+  assertManagedMcpPolicySurvivedRemoval,
   buildMcpDnsRebindingProbeScript,
+  hostAddressForSandbox,
+  hostPrivateAddressForSandbox,
   isExpectedMcpCurlPolicyDenial,
   restoreDnsRebindingHostsFixture,
 } from "../live/mcp-bridge-sandbox.ts";
@@ -81,6 +84,20 @@ async function captureRestoreScript(hostBackupPath: string, sandboxBackupPath: s
 }
 
 describe("MCP curl policy denial classification", SUITE_OPTIONS, () => {
+  it("separates the managed endpoint alias from the concrete rebinding address", async () => {
+    let probeScript = "";
+    const host = {
+      command: async (_command: string, args: string[]) => {
+        probeScript = args[1] ?? "";
+        return { ...denialResult(), stdout: "10.20.30.40\n" };
+      },
+    } as unknown as HostCliClient;
+
+    await expect(hostAddressForSandbox(host)).resolves.toBe("host.openshell.internal");
+    await expect(hostPrivateAddressForSandbox(host)).resolves.toBe("10.20.30.40");
+    expect(probeScript).toContain("ip route get 1.1.1.1");
+  });
+
   it("accepts an L7 HTTP 403 denial", () => {
     expect(
       isExpectedMcpCurlPolicyDenial(denialResult({ stdout: "NEMOCLAW_MCP_CURL_HTTP_CODE=403\n" })),
@@ -151,26 +168,30 @@ describe("MCP curl policy denial classification", SUITE_OPTIONS, () => {
     }
   });
 
-  it("pins the resolve-validate-connect source contract to OpenShell v0.0.72", () => {
-    const commit = "8cb16de9eae4c44d7d31e1493747d8c10abb5963";
+  it("pins the resolve-validate-connect source contract to OpenShell v0.0.101", () => {
+    const commit = "8ddd98c3dff62619a3963f99ba1e055b67650e72";
     const sourcePath = "crates/openshell-supervisor-network/src/proxy.rs";
     const citations = [
-      `${sourcePath}:2476-2502`,
-      `${sourcePath}:2527-2567`,
-      `${sourcePath}:2622-2630`,
-      `${sourcePath}:822-832`,
-      `${sourcePath}:3885-3893`,
-      `${sourcePath}:4123-4125`,
+      `${sourcePath}:3030-3055`,
+      `${sourcePath}:3060-3115`,
+      `${sourcePath}:3179-3211`,
+      `${sourcePath}:3168-3200`,
+      `${sourcePath}:4650-4656`,
+      `${sourcePath}:4706-4711`,
     ];
 
-    for (const docsPath of [
-      "docs/deployment/set-up-mcp-bridge.mdx",
-      "docs/security/openshell-0.0.72-compatibility-review.mdx",
-    ]) {
-      const docs = fs.readFileSync(docsPath, "utf8");
-      expect(docs, docsPath).toContain(commit);
-      for (const citation of citations) expect(docs, docsPath).toContain(citation);
-    }
+    const docsPath = "docs/deployment/set-up-mcp-bridge.mdx";
+    const docs = fs.readFileSync(docsPath, "utf8");
+    expect(docs, docsPath).toContain(commit);
+    for (const citation of citations) expect(docs, docsPath).toContain(citation);
+    expect(docs).toContain("proxy_connect_by_hostname");
+    expect(docs).toContain("reopens proxy-side DNS resolution");
+
+    const migrationReview = fs.readFileSync(
+      "docs/security/openshell-0.0.101-migration-review.md",
+      "utf8",
+    );
+    expect(migrationReview).toContain(commit);
   });
 
   it("adds one raw MCP policy with an exact public IP pin and no adapter identity", () => {
@@ -280,36 +301,58 @@ network_policies:
       contractSource.indexOf("} finally {"),
     );
     expect(contractSource).toContain(
-      "https://github.com/NVIDIA/OpenShell/blob/8cb16de9eae4c44d7d31e1493747d8c10abb5963/",
+      "https://github.com/NVIDIA/OpenShell/blob/3dee5570a46076a57a3b056f35f35ebc0861ac85/",
     );
     expect(contractSource).not.toContain("host.nemoclaw");
     expect(contractSource).not.toContain("assertAdapterDnsRebindingDenied");
   });
 
-  it("runs the zero-upstream rebinding proof for all three adapters", () => {
-    const source = fs.readFileSync("test/e2e/live/mcp-bridge.test.ts", "utf8");
+  it("accepts an unchanged surviving policy only after the unrelated policy is absent", () => {
+    const survivingPolicyBefore = {
+      endpoints: [{ host: "surviving.example.test", allowed_ips: ["203.0.113.10"] }],
+    };
+    const survivingPolicyAfter = {
+      endpoints: [{ host: "surviving.example.test", allowed_ips: ["203.0.113.10"] }],
+    };
+    const changedSurvivingPolicy = {
+      endpoints: [{ host: "changed.example.test", allowed_ips: ["203.0.113.10"] }],
+    };
 
-    expect(source.match(/await assertAdapterDnsRebindingDenied/g)).toHaveLength(3);
-    for (const adapter of [
-      'adapter: "mcporter"',
-      'adapter: "hermes-config"',
-      'adapter: "deepagents-config"',
-    ]) {
-      expect(source).toContain(adapter);
-    }
-    expect(source).toContain("rebound request must not reach the upstream MCP server");
-    expect(source).toContain(").toHaveLength(0);");
-  });
+    expect(() =>
+      assertManagedMcpPolicySurvivedRemoval(
+        survivingPolicyBefore,
+        {
+          networkPolicies: { mcp_bridge_surviving: survivingPolicyAfter },
+          policy: survivingPolicyAfter,
+        },
+        "mcp_bridge_rebinding",
+      ),
+    ).not.toThrow();
 
-  it("restores the DNS fixture before MCP removal can restart the sandbox", () => {
-    const source = fs.readFileSync("test/e2e/live/mcp-bridge.test.ts", "utf8");
-    const denialProof = source.indexOf("rebound request must not reach the upstream MCP server");
-    const restore = source.indexOf("await restoreDnsRebindingHostsFixture", denialProof);
-    const remove = source.indexOf("const remove = await host.nemoclaw", denialProof);
+    expect(() =>
+      assertManagedMcpPolicySurvivedRemoval(
+        survivingPolicyBefore,
+        {
+          networkPolicies: { mcp_bridge_surviving: changedSurvivingPolicy },
+          policy: changedSurvivingPolicy,
+        },
+        "mcp_bridge_rebinding",
+      ),
+    ).toThrow();
 
-    expect(denialProof).toBeGreaterThanOrEqual(0);
-    expect(restore).toBeGreaterThan(denialProof);
-    expect(remove).toBeGreaterThan(restore);
+    expect(() =>
+      assertManagedMcpPolicySurvivedRemoval(
+        survivingPolicyBefore,
+        {
+          networkPolicies: {
+            mcp_bridge_rebinding: { endpoints: [] },
+            mcp_bridge_surviving: survivingPolicyAfter,
+          },
+          policy: survivingPolicyAfter,
+        },
+        "mcp_bridge_rebinding",
+      ),
+    ).toThrow();
   });
 
   it("restores host DNS strictly while treating the ephemeral sandbox as best effort", async () => {

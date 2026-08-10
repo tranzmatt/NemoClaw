@@ -22,7 +22,28 @@ import YAML from "yaml";
 
 import { DASHBOARD_PORT } from "../lib/ports.js";
 import { buildSubprocessEnv } from "../lib/subprocess-env.js";
+import { isPlainObject, type UnknownRecord } from "../shared/object-record.js";
 import * as importedOpenShellPolicyBoundary from "../shared/openshell-policy-boundary.cjs";
+import * as importedSandboxName from "../shared/sandbox-name.cjs";
+import {
+  attachRuntimeIdentity,
+  buildRuntimeIdentityPlan,
+  compensateRuntimeIdentityApply,
+  isRuntimeIdentityConfig,
+  isRuntimeIdentityReceipt,
+  parseRuntimeIdentityProviderMetadata,
+  prepareRuntimeIdentity,
+  type RuntimeIdentityCommandDeps,
+  type RuntimeIdentityCommandOptions,
+  type RuntimeIdentityConfig,
+  type RuntimeIdentityDeps,
+  type RuntimeIdentityPlan,
+  type RuntimeIdentityProfilePolicy,
+  type RuntimeIdentityReceipt,
+  removeRuntimeIdentity,
+} from "./runtime-identity.js";
+import type { SnapshotCommandOptions } from "./snapshot-command.js";
+import { actionSnapshots } from "./snapshot-command.js";
 import { safeEndpointUrlForDownstream, validateEndpointUrl } from "./ssrf.js";
 
 // The compiled plugin exposes named CommonJS exports. Source-mode tsx maps the
@@ -34,10 +55,22 @@ const sourceOrGeneratedOpenShellPolicyBoundary =
 const { parseOpenShellPolicy, withoutProviderComposedPolicies } =
   sourceOrGeneratedOpenShellPolicyBoundary.default ?? sourceOrGeneratedOpenShellPolicyBoundary;
 
+// sourceOfTruth: nemoclaw/src/shared/sandbox-name.cts
+const sourceOrGeneratedSandboxName = importedSandboxName as typeof importedSandboxName & {
+  default?: typeof importedSandboxName;
+};
+const { assertValidName, assertValidProviderName } =
+  sourceOrGeneratedSandboxName.default ?? sourceOrGeneratedSandboxName;
+
 type Action = "plan" | "apply" | "status" | "rollback";
 
-type RollbackPlanSource = { sandbox_name?: unknown };
-type UnknownRecord = { [key: string]: unknown };
+type RollbackPlanSource = {
+  sandbox_name?: unknown;
+  sandbox_created_by_apply?: unknown;
+  inference_provider_created_by_apply?: unknown;
+  inference?: unknown;
+  identity?: unknown;
+};
 type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
 type RestProtocol = "rest";
 type EndpointEnforcement = "enforce" | "audit";
@@ -71,16 +104,93 @@ const HTTP_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "
 const REST_PROTOCOLS = new Set(["rest"]);
 const ENDPOINT_ENFORCEMENT_MODES = new Set(["enforce", "audit"]);
 const ENDPOINT_TLS_MODES = new Set(["terminate", "passthrough", "skip"]);
+const MISSING_SANDBOX_PATTERN = /\b(?:not found|does not exist)\b/i;
+const MISSING_SANDBOX_INSPECTION_PATTERN =
+  /(?:\bsandbox\b[^\r\n]*\b(?:not found|does not exist)\b|\b(?:not found|does not exist)\b[^\r\n]*\bsandbox\b)/i;
+const MISSING_PROVIDER_INSPECTION_PATTERN =
+  /(?:\bprovider\b[^\r\n]*\b(?:not found|does not exist)\b|\b(?:not found|does not exist)\b[^\r\n]*\bprovider\b|\bunknown provider\b)/i;
+
+interface InferenceRouteBinding {
+  provider: string;
+  model: string;
+  timeoutSeconds?: number;
+}
+
+function assertReusableRuntimeIdentitySandbox(output: string, expectedName: string): void {
+  const lines = output.replace(/\u001b\[[0-9;]*m/g, "").split(/\r?\n/);
+  const nameLine = lines.find((line) => /^\s*Name:/i.test(line));
+  const phaseLine = lines.find((line) => /^\s*Phase:/i.test(line));
+  const name = /^\s*Name:\s*(.+)$/i.exec(nameLine ?? "")?.[1]?.trim();
+  const phase = /^\s*Phase:\s*(.+)$/i.exec(phaseLine ?? "")?.[1]?.trim();
+  if (name !== expectedName || phase !== "Ready") {
+    throw new Error(
+      `Sandbox '${expectedName}' is not reusable for runtime identity apply: expected exact name and Ready phase, received ${boundedCommandError(output)}`,
+    );
+  }
+}
+
+function parseInferenceRouteBinding(output: string): InferenceRouteBinding | null {
+  const lines = output.replace(/\u001b\[[0-9;]*m/g, "").split(/\r?\n/);
+  let inGatewayInference = false;
+  let provider = "";
+  let model = "";
+  let timeoutSeconds: number | undefined;
+  for (const line of lines) {
+    if (/^(?:Gateway )?Inference:\s*$/i.test(line)) {
+      inGatewayInference = true;
+      continue;
+    }
+    if (inGatewayInference && /^\S.*:$/.test(line)) break;
+    if (!inGatewayInference) continue;
+    const trimmed = line.trim();
+    const providerMatch = /^Provider:\s*(.+)$/i.exec(trimmed);
+    const modelMatch = /^Model:\s*(.+)$/i.exec(trimmed);
+    const timeoutMatch = /^Timeout:\s*(\d+)s?$/i.exec(trimmed);
+    if (providerMatch) provider = providerMatch[1].trim();
+    if (modelMatch) model = modelMatch[1].trim();
+    if (timeoutMatch) timeoutSeconds = Number(timeoutMatch[1]);
+  }
+  return provider && model ? { provider, model, timeoutSeconds } : null;
+}
+
+function isUnconfiguredInferenceRoute(output: string): boolean {
+  const lines = output.replace(/\u001b\[[0-9;]*m/g, "").split(/\r?\n/);
+  const headingIndex = lines.findIndex((line) => /^(?:Gateway )?Inference:\s*$/i.test(line));
+  if (headingIndex < 0) return false;
+  const routeLines: string[] = [];
+  for (const line of lines.slice(headingIndex + 1)) {
+    if (/^\S.*:$/.test(line)) break;
+    const trimmed = line.trim();
+    if (trimmed) routeLines.push(trimmed);
+  }
+  return routeLines.length === 1 && routeLines[0]?.toLowerCase() === "not configured";
+}
 
 function isAction(value: string | undefined): value is Action {
   return value === "plan" || value === "apply" || value === "status" || value === "rollback";
 }
 
-function isObjectLike(value: unknown): value is UnknownRecord {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
+// Redact credential-shaped output before bounding OpenShell stderr to a compact,
+// single-line diagnostic. (#6703)
+const MAX_COMMAND_ERROR_CHARS = 500;
+const SENSITIVE_ERROR_ASSIGNMENT =
+  /(\b[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*\s*)[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi;
+
+function boundedCommandError(stderr: string, secretValues: readonly string[] = []): string {
+  let redacted = stderr;
+  for (const secret of [...new Set(secretValues)]
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length)) {
+    redacted = redacted.split(secret).join("<REDACTED>");
   }
-  return Object.getPrototypeOf(value) === Object.prototype || Object.getPrototypeOf(value) === null;
+  redacted = redacted
+    .replace(SENSITIVE_ERROR_ASSIGNMENT, "$1=<REDACTED>")
+    .replace(/\b(Bearer)\s+\S+/gi, "$1 <REDACTED>");
+  const collapsed = redacted.replace(/\s+/g, " ").trim();
+  if (collapsed.length === 0) return "no error output";
+  return collapsed.length > MAX_COMMAND_ERROR_CHARS
+    ? `${collapsed.slice(0, MAX_COMMAND_ERROR_CHARS)}…`
+    : collapsed;
 }
 
 function isOptionalString(value: unknown): value is string | undefined {
@@ -110,11 +220,11 @@ function hasOnlyKeys(value: UnknownRecord, allowed: readonly string[]): boolean 
 }
 
 function isPolicyRule(value: unknown): value is PolicyRule {
-  if (!isObjectLike(value) || !hasOnlyKeys(value, ["allow"])) {
+  if (!isPlainObject(value) || !hasOnlyKeys(value, ["allow"])) {
     return false;
   }
   const allow = value.allow;
-  if (!isObjectLike(allow) || !hasOnlyKeys(allow, ["method", "path"])) {
+  if (!isPlainObject(allow) || !hasOnlyKeys(allow, ["method", "path"])) {
     return false;
   }
   return (
@@ -127,7 +237,7 @@ function isPolicyRule(value: unknown): value is PolicyRule {
 
 function isPolicyEndpoint(value: unknown): value is PolicyEndpoint {
   if (
-    !isObjectLike(value) ||
+    !isPlainObject(value) ||
     !hasOnlyKeys(value, ["host", "port", "protocol", "enforcement", "tls", "access", "rules"])
   ) {
     return false;
@@ -154,7 +264,7 @@ function isPolicyEndpoint(value: unknown): value is PolicyEndpoint {
 }
 
 function isPolicyAddition(value: unknown): value is PolicyAddition {
-  if (!isObjectLike(value) || !hasOnlyKeys(value, ["name", "endpoints"])) {
+  if (!isPlainObject(value) || !hasOnlyKeys(value, ["name", "endpoints"])) {
     return false;
   }
   return (
@@ -166,11 +276,11 @@ function isPolicyAddition(value: unknown): value is PolicyAddition {
 }
 
 function isPolicyAdditions(value: unknown): value is PolicyAdditions {
-  return isObjectLike(value) && Object.values(value).every((entry) => isPolicyAddition(entry));
+  return isPlainObject(value) && Object.values(value).every((entry) => isPolicyAddition(entry));
 }
 
 function isInferenceProfile(value: unknown): value is InferenceProfile {
-  if (!isObjectLike(value)) {
+  if (!isPlainObject(value)) {
     return false;
   }
 
@@ -186,7 +296,7 @@ function isInferenceProfile(value: unknown): value is InferenceProfile {
 }
 
 function isBlueprint(value: unknown): value is Blueprint {
-  if (!isObjectLike(value)) {
+  if (!isPlainObject(value)) {
     return false;
   }
 
@@ -198,19 +308,19 @@ function isBlueprint(value: unknown): value is Blueprint {
   if (components === undefined) {
     return true;
   }
-  if (!isObjectLike(components)) {
+  if (!isPlainObject(components)) {
     return false;
   }
 
   const inference = components.inference;
   if (inference !== undefined) {
-    if (!isObjectLike(inference)) {
+    if (!isPlainObject(inference)) {
       return false;
     }
     const profiles = inference.profiles;
     if (profiles !== undefined) {
       if (
-        !isObjectLike(profiles) ||
+        !isPlainObject(profiles) ||
         !Object.values(profiles).every((entry) => isInferenceProfile(entry))
       ) {
         return false;
@@ -220,7 +330,7 @@ function isBlueprint(value: unknown): value is Blueprint {
 
   const sandbox = components.sandbox;
   if (sandbox !== undefined) {
-    if (!isObjectLike(sandbox)) {
+    if (!isPlainObject(sandbox)) {
       return false;
     }
     if (
@@ -234,7 +344,7 @@ function isBlueprint(value: unknown): value is Blueprint {
 
   const router = components.router;
   if (router !== undefined) {
-    if (!isObjectLike(router)) {
+    if (!isPlainObject(router)) {
       return false;
     }
     if (
@@ -248,7 +358,7 @@ function isBlueprint(value: unknown): value is Blueprint {
 
   const policy = components.policy;
   if (policy !== undefined) {
-    if (!isObjectLike(policy)) {
+    if (!isPlainObject(policy)) {
       return false;
     }
     const additions = policy.additions;
@@ -258,6 +368,9 @@ function isBlueprint(value: unknown): value is Blueprint {
       }
     }
   }
+
+  const identity = components.identity;
+  if (identity !== undefined && !isRuntimeIdentityConfig(identity)) return false;
 
   return true;
 }
@@ -277,7 +390,49 @@ function readRollbackSandboxName(value: RollbackPlanSource | null): string {
     throw new Error("rollback plan sandbox_name must be a non-empty string");
   }
 
-  return value.sandbox_name;
+  // The persisted plan is untrusted input at this boundary too: validate before
+  // the name reaches `openshell sandbox stop/remove`, mirroring the apply path.
+  return assertValidName(value.sandbox_name, "sandbox name");
+}
+
+function readRollbackInferenceProviderName(value: RollbackPlanSource): string {
+  if (
+    !isPlainObject(value.inference) ||
+    typeof value.inference.provider_name !== "string" ||
+    value.inference.provider_name.trim() === ""
+  ) {
+    throw new Error(
+      "rollback plan inference.provider_name must be a non-empty string for an owned provider",
+    );
+  }
+  return assertValidProviderName(value.inference.provider_name, "rollback inference provider name");
+}
+
+function assertReusableInferenceProvider(
+  output: string,
+  expected: {
+    name: string;
+    type: string;
+    requiresEndpointConfig: boolean;
+    requiresCredential: boolean;
+  },
+): void {
+  const metadata = parseRuntimeIdentityProviderMetadata(output);
+  const hasExpectedConfigShape =
+    !expected.requiresEndpointConfig || metadata?.configKeys.includes("OPENAI_BASE_URL") === true;
+  const hasExpectedCredentialShape =
+    !expected.requiresCredential || metadata?.credentialKeys.includes("OPENAI_API_KEY") === true;
+  if (
+    !metadata ||
+    metadata.name !== expected.name ||
+    metadata.type !== expected.type ||
+    !hasExpectedConfigShape ||
+    !hasExpectedCredentialShape
+  ) {
+    throw new Error(
+      `Inference provider '${expected.name}' does not match the requested non-secret binding; refusing runtime identity apply`,
+    );
+  }
 }
 
 // ── Utilities ───────────────────────────────────────────────────
@@ -307,6 +462,7 @@ interface Blueprint {
     policy?: {
       additions?: PolicyAdditions;
     };
+    identity?: RuntimeIdentityConfig;
   };
 }
 
@@ -337,29 +493,23 @@ const DEFAULT_ROUTER_PORT = 4000;
 function mergePolicyAdditions(currentPolicyRaw: string, additions: PolicyAdditions): string {
   // sourceOfTruth: nemoclaw/src/shared/openshell-policy-boundary.cts
   const current = parseOpenShellPolicy(currentPolicyRaw).policy;
-  if (current.network_policies !== undefined && !isObjectLike(current.network_policies)) {
-    throw new Error("Current policy network_policies must be a YAML mapping");
-  }
-  const existingNetworkPolicies = isObjectLike(current.network_policies)
-    ? current.network_policies
-    : {};
+  const existingNetworkPolicies = current.network_policies ?? {};
   const output: UnknownRecord = {};
 
-  // Stable OpenShell 0.0.72 exposes composable top-level policy sections as
+  // OpenShell 0.0.72 and later expose composable top-level policy sections as
   // mappings. Preserve unknown mapping sections for forward compatibility, but
   // fail closed on a scalar or sequence until its mutation semantics are
   // reviewed for the next supported OpenShell contract.
   for (const [key, value] of Object.entries(current)) {
     if (key !== "version" && key !== "network_policies") {
-      if (!isObjectLike(value)) {
+      if (!isPlainObject(value)) {
         throw new Error(`Current policy top-level field "${key}" must be a YAML mapping`);
       }
       output[key] = value;
     }
   }
 
-  output.version =
-    typeof current.version === "number" && Number.isFinite(current.version) ? current.version : 1;
+  output.version = current.version ?? 1;
   output.network_policies = withoutProviderComposedPolicies({
     ...existingNetworkPolicies,
     ...additions,
@@ -393,16 +543,62 @@ async function runCmd(
     reject: options?.reject ?? true,
     stdout: "pipe",
     stderr: "pipe",
+    env: buildSubprocessEnv(),
+    extendEnv: false,
   });
   return {
-    exitCode: result.exitCode ?? 0,
+    exitCode: result.exitCode ?? 1,
     stdout: result.stdout,
     stderr: result.stderr,
   };
 }
 
+async function runRuntimeIdentityCommand(
+  args: string[],
+  options?: RuntimeIdentityCommandOptions,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const result = await execa(args[0], args.slice(1), {
+    reject: false,
+    stdout: "pipe",
+    stderr: "pipe",
+    env: buildSubprocessEnv(options?.env),
+    extendEnv: false,
+  });
+  return {
+    exitCode: result.exitCode ?? 1,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  };
+}
+
+function runtimeIdentityCommandDeps(): RuntimeIdentityCommandDeps {
+  return {
+    run: runRuntimeIdentityCommand,
+    formatError: boundedCommandError,
+  };
+}
+
+function runtimeIdentityDeps(
+  persistReceipt: (receipt: RuntimeIdentityReceipt) => void,
+  profilePolicy?: RuntimeIdentityProfilePolicy,
+): RuntimeIdentityDeps {
+  return {
+    ...runtimeIdentityCommandDeps(),
+    validateEndpointUrl,
+    persistReceipt,
+    blueprintPath: process.env.NEMOCLAW_BLUEPRINT_PATH ?? ".",
+    env: process.env,
+    profilePolicy,
+  };
+}
+
 async function openshellAvailable(): Promise<boolean> {
-  const result = await execa("which", ["openshell"], { reject: false, stdout: "pipe" });
+  const result = await execa("which", ["openshell"], {
+    reject: false,
+    stdout: "pipe",
+    env: buildSubprocessEnv(),
+    extendEnv: false,
+  });
   return result.exitCode === 0;
 }
 
@@ -440,6 +636,20 @@ async function resolveRunConfig(
 
   const sandboxCfg = blueprint.components?.sandbox ?? {};
   const routerCfg = blueprint.components?.router ?? {};
+
+  // A blueprint is untrusted input. Validate the identifiers that flow into
+  // `openshell ... --name <value>` argv slots (and onward to shell scripts and
+  // Kubernetes pod names) at this ingestion boundary and fail closed, so every
+  // downstream consumer receives a name that is safe by construction. Absent
+  // values fall back to validated defaults ("openclaw" / "default") at the use
+  // sites and are intentionally not rejected here.
+  if (sandboxCfg.name !== undefined) {
+    assertValidName(sandboxCfg.name, "sandbox name");
+  }
+  if (inferenceCfg.provider_name !== undefined) {
+    assertValidProviderName(inferenceCfg.provider_name);
+  }
+
   return { inferenceProfiles, inferenceCfg, sandboxCfg, routerCfg };
 }
 
@@ -464,6 +674,7 @@ export interface RunPlan {
     port: number;
     pool_config_path: string | undefined;
   };
+  identity?: RuntimeIdentityPlan;
   policy_additions: PolicyAdditions;
   dry_run: boolean;
 }
@@ -479,8 +690,11 @@ interface PersistedRunPlan {
   run_id: string;
   profile: string;
   sandbox_name: string;
+  sandbox_created_by_apply: boolean;
+  inference_provider_created_by_apply: boolean;
   policy_additions: PolicyAdditions;
   inference: SafeInferencePlan;
+  identity?: RuntimeIdentityReceipt;
   timestamp: string;
 }
 
@@ -493,8 +707,11 @@ type StatusRunPlan = {
     forward_ports?: number[];
   };
   sandbox_name?: string;
+  sandbox_created_by_apply?: boolean;
+  inference_provider_created_by_apply?: boolean;
   policy_additions?: PolicyAdditions;
   inference?: SafeInferencePlan;
+  identity?: RuntimeIdentityReceipt;
   router?: {
     enabled?: boolean;
     port?: number;
@@ -508,13 +725,12 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-function buildSafeInferencePlan(source: InferenceProfile | unknown): SafeInferencePlan {
-  const record = isObjectLike(source) ? source : {};
+function buildSafeInferencePlan(source: InferenceProfile | UnknownRecord): SafeInferencePlan {
   return {
-    provider_type: optionalString(record.provider_type),
-    provider_name: optionalString(record.provider_name),
-    endpoint: optionalString(record.endpoint),
-    model: optionalString(record.model),
+    provider_type: optionalString(source.provider_type),
+    provider_name: optionalString(source.provider_name),
+    endpoint: optionalString(source.endpoint),
+    model: optionalString(source.model),
   };
 }
 
@@ -524,13 +740,14 @@ function buildSafePublicRunPlan(args: {
   inferenceCfg: InferenceProfile;
   sandboxCfg: SandboxConfig;
   routerCfg: RouterConfig;
+  runtimeIdentityConfig?: RuntimeIdentityConfig;
   policyAdditions: PolicyAdditions;
   dryRun: boolean;
 }): RunPlan {
   const routerEnabled = args.routerCfg.enabled === true;
   const routerPort = args.routerCfg.port ?? DEFAULT_ROUTER_PORT;
 
-  return {
+  const plan: RunPlan = {
     run_id: args.runId,
     profile: args.profile,
     sandbox: {
@@ -547,28 +764,41 @@ function buildSafePublicRunPlan(args: {
     policy_additions: args.policyAdditions,
     dry_run: args.dryRun,
   };
+  if (args.runtimeIdentityConfig) {
+    plan.identity = buildRuntimeIdentityPlan(args.runtimeIdentityConfig);
+  }
+  return plan;
 }
 
 function buildPersistedRunPlan(args: {
   runId: string;
   profile: string;
   sandboxName: string;
+  sandboxCreatedByApply: boolean;
+  inferenceProviderCreatedByApply: boolean;
   policyAdditions: PolicyAdditions;
   inferenceCfg: InferenceProfile;
+  runtimeIdentityReceipt?: RuntimeIdentityReceipt;
   timestamp: string;
 }): PersistedRunPlan {
-  return {
+  const plan: PersistedRunPlan = {
     run_id: args.runId,
     profile: args.profile,
     sandbox_name: args.sandboxName,
+    sandbox_created_by_apply: args.sandboxCreatedByApply,
+    inference_provider_created_by_apply: args.inferenceProviderCreatedByApply,
     policy_additions: args.policyAdditions,
     inference: buildSafeInferencePlan(args.inferenceCfg),
     timestamp: args.timestamp,
   };
+  if (args.runtimeIdentityReceipt) {
+    plan.identity = args.runtimeIdentityReceipt;
+  }
+  return plan;
 }
 
 function buildStatusRunPlan(source: unknown, fallbackRunId: string): StatusRunPlan | null {
-  if (!isObjectLike(source)) {
+  if (!isPlainObject(source)) {
     return null;
   }
 
@@ -581,7 +811,7 @@ function buildStatusRunPlan(source: unknown, fallbackRunId: string): StatusRunPl
     safePlan.profile = profile;
   }
 
-  if (isObjectLike(source.sandbox)) {
+  if (isPlainObject(source.sandbox)) {
     const sandbox: StatusRunPlan["sandbox"] = {};
     const image = optionalString(source.sandbox.image);
     const name = optionalString(source.sandbox.name);
@@ -606,16 +836,26 @@ function buildStatusRunPlan(source: unknown, fallbackRunId: string): StatusRunPl
   if (sandboxName !== undefined) {
     safePlan.sandbox_name = sandboxName;
   }
+  if (typeof source.sandbox_created_by_apply === "boolean") {
+    safePlan.sandbox_created_by_apply = source.sandbox_created_by_apply;
+  }
+  if (typeof source.inference_provider_created_by_apply === "boolean") {
+    safePlan.inference_provider_created_by_apply = source.inference_provider_created_by_apply;
+  }
 
   if (isPolicyAdditions(source.policy_additions)) {
     safePlan.policy_additions = source.policy_additions;
   }
 
-  if (isObjectLike(source.inference)) {
+  if (isPlainObject(source.inference)) {
     safePlan.inference = buildSafeInferencePlan(source.inference);
   }
 
-  if (isObjectLike(source.router)) {
+  if (isRuntimeIdentityReceipt(source.identity)) {
+    safePlan.identity = source.identity;
+  }
+
+  if (isPlainObject(source.router)) {
     const router: StatusRunPlan["router"] = {};
     if (typeof source.router.enabled === "boolean") {
       router.enabled = source.router.enabled;
@@ -670,6 +910,7 @@ export async function actionPlan(
     inferenceCfg,
     sandboxCfg,
     routerCfg,
+    runtimeIdentityConfig: blueprint.components?.identity,
     policyAdditions: blueprint.components?.policy?.additions ?? {},
     dryRun: options?.dryRun ?? false,
   });
@@ -682,7 +923,12 @@ export async function actionPlan(
 export async function actionApply(
   profile: string,
   blueprint: Blueprint,
-  options?: { planPath?: string; endpointUrl?: string },
+  options?: {
+    planPath?: string;
+    endpointUrl?: string;
+    /** Code-only conformance-test seam. No CLI flag or environment input populates this policy. */
+    runtimeIdentityProfilePolicy?: RuntimeIdentityProfilePolicy;
+  },
 ): Promise<void> {
   if (options?.planPath) {
     throw new Error(
@@ -702,133 +948,363 @@ export async function actionApply(
   const sandboxImage = sandboxCfg.image ?? "openclaw";
   const forwardPorts = sandboxCfg.forward_ports ?? [DASHBOARD_PORT];
   const policyAdditions = blueprint.components?.policy?.additions ?? {};
-  const stateDir = join(homedir(), ".nemoclaw", "state", "runs", rid);
-  mkdirSync(stateDir, { recursive: true });
-
-  progress(20, "Creating OpenClaw sandbox");
-  const createArgs = [
-    "openshell",
-    "sandbox",
-    "create",
-    "--from",
-    sandboxImage,
-    "--name",
-    sandboxName,
-  ];
-  for (const port of forwardPorts) {
-    createArgs.push("--forward", String(port));
-  }
-
-  const createResult = await runCmd(createArgs, { reject: false });
-  if (createResult.exitCode !== 0) {
-    if (createResult.stderr.includes("already exists")) {
-      log(`Sandbox '${sandboxName}' already exists, reusing.`);
-    } else {
-      throw new Error(`Failed to create sandbox: ${createResult.stderr}`);
-    }
-  }
-
-  progress(50, "Configuring inference provider");
+  const runtimeIdentityConfig = blueprint.components?.identity;
   const providerName = inferenceCfg.provider_name ?? "default";
   const providerType = inferenceCfg.provider_type ?? "openai";
   const endpoint = inferenceCfg.endpoint ?? "";
   const model = inferenceCfg.model ?? "";
-
   const credentialEnv = inferenceCfg.credential_env;
   const credentialDefault = inferenceCfg.credential_default ?? "";
   let credential = "";
   if (credentialEnv) {
     credential = process.env[credentialEnv] ?? credentialDefault;
   }
+  const stateDir = join(homedir(), ".nemoclaw", "state", "runs", rid);
+  mkdirSync(stateDir, { recursive: true });
 
-  const providerArgs = [
-    "openshell",
-    "provider",
-    "create",
-    "--name",
-    providerName,
-    "--type",
-    providerType,
-  ];
-  // Pass the env-var NAME (not the value) to --credential; openshell reads the value from the env.
-  // Scope the credential to the subprocess to avoid leaking into later commands.
-  const credEnv: Record<string, string> = {};
-  if (credential) {
-    credEnv.OPENAI_API_KEY = credential;
-    providerArgs.push("--credential", "OPENAI_API_KEY");
-  }
-  if (endpoint) {
-    providerArgs.push("--config", `OPENAI_BASE_URL=${endpoint}`);
-  }
-
-  await execa(providerArgs[0], providerArgs.slice(1), {
-    reject: false,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: buildSubprocessEnv(credEnv),
-  });
-
-  progress(70, "Setting inference route");
-  const inferenceArgs = [
-    "openshell",
-    "inference",
-    "set",
-    "--provider",
-    providerName,
-    "--model",
-    model,
-  ];
-  if (inferenceCfg.timeout_secs !== undefined) {
-    inferenceArgs.push("--timeout", String(inferenceCfg.timeout_secs));
-  }
-  await runCmd(inferenceArgs, { reject: false });
-
-  if (Object.keys(policyAdditions).length > 0) {
-    progress(78, "Applying policy additions");
-    const currentPolicy = await runCmd(["openshell", "policy", "get", "--base", sandboxName], {
-      reject: false,
-    });
-    if (currentPolicy.exitCode !== 0) {
-      throw new Error(
-        `Failed to read current policy before applying additions: ${currentPolicy.stderr}`,
-      );
-    }
-
-    const mergedPolicyFile = join(stateDir, "merged-policy.yaml");
-    writeFileSync(mergedPolicyFile, mergePolicyAdditions(currentPolicy.stdout, policyAdditions), {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
-
-    const policySet = await runCmd(
-      ["openshell", "policy", "set", "--policy", mergedPolicyFile, "--wait", sandboxName],
-      { reject: false },
+  let runtimeIdentityReceipt: RuntimeIdentityReceipt | undefined;
+  let sandboxCreatedByApply = false;
+  let inferenceProviderCreatedByApply = false;
+  const persistRunPlan = (): void => {
+    writeFileSync(
+      join(stateDir, "plan.json"),
+      JSON.stringify(
+        buildPersistedRunPlan({
+          runId: rid,
+          profile,
+          sandboxName,
+          sandboxCreatedByApply,
+          inferenceProviderCreatedByApply,
+          policyAdditions,
+          inferenceCfg,
+          runtimeIdentityReceipt,
+          timestamp: new Date().toISOString(),
+        }),
+        null,
+        2,
+      ),
     );
-    if (policySet.exitCode !== 0) {
-      throw new Error(`Failed to apply policy additions: ${policySet.stderr}`);
+  };
+  const identityDeps = runtimeIdentityDeps((receipt) => {
+    runtimeIdentityReceipt = receipt;
+    persistRunPlan();
+  }, options?.runtimeIdentityProfilePolicy);
+
+  try {
+    let reuseExistingSandbox = false;
+    let reuseExistingInferenceProvider = false;
+    let reuseExistingInferenceRoute = false;
+    if (runtimeIdentityConfig) {
+      const sandboxResult = await runCmd(["openshell", "sandbox", "get", sandboxName], {
+        reject: false,
+      });
+      const sandboxOutput = `${sandboxResult.stderr}\n${sandboxResult.stdout}`;
+      if (sandboxResult.exitCode === 0) {
+        assertReusableRuntimeIdentitySandbox(sandboxResult.stdout, sandboxName);
+        reuseExistingSandbox = true;
+      } else if (!MISSING_SANDBOX_INSPECTION_PATTERN.test(sandboxOutput)) {
+        throw new Error(
+          `Failed to inspect sandbox '${sandboxName}' before runtime identity apply: ${boundedCommandError(sandboxOutput)}`,
+        );
+      }
+
+      const providerResult = await runCmd(["openshell", "provider", "get", providerName], {
+        reject: false,
+      });
+      const providerOutput = `${providerResult.stderr}\n${providerResult.stdout}`;
+      if (providerResult.exitCode === 0) {
+        assertReusableInferenceProvider(providerResult.stdout, {
+          name: providerName,
+          type: providerType,
+          requiresEndpointConfig: endpoint !== "",
+          requiresCredential: credential !== "",
+        });
+        reuseExistingInferenceProvider = true;
+      } else if (!MISSING_PROVIDER_INSPECTION_PATTERN.test(providerOutput)) {
+        throw new Error(
+          `Failed to inspect inference provider '${providerName}' before runtime identity apply: ${boundedCommandError(providerOutput)}`,
+        );
+      }
+
+      if (reuseExistingSandbox && reuseExistingInferenceProvider) {
+        const routeResult = await runCmd(["openshell", "inference", "get"], {
+          reject: false,
+        });
+        const routeOutput = `${routeResult.stderr}\n${routeResult.stdout}`;
+        if (routeResult.exitCode !== 0) {
+          throw new Error(
+            `Failed to inspect the active inference route before runtime identity apply: ${boundedCommandError(routeOutput)}`,
+          );
+        }
+        const activeRoute = parseInferenceRouteBinding(routeResult.stdout);
+        if (!activeRoute && !isUnconfiguredInferenceRoute(routeResult.stdout)) {
+          throw new Error(
+            `Failed to parse the active inference route before runtime identity apply: ${boundedCommandError(routeOutput)}`,
+          );
+        }
+        reuseExistingInferenceRoute =
+          activeRoute?.provider === providerName &&
+          activeRoute.model === model &&
+          (inferenceCfg.timeout_secs === undefined ||
+            activeRoute.timeoutSeconds === inferenceCfg.timeout_secs);
+      }
+
+      progress(10, "Configuring runtime identity");
+      // Establish durable state before the first identity mutation, then update
+      // the receipt after each acquired resource.
+      persistRunPlan();
+      runtimeIdentityReceipt = await prepareRuntimeIdentity(runtimeIdentityConfig, identityDeps);
+      persistRunPlan();
     }
-  }
 
-  progress(85, "Saving run state");
-  writeFileSync(
-    join(stateDir, "plan.json"),
-    JSON.stringify(
-      buildPersistedRunPlan({
-        runId: rid,
-        profile,
+    progress(20, "Creating OpenClaw sandbox");
+    if (reuseExistingSandbox) {
+      log(`Sandbox '${sandboxName}' already exists, reusing.`);
+    } else {
+      const createArgs = [
+        "openshell",
+        "sandbox",
+        "create",
+        "--from",
+        sandboxImage,
+        "--name",
         sandboxName,
-        policyAdditions,
-        inferenceCfg,
-        timestamp: new Date().toISOString(),
-      }),
-      null,
-      2,
-    ),
-  );
+      ];
+      for (const port of forwardPorts) {
+        createArgs.push("--forward", String(port));
+      }
 
-  progress(100, "Apply complete");
-  log(`Sandbox '${sandboxName}' is ready.`);
-  log(`Inference: ${providerName} -> ${model} @ ${endpoint}`);
+      const createResult = await runCmd(createArgs, { reject: false });
+      sandboxCreatedByApply = createResult.exitCode === 0;
+      if (sandboxCreatedByApply) {
+        // Persist ownership immediately so a later-process rollback stays safe
+        // if apply is interrupted before its final state write.
+        persistRunPlan();
+      }
+      if (createResult.exitCode !== 0) {
+        if (createResult.stderr.includes("already exists")) {
+          if (runtimeIdentityConfig) {
+            const racedSandbox = await runCmd(["openshell", "sandbox", "get", sandboxName], {
+              reject: false,
+            });
+            if (racedSandbox.exitCode !== 0) {
+              throw new Error(
+                `Failed to inspect sandbox '${sandboxName}' after concurrent creation: ${boundedCommandError(`${racedSandbox.stderr}\n${racedSandbox.stdout}`)}`,
+              );
+            }
+            assertReusableRuntimeIdentitySandbox(racedSandbox.stdout, sandboxName);
+          }
+          log(`Sandbox '${sandboxName}' already exists, reusing.`);
+        } else {
+          throw new Error(`Failed to create sandbox: ${createResult.stderr}`);
+        }
+      }
+    }
+
+    // Keep runtime credentials unattached until OpenShell accepts the
+    // sandbox's requested inference route.
+    progress(50, "Configuring inference provider");
+    if (reuseExistingInferenceProvider) {
+      log(`Provider '${providerName}' already exists, reusing.`);
+    } else {
+      const providerArgs = [
+        "openshell",
+        "provider",
+        "create",
+        "--name",
+        providerName,
+        "--type",
+        providerType,
+      ];
+      // Pass the env-var NAME (not the value) to --credential; openshell reads the value from the env.
+      // Scope the credential to the subprocess to avoid leaking into later commands.
+      const credEnv: Record<string, string> = {};
+      if (credential) {
+        credEnv.OPENAI_API_KEY = credential;
+        providerArgs.push("--credential", "OPENAI_API_KEY");
+      }
+      if (endpoint) {
+        providerArgs.push("--config", `OPENAI_BASE_URL=${endpoint}`);
+      }
+
+      const providerResult = await execa(providerArgs[0], providerArgs.slice(1), {
+        reject: false,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: buildSubprocessEnv(credEnv),
+        extendEnv: false,
+      });
+      // A required mutation: a silently-ignored failure would persist plan.json and
+      // report a ready sandbox that cannot perform inference. Mirror the
+      // sandbox-create contract above — tolerate an already-existing provider as a
+      // reuse (keeps re-apply idempotent) and fail on any other non-zero result.
+      // The credential is passed via env (never argv); redact it from stderr before
+      // surfacing bounded diagnostic context. (#6703)
+      if (providerResult.exitCode !== 0) {
+        if (providerResult.stderr.includes("already exists")) {
+          if (runtimeIdentityConfig) {
+            const racedProvider = await runCmd(["openshell", "provider", "get", providerName], {
+              reject: false,
+            });
+            if (racedProvider.exitCode !== 0) {
+              throw new Error(
+                `Failed to inspect inference provider '${providerName}' after concurrent creation: ${boundedCommandError(`${racedProvider.stderr}\n${racedProvider.stdout}`)}`,
+              );
+            }
+            assertReusableInferenceProvider(racedProvider.stdout, {
+              name: providerName,
+              type: providerType,
+              requiresEndpointConfig: endpoint !== "",
+              requiresCredential: credential !== "",
+            });
+          }
+          log(`Provider '${providerName}' already exists, reusing.`);
+        } else {
+          throw new Error(
+            `Failed to create inference provider '${providerName}': ${boundedCommandError(providerResult.stderr, [credential])}`,
+          );
+        }
+      } else {
+        inferenceProviderCreatedByApply = true;
+        // Persist ownership before a later route or policy mutation can fail.
+        persistRunPlan();
+      }
+    }
+
+    progress(70, "Setting inference route");
+    if (reuseExistingInferenceRoute) {
+      log(`Inference route '${providerName} / ${model}' is already active, reusing.`);
+    } else {
+      const inferenceArgs = [
+        "openshell",
+        "inference",
+        "set",
+        "--provider",
+        providerName,
+        "--model",
+        model,
+      ];
+      if (inferenceCfg.timeout_secs !== undefined) {
+        inferenceArgs.push("--timeout", String(inferenceCfg.timeout_secs));
+      }
+      const inferenceResult = await runCmd(inferenceArgs, { reject: false });
+      // Another required mutation: without a routed provider the sandbox cannot
+      // perform inference, so a non-zero result must abort the apply. (#6703)
+      if (inferenceResult.exitCode !== 0) {
+        throw new Error(
+          `Failed to set inference route (provider '${providerName}', model '${model}'): ${boundedCommandError(inferenceResult.stderr)}`,
+        );
+      }
+    }
+
+    if (runtimeIdentityReceipt) {
+      const attachmentSandbox = await runCmd(["openshell", "sandbox", "get", sandboxName], {
+        reject: false,
+      });
+      if (attachmentSandbox.exitCode !== 0) {
+        throw new Error(
+          `Failed to inspect sandbox '${sandboxName}' immediately before runtime identity attachment: ${boundedCommandError(`${attachmentSandbox.stderr}\n${attachmentSandbox.stdout}`)}`,
+        );
+      }
+      assertReusableRuntimeIdentitySandbox(attachmentSandbox.stdout, sandboxName);
+      const attachmentCreated = await attachRuntimeIdentity(
+        runtimeIdentityReceipt,
+        sandboxName,
+        identityDeps,
+      );
+      runtimeIdentityReceipt = {
+        ...runtimeIdentityReceipt,
+        attachment_created: attachmentCreated,
+      };
+      persistRunPlan();
+    }
+
+    if (Object.keys(policyAdditions).length > 0) {
+      progress(78, "Applying policy additions");
+      const currentPolicy = await runCmd(["openshell", "policy", "get", "--base", sandboxName], {
+        reject: false,
+      });
+      if (currentPolicy.exitCode !== 0) {
+        throw new Error(
+          `Failed to read current policy before applying additions: ${currentPolicy.stderr}`,
+        );
+      }
+
+      const mergedPolicyFile = join(stateDir, "merged-policy.yaml");
+      writeFileSync(mergedPolicyFile, mergePolicyAdditions(currentPolicy.stdout, policyAdditions), {
+        encoding: "utf-8",
+        mode: 0o600,
+      });
+
+      const policySet = await runCmd(
+        ["openshell", "policy", "set", "--policy", mergedPolicyFile, "--wait", sandboxName],
+        { reject: false },
+      );
+      if (policySet.exitCode !== 0) {
+        throw new Error(`Failed to apply policy additions: ${policySet.stderr}`);
+      }
+    }
+
+    progress(85, "Saving run state");
+    persistRunPlan();
+
+    progress(100, "Apply complete");
+    log(`Sandbox '${sandboxName}' is ready.`);
+    log(`Inference: ${providerName} -> ${model} @ ${endpoint}`);
+  } catch (error) {
+    const cleanupFailures: string[] = [];
+    if (runtimeIdentityReceipt) {
+      try {
+        await compensateRuntimeIdentityApply(runtimeIdentityReceipt, sandboxName, identityDeps);
+        runtimeIdentityReceipt = {
+          ...runtimeIdentityReceipt,
+          provider_created: false,
+          attachment_created: false,
+        };
+        persistRunPlan();
+      } catch (cleanupError) {
+        cleanupFailures.push(
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        );
+      }
+    }
+    if (sandboxCreatedByApply) {
+      await runCmd(["openshell", "sandbox", "stop", sandboxName], { reject: false });
+      const remove = await runCmd(["openshell", "sandbox", "remove", sandboxName], {
+        reject: false,
+      });
+      if (remove.exitCode === 0 || MISSING_SANDBOX_PATTERN.test(remove.stderr)) {
+        sandboxCreatedByApply = false;
+        persistRunPlan();
+      } else {
+        cleanupFailures.push(
+          `Failed to remove sandbox '${sandboxName}': ${boundedCommandError(remove.stderr)}`,
+        );
+      }
+    }
+    if (inferenceProviderCreatedByApply && !sandboxCreatedByApply) {
+      const removeProvider = await runCmd(["openshell", "provider", "delete", providerName], {
+        reject: false,
+      });
+      if (
+        removeProvider.exitCode === 0 ||
+        MISSING_PROVIDER_INSPECTION_PATTERN.test(removeProvider.stderr)
+      ) {
+        inferenceProviderCreatedByApply = false;
+        persistRunPlan();
+      } else {
+        cleanupFailures.push(
+          `Failed to remove inference provider '${providerName}': ${boundedCommandError(removeProvider.stderr)}`,
+        );
+      }
+    }
+
+    const message = error instanceof Error ? error.message : String(error);
+    if (cleanupFailures.length > 0) {
+      throw new Error(`${message}; cleanup failed: ${cleanupFailures.join("; ")}`);
+    }
+    throw error;
+  }
 }
 
 function validateRunId(rid: string): void {
@@ -897,6 +1373,10 @@ export async function actionRollback(rid: string): Promise<void> {
 
   const planFile = join(stateDir, "plan.json");
   let sandboxName: string;
+  let sandboxCreatedByApply = false;
+  let inferenceProviderCreatedByApply = false;
+  let inferenceProviderName: string | undefined;
+  let runtimeIdentityReceipt: RuntimeIdentityReceipt | undefined;
   try {
     const planData = readFileSync(planFile, "utf-8");
     const parsedPlan: unknown = JSON.parse(planData);
@@ -905,19 +1385,63 @@ export async function actionRollback(rid: string): Promise<void> {
         ? parsedPlan
         : null;
     sandboxName = readRollbackSandboxName(rollbackPlan);
+    sandboxCreatedByApply = rollbackPlan?.sandbox_created_by_apply === true;
+    inferenceProviderCreatedByApply = rollbackPlan?.inference_provider_created_by_apply === true;
+    if (inferenceProviderCreatedByApply) {
+      inferenceProviderName = readRollbackInferenceProviderName(rollbackPlan!);
+    }
+    if (rollbackPlan?.identity !== undefined) {
+      if (!isRuntimeIdentityReceipt(rollbackPlan.identity)) {
+        throw new Error("identity ownership receipt is invalid");
+      }
+      runtimeIdentityReceipt = rollbackPlan.identity;
+    }
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     throw new Error(`Cannot read rollback plan for run ${rid}: ${detail}`);
   }
 
-  try {
+  if (runtimeIdentityReceipt) {
+    progress(20, `Removing runtime identity provider ${runtimeIdentityReceipt.provider_name}`);
+    await removeRuntimeIdentity(runtimeIdentityReceipt, sandboxName, runtimeIdentityCommandDeps());
+  }
+
+  if (sandboxCreatedByApply) {
     progress(30, `Stopping sandbox ${sandboxName}`);
-    await runCmd(["openshell", "sandbox", "stop", sandboxName], { reject: false });
+    const stop = await runCmd(["openshell", "sandbox", "stop", sandboxName], { reject: false });
 
     progress(60, `Removing sandbox ${sandboxName}`);
-    await runCmd(["openshell", "sandbox", "remove", sandboxName], { reject: false });
-  } catch {
-    // Sandbox cleanup is best-effort; the rollback marker still records this run as handled.
+    const remove = await runCmd(["openshell", "sandbox", "remove", sandboxName], {
+      reject: false,
+    });
+    if (remove.exitCode !== 0 && !MISSING_SANDBOX_PATTERN.test(remove.stderr)) {
+      const stopFailure =
+        stop.exitCode !== 0 && !MISSING_SANDBOX_PATTERN.test(stop.stderr)
+          ? `; sandbox stop also failed: ${boundedCommandError(stop.stderr)}`
+          : "";
+      throw new Error(
+        `Failed to remove owned sandbox '${sandboxName}': ${boundedCommandError(remove.stderr)}` +
+          stopFailure,
+      );
+    }
+  } else {
+    progress(60, `Preserving unowned sandbox ${sandboxName}`);
+  }
+
+  if (inferenceProviderCreatedByApply) {
+    progress(80, `Removing inference provider ${inferenceProviderName!}`);
+    const removeProvider = await runCmd(
+      ["openshell", "provider", "delete", inferenceProviderName!],
+      { reject: false },
+    );
+    if (
+      removeProvider.exitCode !== 0 &&
+      !MISSING_PROVIDER_INSPECTION_PATTERN.test(removeProvider.stderr)
+    ) {
+      throw new Error(
+        `Failed to remove owned inference provider '${inferenceProviderName!}': ${boundedCommandError(removeProvider.stderr)}`,
+      );
+    }
   }
 
   progress(90, "Cleaning up run state");
@@ -928,7 +1452,14 @@ export async function actionRollback(rid: string): Promise<void> {
 
 // ── CLI ─────────────────────────────────────────────────────────
 
-export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
+export async function main(
+  argv: string[] = process.argv.slice(2),
+  options: {
+    snapshotCommand?: SnapshotCommandOptions;
+    /** Code-only conformance-test seam. No CLI flag or environment input populates this policy. */
+    runtimeIdentityProfilePolicy?: RuntimeIdentityProfilePolicy;
+  } = {},
+): Promise<void> {
   const rawAction = argv.at(0);
   const action = isAction(rawAction) ? rawAction : undefined;
   let profile = "default";
@@ -943,8 +1474,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   }
 
   if (!action) {
+    if (rawAction === "snapshots") {
+      actionSnapshots(argv.slice(1), options.snapshotCommand);
+      return;
+    }
     throw new Error(
-      `Unknown action '${rawAction ?? "(missing)"}'. Use: plan, apply, status, rollback`,
+      `Unknown action '${rawAction ?? "(missing)"}'. Use: plan, apply, status, rollback, snapshots`,
     );
   }
 
@@ -976,7 +1511,11 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
     }
     case "apply": {
       const blueprint = loadBlueprint();
-      await actionApply(profile, blueprint, { planPath, endpointUrl });
+      await actionApply(profile, blueprint, {
+        planPath,
+        endpointUrl,
+        runtimeIdentityProfilePolicy: options.runtimeIdentityProfilePolicy,
+      });
       break;
     }
     case "status":

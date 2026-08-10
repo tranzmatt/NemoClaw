@@ -9,6 +9,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DASHBOARD_PORT } from "../core/ports";
+import { isCuaFrameworkEnabled, requireCuaFrameworkEnabled } from "../cua/feature";
+import { getCuaExternalAgentManifestPath } from "../cua/runtime-manifest";
 import { ROOT } from "../runner";
 import {
   formatAgentAliasSuffix,
@@ -23,12 +25,15 @@ import type {
   AgentHealthProbe,
   AgentLegacyPaths,
   AgentMcpCapability,
+  AgentStateDirectory,
   AgentStateFile,
+  AgentStateLockPlan,
   AgentVersionScheme,
 } from "./definition-types";
 import {
   loadManifestRecord,
   readBoolean,
+  readConfigShieldsFiles,
   readDashboard,
   readHealthProbe,
   readInference,
@@ -36,6 +41,7 @@ import {
   readObject,
   readPortArray,
   readStateFiles,
+  readStateLockPlanInImage,
   readString,
   readStringArray,
   readStringMap,
@@ -43,6 +49,12 @@ import {
   readVersionScheme,
 } from "./manifest-readers";
 import { type AgentRuntime, readAgentRuntime } from "./runtime-manifest";
+import {
+  buildStateLockPlan,
+  readStateDirectories,
+  stateDirectoryPaths,
+  stateDirectoryPrefixes,
+} from "./state-directory-contract";
 import { type AgentWebAuth, readWebAuth } from "./web-auth";
 
 export type {
@@ -57,9 +69,21 @@ export type {
   AgentMcpAdapter,
   AgentMcpCapability,
   AgentMcpSupport,
+  AgentStateDirectory,
+  AgentStateDirectoryPath,
+  AgentStateDirectoryPrefix,
+  AgentStateDirectoryShields,
   AgentStateFile,
   AgentStateFileStrategy,
+  AgentStateLockPlan,
   AgentVersionScheme,
+  StateFileFreshHeader,
+  StateFileKeyAllowlistRestoreOwnership,
+  StateFileOpenClawRestoreOwnership,
+  StateFileRestoreMerge,
+  StateFileRestoreOwnership,
+  StateFileUserKey,
+  StateFileUserKeyType,
 } from "./definition-types";
 export type { AgentRuntime, AgentRuntimeKind } from "./runtime-manifest";
 export { getAgentRuntimeKind, isTerminalAgent } from "./runtime-manifest";
@@ -92,30 +116,60 @@ function unknownAgentMessage(
  * List available agent names by scanning agents/ for directories with
  * a manifest.yaml file.
  */
-export function listAgents(): string[] {
-  if (!fs.existsSync(AGENTS_DIR)) return [];
-  return fs
-    .readdirSync(AGENTS_DIR, { withFileTypes: true })
-    .filter((entry) => entry.isDirectory())
-    .filter((entry) => fs.existsSync(path.join(AGENTS_DIR, entry.name, "manifest.yaml")))
-    .map((entry) => entry.name)
-    .sort();
+export function listAgents(env: NodeJS.ProcessEnv = process.env): string[] {
+  const agents = fs.existsSync(AGENTS_DIR)
+    ? fs
+        .readdirSync(AGENTS_DIR, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .filter((entry) => entry.name !== "nemocua")
+        .filter((entry) => fs.existsSync(path.join(AGENTS_DIR, entry.name, "manifest.yaml")))
+        .map((entry) => entry.name)
+    : [];
+  if (
+    isCuaFrameworkEnabled(env) &&
+    env.NEMOCLAW_CUA_RUNTIME_MANIFEST &&
+    env.NEMOCLAW_CUA_RUNTIME_MANIFEST_SHA256
+  ) {
+    agents.push("nemocua");
+  }
+  return [...new Set(agents)].sort();
+}
+
+/** Resolve a non-OpenClaw agent's required, readable baseline policy. */
+export function requireAgentPolicyAdditionsPath(
+  agent: Pick<AgentDefinition, "name" | "policyAdditionsPath">,
+): string {
+  const policyPath = agent.policyAdditionsPath;
+  try {
+    if (!policyPath || !fs.statSync(policyPath).isFile()) throw new Error("missing policy file");
+    fs.accessSync(policyPath, fs.constants.R_OK);
+    return policyPath;
+  } catch {
+    throw new Error(
+      `Agent '${agent.name}' baseline policy is unavailable; a readable policy-additions.yaml is required. Refusing to substitute the OpenClaw baseline.`,
+    );
+  }
 }
 
 /**
  * Load and parse an agent manifest.
  */
-export function loadAgent(name: string): AgentDefinition {
-  const cached = _cache.get(name);
+export function loadAgent(name: string, env: NodeJS.ProcessEnv = process.env): AgentDefinition {
+  if (name === "nemocua") requireCuaFrameworkEnabled(env);
+  const externalCua = name === "nemocua";
+  const manifestPath = externalCua
+    ? getCuaExternalAgentManifestPath(env)
+    : path.join(AGENTS_DIR, name, "manifest.yaml");
+  const cacheKey = externalCua ? null : name;
+  const cached = cacheKey ? _cache.get(cacheKey) : undefined;
   if (cached) return cached;
 
-  const manifestPath = path.join(AGENTS_DIR, name, "manifest.yaml");
   if (!fs.existsSync(manifestPath)) {
     throw new Error(`Agent '${name}' not found: ${manifestPath}`);
   }
 
   const raw = loadManifestRecord(manifestPath);
-  const agentDir = path.join(AGENTS_DIR, name);
+  const agentDir = path.dirname(manifestPath);
   const manifestName = readString(raw, "name") ?? name;
   const description = readString(raw, "description");
   const displayName = readString(raw, "display_name");
@@ -130,9 +184,23 @@ export function loadAgent(name: string): AgentDefinition {
   const webAuth = readWebAuth(raw);
   const healthProbe = readHealthProbe(raw);
   const config = readObject(raw, "config");
+  const configShieldsFiles = readConfigShieldsFiles(config);
   const inference = readInference(raw);
   const mcp = readMcpCapability(raw);
-  const stateDirs = readStringArray(raw, "state_dirs");
+  if (raw.runtime_auth_state_dirs !== undefined) {
+    throw new Error(
+      "Agent manifest field 'runtime_auth_state_dirs' was replaced by state_dirs entries with backup: false",
+    );
+  }
+  const stateDirectories = readStateDirectories(raw);
+  const stateDirs = stateDirectoryPaths(stateDirectories);
+  const stateDirPrefixes = stateDirectoryPrefixes(stateDirectories);
+  const backupStateDirs = stateDirectoryPaths(stateDirectories, { backup: true });
+  const backupStateDirPrefixes = stateDirectoryPrefixes(stateDirectories, { backup: true });
+  const nonBackupStateDirs = stateDirectoryPaths(stateDirectories, { backup: false });
+  const nonBackupStateDirPrefixes = stateDirectoryPrefixes(stateDirectories, { backup: false });
+  const stateLockPlan = buildStateLockPlan(stateDirectories);
+  const stateLockPlanInImage = readStateLockPlanInImage(raw);
   const stateFiles = readStateFiles(raw);
   const userManagedFiles = readUserManagedFiles(raw);
   const phoneHomeHosts = readStringArray(raw, "phone_home_hosts");
@@ -157,7 +225,7 @@ export function loadAgent(name: string): AgentDefinition {
     config,
     inference,
     mcp,
-    state_dirs: stateDirs,
+    state_lock_plan_in_image: stateLockPlanInImage,
     state_files: stateFiles,
     user_managed_files: userManagedFiles,
     _legacy_paths: legacyPathConfig,
@@ -206,6 +274,7 @@ export function loadAgent(name: string): AgentDefinition {
         configFile: readString(config ?? {}, "config_file") ?? "openclaw.json",
         envFile: readString(config ?? {}, "env_file") ?? null,
         format: readString(config ?? {}, "format") ?? "json",
+        shieldsFiles: configShieldsFiles,
       };
     },
 
@@ -217,8 +286,40 @@ export function loadAgent(name: string): AgentDefinition {
       return mcp;
     },
 
+    get stateDirectories(): AgentStateDirectory[] {
+      return stateDirectories;
+    },
+
     get stateDirs(): string[] {
-      return stateDirs ?? [];
+      return stateDirs;
+    },
+
+    get stateDirPrefixes(): string[] {
+      return stateDirPrefixes;
+    },
+
+    get backupStateDirs(): string[] {
+      return backupStateDirs;
+    },
+
+    get backupStateDirPrefixes(): string[] {
+      return backupStateDirPrefixes;
+    },
+
+    get nonBackupStateDirs(): string[] {
+      return nonBackupStateDirs;
+    },
+
+    get nonBackupStateDirPrefixes(): string[] {
+      return nonBackupStateDirPrefixes;
+    },
+
+    get stateLockPlan(): AgentStateLockPlan {
+      return stateLockPlan;
+    },
+
+    get stateLockPlanInImage(): boolean {
+      return stateLockPlanInImage;
     },
 
     get stateFiles(): AgentStateFile[] {
@@ -297,7 +398,24 @@ export function loadAgent(name: string): AgentDefinition {
     },
   };
 
-  _cache.set(name, agent);
+  if (externalCua) {
+    if (
+      agent.name !== "nemocua" ||
+      runtime.kind !== "terminal" ||
+      !runtime.interactive_command ||
+      !runtime.headless_command ||
+      !runtime.smoke_commands?.length ||
+      !binaryPath?.startsWith("/") ||
+      !versionCommand ||
+      !expectedVersion
+    ) {
+      throw new Error(
+        "External NemoCUA agent manifest must declare the canonical terminal runtime, binary, version, and smoke surfaces",
+      );
+    }
+  }
+
+  if (cacheKey) _cache.set(cacheKey, agent);
   return agent;
 }
 

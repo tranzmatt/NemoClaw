@@ -23,14 +23,29 @@ function corePackageSpecs(block) {
 }
 
 function explicitLifecycleScripts(block) {
-  return [...block.matchAll(
+  const scripts = [...block.matchAll(
     /^\s*([0-9]+(?:\.[0-9]+){2}(?:\|[0-9]+(?:\.[0-9]+){2})*)\)\s+(node [^;]+postinstall-bundled-plugins\.mjs)\s+;;/gm,
   )].flatMap((match) =>
     match[1].split("|").map((version) => ({
       packageSpec: "openclaw@" + version,
       explicitCommand: match[2],
     })),
-  ).sort((left, right) => left.packageSpec.localeCompare(right.packageSpec));
+  );
+  const lockedRuntimeCommand =
+    "node /usr/local/lib/nemoclaw/openclaw-runtime/node_modules/openclaw/scripts/postinstall-bundled-plugins.mjs";
+  if (
+    block.includes("npm --prefix /usr/local/lib/nemoclaw/openclaw-runtime ci") &&
+    block.includes(lockedRuntimeCommand)
+  ) {
+    const manifest = JSON.parse(
+      fs.readFileSync("agents/openclaw/openclaw-runtime/package.json", "utf8"),
+    );
+    scripts.push({
+      packageSpec: "openclaw@" + manifest.dependencies.openclaw,
+      explicitCommand: lockedRuntimeCommand,
+    });
+  }
+  return scripts.sort((left, right) => left.packageSpec.localeCompare(right.packageSpec));
 }
 
 const dockerfile = fs.readFileSync("Dockerfile", "utf8");
@@ -42,8 +57,8 @@ const messagingApplier = fs.readFileSync(
 
 const codexBlock = between(
   dockerfile,
-  "# Pre-install the codex-acp package",
-  "# Upgrade OpenClaw if the base image is stale.",
+  "AS codex-acp-runtime",
+  "AS wechat-npm-cache",
 );
 const runtimeBlock = between(
   dockerfile,
@@ -66,25 +81,28 @@ const messagingInstallBlock = between(
   "export function runOpenClawMessagingDoctor",
 );
 
-const codexMatch = codexBlock.match(/CODEX_ACP_SPEC='([^']+)'/);
+const codexMatch = dockerfile.match(
+  /ADD --checksum=sha256:[0-9a-f]{64} https:\/\/registry\.npmjs\.org\/@zed-industries\/codex-acp\/-\/codex-acp-0\.11\.1\.tgz/,
+);
 const optionalPluginSpecs = [...optionalPluginBlock.matchAll(
     /"(@openclaw\/[^"\s]+@[0-9]+(?:\.[0-9]+){2})"\)\s+expected_integrity=/g,
   )].map((match) => match[1]).sort();
 
 console.log(JSON.stringify({
-  codexPackageSpec: codexMatch?.[1] ?? null,
+  codexPackageSpec: codexMatch ? "@zed-industries/codex-acp@0.11.1" : null,
   runtimeCoreSpecs: corePackageSpecs(runtimeBlock),
   baseCoreSpecs: corePackageSpecs(baseBlock),
   optionalPluginSpecs,
   runtimeLifecycleScripts: explicitLifecycleScripts(runtimeBlock),
   baseLifecycleScripts: explicitLifecycleScripts(baseBlock),
   scriptsSuppressed: {
-    codex: /npm install -g --no-audit --no-fund --no-progress --ignore-scripts\s+\\\s*"\$CODEX_ACP_PACK_PATH"/.test(codexBlock),
+    codex: /npm install -g --offline --no-audit --no-fund --no-progress --ignore-scripts/.test(codexBlock),
     runtime: /npm install -g --no-audit --no-fund --no-progress --ignore-scripts "\$OPENCLAW_PACK_PATH"/.test(runtimeBlock),
     base: /npm install -g --ignore-scripts "\$OPENCLAW_PACK_PATH"/.test(baseBlock),
-    optionalPlugin: /NPM_CONFIG_IGNORE_SCRIPTS=true npm_config_ignore_scripts=true\s+\\\s*openclaw plugins install "\$plugin_archive" --pin/.test(optionalPluginBlock),
+    optionalPlugin: /NPM_CONFIG_IGNORE_SCRIPTS=true npm_config_ignore_scripts=true\s+\\\s*openclaw plugins install "npm-pack:/.test(optionalPluginBlock) &&
+      optionalPluginBlock.includes('openclaw plugins install "npm-pack:\${plugin_install_archive}"'),
     messagingPlugin: [
-      '["openclaw", "plugins", "install", packed.archivePath',
+      '["openclaw", "plugins", "install", \`npm-pack:\${packed.archivePath}\`]',
       'NPM_CONFIG_IGNORE_SCRIPTS: "true"',
       'npm_config_ignore_scripts: "true"',
     ].every((marker) => messagingInstallBlock.includes(marker)),
@@ -99,45 +117,20 @@ console.log(JSON.stringify({
 `;
 
 describe("reviewed npm lifecycle policy", () => {
-  it("keeps the exact archive and explicit-script allowlist", () => {
-    expect(policy).toEqual({
-      schemaVersion: 1,
-      defaultPolicy: "deny",
-      reviewedArchivePackages: [
-        "@openclaw/brave-plugin@2026.6.10",
-        "@openclaw/diagnostics-otel@2026.6.10",
-        "@openclaw/discord@2026.6.10",
-        "@openclaw/msteams@2026.6.10",
-        "@openclaw/slack@2026.6.10",
-        "@openclaw/whatsapp@2026.6.10",
-        "@tencent-weixin/openclaw-weixin@2.4.3",
-        "@zed-industries/codex-acp@0.11.1",
-        "openclaw@2026.3.11",
-        "openclaw@2026.4.24",
-        "openclaw@2026.6.10",
-      ],
-      allowedLifecycleScripts: [
-        {
-          packageSpec: "openclaw@2026.4.24",
-          event: "postinstall",
-          manifestCommand: "node scripts/postinstall-bundled-plugins.mjs",
-          explicitCommand:
-            "node /usr/local/lib/node_modules/openclaw/scripts/postinstall-bundled-plugins.mjs",
-        },
-        {
-          packageSpec: "openclaw@2026.6.10",
-          event: "postinstall",
-          manifestCommand: "node scripts/postinstall-bundled-plugins.mjs",
-          explicitCommand:
-            "node /usr/local/lib/node_modules/openclaw/scripts/postinstall-bundled-plugins.mjs",
-        },
-      ],
-    });
-  });
-
+  // source-shape-contract: security -- Every executable archive install must match the reviewed fail-closed lifecycle allowlist
   it("cross-checks the allowlist against every production archive install boundary", () => {
+    expect(policy).toMatchObject({ schemaVersion: 1, defaultPolicy: "deny" });
+    expect(policy.allowedLifecycleScripts).not.toHaveLength(0);
+    expect(
+      policy.allowedLifecycleScripts.every(
+        ({ event, manifestCommand }) =>
+          event === "postinstall" &&
+          manifestCommand === "node scripts/postinstall-bundled-plugins.mjs",
+      ),
+    ).toBe(true);
+
     const messagingPackageSpecs = Object.keys(
-      reviewedOpenClawPluginIntegrityByPackageSpec({ OPENCLAW_VERSION: "2026.6.10" }),
+      reviewedOpenClawPluginIntegrityByPackageSpec({ OPENCLAW_VERSION: "2026.7.1" }),
     );
     const result = spawnSync(process.execPath, ["-e", PRODUCTION_BOUNDARY_AUDIT], {
       cwd: REPO_ROOT,

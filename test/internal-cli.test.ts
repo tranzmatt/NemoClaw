@@ -82,7 +82,7 @@ describe("internal oclif namespace", () => {
         "--provider",
         "cloud",
         "--node-version",
-        "v22.16.0",
+        "v22.19.0",
         "--npm-version",
         "10.0.0",
       ],
@@ -116,5 +116,36 @@ describe("internal oclif namespace", () => {
       installRef: "lkg",
       provider: { normalized: "nim-local", raw: "nim", valid: true },
     });
+  });
+
+  it("fails the experimental voice gateway gate before parsing credential flags (#8378)", () => {
+    const env = { ...process.env };
+    delete env.NEMOCLAW_EXPERIMENTAL_VOICE_GATEWAY;
+
+    const result = spawnSync(process.execPath, [CLI, "internal", "voice-gateway", "serve"], {
+      encoding: "utf-8",
+      env,
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("Experimental voice gateway is disabled");
+    expect(result.stderr).not.toContain("Missing required flag");
+  });
+
+  it("ships hidden help for the feature-gated voice gateway command (#8378)", () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI, "internal", "voice-gateway", "serve", "--help"],
+      {
+        encoding: "utf-8",
+        env: { ...process.env, NEMOCLAW_EXPERIMENTAL_VOICE_GATEWAY: "1" },
+      },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain("Internal: serve the experimental voice gateway");
+    expect(result.stdout).toContain("--deployment-credential-file");
+    expect(result.stdout).toContain("--openclaw-credential-file");
+    expect(result.stdout).toContain("--runtime-identity");
   });
 });

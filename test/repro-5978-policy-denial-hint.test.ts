@@ -96,15 +96,18 @@ function runInPty(snippet: string, env: NodeJS.ProcessEnv): { stdout: string; st
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "nc-5978-")), "snippet.sh");
   fs.writeFileSync(file, snippet);
   try {
-    const result = spawnSync(
-      "script",
-      ["-qec", `bash --noprofile --norc -i ${file}`, "/dev/null"],
-      {
-        encoding: "utf-8",
-        timeout: 10_000,
-        env: { ...process.env, ...env, SHLVL: "9" },
-      },
-    );
+    const scriptArgs =
+      process.platform === "darwin"
+        ? ["-q", "/dev/null", "bash", "--noprofile", "--norc", "-i", file]
+        : ["-qec", `bash --noprofile --norc -i ${file}`, "/dev/null"];
+    const result = spawnSync("script", scriptArgs, {
+      encoding: "utf-8",
+      timeout: 10_000,
+      env: { ...process.env, ...env, SHLVL: "9" },
+      // Darwin's script(1) rejects Node's default socket-backed stdin. The
+      // snippet is read from file, so a null stdin preserves the PTY contract.
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     return { stdout: result.stdout ?? "", status: result.status ?? -1 };
   } finally {
     fs.rmSync(path.dirname(file), { recursive: true, force: true });
@@ -235,10 +238,10 @@ describe("sandbox policy-denial logs breadcrumb (#5978)", () => {
     expect(stdout).not.toContain("nemoclaw 9abc logs");
   });
 
-  it("falls back to <name> when OPENSHELL_SANDBOX exceeds the 63-char name limit", () => {
-    // NAME_MAX_LENGTH is 63; an over-length value must not be rendered into
+  it("falls back to <name> when OPENSHELL_SANDBOX exceeds the 19-character name limit", () => {
+    // NAME_MAX_LENGTH matches OpenShell's routable-name limit; an over-length value must not be rendered into
     // the copyable command (it could never be a real sandbox name).
-    const tooLong = "a".repeat(64);
+    const tooLong = "a".repeat(20);
     const { stdout, status } = gate({ OPENSHELL_SANDBOX: tooLong });
     expect(status).toBe(0);
     expect(stdout).toContain("nemoclaw <name> logs --tail 50");
@@ -306,6 +309,7 @@ describe("sandbox policy-denial logs breadcrumb (#5978)", () => {
     expect(stdout).not.toContain("logs --tail 50");
   });
 
+  // source-shape-contract: compatibility -- Executing the emitted shell hook twice protects login profile and bashrc coexistence
   it("prints only once when the file is sourced twice in one login shell", () => {
     // A login shell sources both the system profile and bashrc hooks, each of
     // which sources this file and runs its trailing auto-invocation — the

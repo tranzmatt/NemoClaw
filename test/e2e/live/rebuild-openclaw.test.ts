@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { Buffer } from "node:buffer";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { shellQuote } from "../../../src/lib/core/shell-quote";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
+import { assertCleanupSucceededOrAbsent } from "../fixtures/cleanup-resources.ts";
 import { assertExitZero as expectExitZero, resultText } from "../fixtures/clients/command.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import { validateSandboxName } from "../fixtures/clients/sandbox.ts";
@@ -40,12 +40,8 @@ const DEFAULT_MODEL =
   process.env.NEMOCLAW_MODEL ??
   process.env.NEMOCLAW_COMPAT_MODEL ??
   "nvidia/nvidia/nemotron-3-ultra";
-const TEST_SANDBOX_PREFIX = "e2e-rebuild-openclaw";
-const SANDBOX_NAME =
-  process.env.NEMOCLAW_SANDBOX_NAME ??
-  [TEST_SANDBOX_PREFIX, process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT, process.pid]
-    .filter(Boolean)
-    .join("-");
+const TEST_SANDBOX_PREFIX = "e2e-rebuild-oc";
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? TEST_SANDBOX_PREFIX;
 validateSandboxName(SANDBOX_NAME);
 if (!SANDBOX_NAME.startsWith(TEST_SANDBOX_PREFIX)) {
   throw new Error(
@@ -137,9 +133,35 @@ function openshellBestEffort(
   );
 }
 
+async function cleanupRebuiltNemoClawSandbox(host: HostCliClient, apiKey: string): Promise<void> {
+  const result = await host.command("node", [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes"], {
+    artifactName: "cleanup-nemoclaw-destroy",
+    env: cliEnv(apiKey),
+    redactionValues: [apiKey],
+    timeoutMs: 2 * 60_000,
+  });
+  assertCleanupSucceededOrAbsent(
+    result,
+    /Sandbox '.+' does not exist|Run 'nemoclaw onboard' to create one|sandbox .* not found|no such sandbox/iu,
+    `cleanup rebuilt sandbox ${SANDBOX_NAME}`,
+  );
+}
+
+async function cleanupOldOpenClawBaseImage(host: HostCliClient): Promise<void> {
+  const result = await host.command("docker", ["rmi", OLD_BASE_TAG], {
+    artifactName: "cleanup-docker-rmi-old-base",
+    env: dockerContextEnv(),
+    timeoutMs: OPENSHELL_TIMEOUT_MS,
+  });
+  assertCleanupSucceededOrAbsent(
+    result,
+    /No such image|image .* not found/iu,
+    `cleanup old OpenClaw base image ${OLD_BASE_TAG}`,
+  );
+}
+
 function pythonExecArgs(script: string): string[] {
-  const encoded = Buffer.from(script, "utf8").toString("base64");
-  return ["python3", "-c", `import base64; exec(base64.b64decode('${encoded}'))`];
+  return ["python3", "-c", script];
 }
 
 async function waitForSandboxReady(sandbox: {
@@ -314,9 +336,25 @@ function backupCredentialLeakPaths(backupDir: string, oldGatewayToken: string): 
 // The e2e-live Vitest project owns the NEMOCLAW_RUN_LIVE_E2E collection gate.
 // Accidental cli-test-shard discovery must not build Docker images, mutate
 // ~/.nemoclaw, or call NVIDIA.
+// biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
 test(
   "rebuild-openclaw: old OpenClaw sandbox rebuild preserves state and rotates gateway token",
-  async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
+  {
+    timeout: REBUILD_TIMEOUT_MS + 2 * DOCKER_BUILD_TIMEOUT_MS + ONBOARD_TIMEOUT_MS,
+    meta: {
+      e2ePhases: [
+        "confirm Docker and prepare OpenClaw rebuild resources",
+        "onboard the current OpenClaw sandbox",
+        "build the old OpenClaw base image",
+        "create the old OpenClaw sandbox",
+        "seed persistent state policy and registry metadata",
+        "restore the current OpenClaw base image",
+        "rebuild the OpenClaw sandbox",
+        "validate upgraded state policy inference and backup hygiene",
+      ],
+    },
+  },
+  async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
     const apiKey = secrets.required("NVIDIA_INFERENCE_API_KEY");
     expect(
       fs.existsSync(CLI_ENTRYPOINT),
@@ -379,43 +417,34 @@ test(
     const registrySnapshot = snapshotFile(REGISTRY_FILE);
     const sessionSnapshot = snapshotFile(SESSION_FILE);
     const sandboxBackupRoot = path.join(BACKUP_ROOT, SANDBOX_NAME);
-    cleanup.add(`restore NemoClaw state files for ${SANDBOX_NAME}`, () => {
+    cleanup.trackDisposable(`restore NemoClaw state files for ${SANDBOX_NAME}`, () => {
       restoreFile(REGISTRY_FILE, registrySnapshot);
       restoreFile(SESSION_FILE, sessionSnapshot);
       fs.rmSync(sandboxBackupRoot, { recursive: true, force: true });
     });
-
-    cleanup.add(`destroy rebuilt sandbox ${SANDBOX_NAME}`, async () => {
-      await host.command(
-        "node",
-        [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes", "--cleanup-gateway"],
-        {
-          artifactName: "cleanup-nemoclaw-destroy",
-          env: cliEnv(apiKey),
-          redactionValues: [apiKey],
-          timeoutMs: 2 * 60_000,
-        },
-      );
-      await openshellBestEffort(
-        host,
-        ["sandbox", "delete", SANDBOX_NAME],
-        "cleanup-openshell-sandbox-delete",
-      );
-      await openshellBestEffort(
-        host,
-        ["gateway", "destroy", "-g", "nemoclaw"],
-        "cleanup-openshell-gateway-destroy",
-      );
-      await host.command("docker", ["rmi", OLD_BASE_TAG], {
-        artifactName: "cleanup-docker-rmi-old-base",
+    cleanup.trackDisposable(`remove old OpenClaw base image ${OLD_BASE_TAG}`, () =>
+      cleanupOldOpenClawBaseImage(host),
+    );
+    cleanup.trackGateway(host, "nemoclaw", {
+      artifactName: "cleanup-openshell-gateway-destroy",
+      env: dockerContextEnv(),
+      timeoutMs: OPENSHELL_TIMEOUT_MS,
+    });
+    cleanup.trackDisposable(`delete rebuilt OpenShell sandbox ${SANDBOX_NAME}`, () =>
+      sandbox.cleanupSandbox(SANDBOX_NAME, {
+        artifactName: "cleanup-openshell-sandbox-delete",
         env: dockerContextEnv(),
         timeoutMs: OPENSHELL_TIMEOUT_MS,
-      });
-    });
+      }),
+    );
+    cleanup.trackDisposable(`destroy rebuilt sandbox ${SANDBOX_NAME}`, () =>
+      cleanupRebuiltNemoClawSandbox(host, apiKey),
+    );
 
     // Phase 1: create a normal current sandbox first so the real gateway and
     // session/credential scaffolding exist, matching the legacy install/onboard
     // setup before it swaps in an old OpenClaw sandbox.
+    progress.phase("onboard the current OpenClaw sandbox");
     const onboard = await host.command("node", [CLI_ENTRYPOINT, "onboard", "--non-interactive"], {
       artifactName: "phase-1-onboard-current",
       env: cliEnv(apiKey, { NEMOCLAW_RECREATE_SANDBOX: "1" }),
@@ -456,6 +485,7 @@ test(
     // Phase 2: build the old base image with a temporary build context that
     // lowers only the blueprint minimum-version gate consumed by Dockerfile.base.
     // The trusted checkout stays read-only.
+    progress.phase("build the old OpenClaw base image");
     const oldBaseBuildContext = createOldBaseBuildContext();
     try {
       const buildOldBase = await host.command(
@@ -484,6 +514,7 @@ test(
     }
 
     // Phase 3: create an OpenShell sandbox from the old base image.
+    progress.phase("create the old OpenClaw sandbox");
     const oldDockerfileDir = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-rebuild-openclaw-"));
     const oldDockerfile = path.join(oldDockerfileDir, "Dockerfile");
     fs.writeFileSync(
@@ -537,6 +568,7 @@ test(
     // Phase 4: seed workspace state, an existing gateway token, and registry /
     // resume-session state so `nemoclaw <name> rebuild --yes` drives the same
     // user-visible rebuild path as the former shell test.
+    progress.phase("seed persistent state policy and registry metadata");
     const markerWrite = await sandbox.exec(
       SANDBOX_NAME,
       [
@@ -663,6 +695,7 @@ print(json.dumps({'seeded': saved == os.environ['PRE_REBUILD_GATEWAY_TOKEN'], 'h
     expect(prePolicyList.stdout).toMatch(/●\s+telegram/i);
 
     // Phase 5: restore the current base image tag that rebuild consumes.
+    progress.phase("restore the current OpenClaw base image");
     const buildCurrentBase = await host.command(
       "docker",
       [
@@ -682,6 +715,7 @@ print(json.dumps({'seeded': saved == os.environ['PRE_REBUILD_GATEWAY_TOKEN'], 'h
     expectExitZero(buildCurrentBase, "docker build current base image");
 
     // Phase 6: run the real rebuild CLI.
+    progress.phase("rebuild the OpenClaw sandbox");
     const rebuild = await host.command(
       "node",
       [CLI_ENTRYPOINT, SANDBOX_NAME, "rebuild", "--yes", "--verbose"],
@@ -693,9 +727,13 @@ print(json.dumps({'seeded': saved == os.environ['PRE_REBUILD_GATEWAY_TOKEN'], 'h
       },
     );
     expectExitZero(rebuild, "nemoclaw rebuild");
+    const rebuildText = resultText(rebuild);
+    expect(rebuildText).toContain(`Sandbox '${SANDBOX_NAME}' rebuilt successfully`);
+    expect(rebuildText).not.toContain("post-restore steps were incomplete");
 
     // Phase 7: state preservation, upgrade, token rotation, backup hygiene, and
     // policy-preset preservation assertions.
+    progress.phase("validate upgraded state policy inference and backup hygiene");
     const markerRead = await sandbox.exec(SANDBOX_NAME, ["cat", MARKER_FILE], {
       artifactName: "phase-7-read-workspace-marker",
       env: dockerContextEnv(),
@@ -831,5 +869,4 @@ print(json.dumps({'tokenPresent': bool(token), 'tokenRotated': token != old, 'ru
       },
     );
   },
-  REBUILD_TIMEOUT_MS + 2 * DOCKER_BUILD_TIMEOUT_MS + ONBOARD_TIMEOUT_MS,
 );

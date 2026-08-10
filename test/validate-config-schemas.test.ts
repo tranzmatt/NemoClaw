@@ -2,35 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Validate config files against their JSON Schemas.
+ * Exercise config JSON Schemas with focused synthetic fixtures.
  *
- * Complements validate-blueprint.test.ts (business-logic invariants) with
- * structural/type validation via JSON Schema. Runs as part of the "cli"
- * Vitest project.
+ * Checked-in config files are validated by scripts/validate-configs.mts. This
+ * suite protects schema behavior without coupling it to those config values.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import Ajv, { type ValidateFunction } from "ajv/dist/2020.js";
+import type { ValidateFunction } from "ajv/dist/2020.js";
 import { describe, expect, it } from "vitest";
-import YAML from "yaml";
 
-import { discoverTargets } from "../scripts/validate-configs";
-
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-
-function repoPath(...segments: string[]): string {
-  return join(REPO_ROOT, ...segments);
-}
+import { compileConfigSchema, discoverTargets } from "../scripts/validate-configs.mts";
 
 type LooseScalar = string | number | boolean | null;
 type LooseValue = LooseScalar | LooseObject | LooseValue[];
 type LooseObject = { [key: string]: LooseValue };
-
-function parseJson<T>(text: string): T {
-  return JSON.parse(text);
-}
 
 function isLooseValue(value: LooseValue | object | undefined): value is LooseValue {
   if (value === null) return true;
@@ -52,26 +37,8 @@ function isLooseObject(value: LooseValue | object | undefined): value is LooseOb
   );
 }
 
-function loadYAML(path: string): LooseObject {
-  const parsed = YAML.parse(readFileSync(path, "utf-8"));
-  if (!isLooseObject(parsed)) {
-    throw new Error(`Expected YAML object in ${path}`);
-  }
-  return parsed;
-}
-
-function loadJSON(path: string): LooseObject {
-  const parsed = parseJson<LooseValue>(readFileSync(path, "utf-8"));
-  if (!isLooseObject(parsed)) {
-    throw new Error(`Expected JSON object in ${path}`);
-  }
-  return parsed;
-}
-
 function compileSchema(schemaRelPath: string): ValidateFunction {
-  const ajv = new Ajv({ allErrors: true, strict: false });
-  const schema = loadJSON(repoPath(schemaRelPath));
-  return ajv.compile(schema);
+  return compileConfigSchema(schemaRelPath);
 }
 
 function asRecord(value: LooseValue | undefined): LooseObject {
@@ -289,22 +256,85 @@ describe("config validation target discovery", () => {
   });
 });
 
-// ── Onboard performance budget ──────────────────────────────────────────────
+describe("network-policy.schema.json", () => {
+  const validate = compileSchema("schemas/network-policy.schema.json");
 
-describe("onboard-config.schema.json", () => {
-  const validate = compileSchema("schemas/onboard-config.schema.json");
-  const data = loadJSON(repoPath("ci/onboard-performance-budget.json"));
-
-  it("onboard-performance-budget.json passes schema validation", () => {
-    expectValid(validate, data, "onboard-performance-budget.json");
+  it("accepts a valid policy map as a direct validation target", () => {
+    expect(
+      validate({
+        test_service: {
+          name: "Test Service",
+          binaries: [{ path: "/usr/bin/node" }],
+          endpoints: [{ host: "api.example.com", port: 443, access: "full" }],
+        },
+      }),
+    ).toBe(true);
   });
 
-  it("rejects invalid threshold shapes", () => {
-    const bad = {
-      ...cloneObject(data),
-      regressionWarning: { minDeltaMs: -1, minPercent: 20 },
-    };
-    expect(validate(bad)).toBe(false);
+  it("accepts an OpenShell hostless L4 endpoint with explicit address ranges", () => {
+    expect(
+      validate({
+        open_internet: {
+          name: "Open internet",
+          binaries: [{ path: "/**" }],
+          endpoints: [
+            {
+              ports: [80, 443],
+              allowed_ips: ["1.0.0.0/8", "2000::/3"],
+            },
+          ],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects a hostless endpoint without explicit address ranges", () => {
+    expect(
+      validate({
+        invalid: {
+          name: "Invalid",
+          binaries: [{ path: "/**" }],
+          endpoints: [{ port: 443 }],
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects an endpoint that declares both port forms", () => {
+    expect(
+      validate({
+        invalid: {
+          name: "Invalid",
+          binaries: [{ path: "/**" }],
+          endpoints: [{ host: "api.example.com", port: 443, ports: [80, 443] }],
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it.each([
+    ["an empty policy map", {}],
+    ["an unrelated object", { unrelated: true }],
+    [
+      "a policy entry without endpoints",
+      {
+        test_service: {
+          name: "Test Service",
+          binaries: [{ path: "/usr/bin/node" }],
+        },
+      },
+    ],
+    [
+      "a policy entry without binaries",
+      {
+        test_service: {
+          name: "Test Service",
+          endpoints: [{ host: "api.example.com", port: 443 }],
+        },
+      },
+    ],
+  ])("rejects %s", (_label, invalid) => {
+    expect(validate(invalid)).toBe(false);
   });
 });
 
@@ -312,30 +342,41 @@ describe("onboard-config.schema.json", () => {
 
 describe("blueprint.schema.json", () => {
   const validate = compileSchema("schemas/blueprint.schema.json");
-  const data = loadYAML(repoPath("nemoclaw-blueprint/blueprint.yaml"));
+  const validBlueprint = {
+    version: "1.0.0",
+    profiles: ["default"],
+    components: {
+      sandbox: { image: "example.invalid/nemoclaw:fixture", name: "fixture" },
+      inference: {
+        profiles: {
+          default: { provider_type: "openai", endpoint: "https://api.example.com" },
+        },
+      },
+    },
+  };
 
-  it("blueprint.yaml passes schema validation", () => {
-    expectValid(validate, data, "blueprint.yaml");
+  it("accepts a minimal blueprint", () => {
+    expectValid(validate, validBlueprint, "minimal blueprint");
   });
 
   it("rejects blueprint with missing required field", () => {
-    const bad = cloneObject(data);
+    const bad = cloneObject(validBlueprint);
     delete bad.version;
     expect(validate(bad)).toBe(false);
   });
 
   it("rejects blueprint with wrong type for version", () => {
-    const bad = { ...cloneObject(data), version: 123 };
+    const bad = { ...validBlueprint, version: 123 };
     expect(validate(bad)).toBe(false);
   });
 
   it("rejects blueprint with unknown top-level property", () => {
-    const bad = { ...cloneObject(data), unknownField: true };
+    const bad = { ...validBlueprint, unknownField: true };
     expect(validate(bad)).toBe(false);
   });
 
   it("rejects blueprint with unknown nested component property", () => {
-    const root = asRecord(data);
+    const root = asRecord(validBlueprint);
     const components = asRecord(root.components);
     const inference = asRecord(components.inference);
     const bad = {
@@ -352,7 +393,7 @@ describe("blueprint.schema.json", () => {
   });
 
   it("rejects blueprint inference profile with unknown property", () => {
-    const root = asRecord(data);
+    const root = asRecord(validBlueprint);
     const components = asRecord(root.components);
     const inference = asRecord(components.inference);
     const profiles = asRecord(inference.profiles);
@@ -406,20 +447,38 @@ describe("blueprint.schema.json", () => {
 
 describe("router-pool-config.schema.json", () => {
   const validate = compileSchema("schemas/router-pool-config.schema.json");
-  const data = loadYAML(repoPath("nemoclaw-blueprint/router/pool-config.yaml"));
+  const validRouterPoolConfig = {
+    routing: {
+      method: "fixture",
+      checkpoint: "fixture",
+      tolerance: 0.5,
+      encoder: "fixture",
+      encoder_backend: "fixture",
+    },
+    models: [
+      {
+        name: "fixture",
+        display_name: "Fixture",
+        litellm_model: "openai/fixture",
+        cost_per_m_input_tokens: 0,
+        cost_per_m_output_tokens: 0,
+        api_base: "https://api.example.com/v1",
+      },
+    ],
+  };
 
-  it("pool-config.yaml passes schema validation", () => {
-    expectValid(validate, data, "pool-config.yaml");
+  it("accepts a minimal router pool config", () => {
+    expectValid(validate, validRouterPoolConfig, "minimal router pool config");
   });
 
   it("rejects router pool config without routing settings", () => {
-    const bad = cloneObject(data);
+    const bad = cloneObject(validRouterPoolConfig);
     delete bad.routing;
     expect(validate(bad)).toBe(false);
   });
 
   it("rejects router pool config models without LiteLLM model IDs", () => {
-    const root = asRecord(data);
+    const root = asRecord(validRouterPoolConfig);
     const firstModel = asRecord(Array.isArray(root.models) ? root.models[0] : undefined);
     const { litellm_model: _litellmModel, ...modelWithoutId } = firstModel;
     const bad = { ...root, models: [modelWithoutId] };
@@ -427,7 +486,7 @@ describe("router-pool-config.schema.json", () => {
   });
 
   it("rejects router pool config api_base without HTTPS", () => {
-    const root = asRecord(data);
+    const root = asRecord(validRouterPoolConfig);
     const firstModel = asRecord(Array.isArray(root.models) ? root.models[0] : undefined);
     const bad = {
       ...root,
@@ -442,40 +501,29 @@ describe("router-pool-config.schema.json", () => {
 describe("sandbox-policy.schema.json", () => {
   const validate = compileSchema("schemas/sandbox-policy.schema.json");
   registerOpenShellJsonRpcMcpMatcherTests("sandbox", validate);
-  const data = loadYAML(repoPath("nemoclaw-blueprint/policies/openclaw-sandbox.yaml"));
+  const validSandboxPolicy = {
+    version: 1,
+    network_policies: {
+      test_service: {
+        name: "Test Service",
+        binaries: [{ path: "/usr/bin/node" }],
+        endpoints: [{ host: "api.example.com", port: 443, access: "full" }],
+      },
+    },
+  };
 
-  it("openclaw-sandbox.yaml passes schema validation", () => {
-    expectValid(validate, data, "openclaw-sandbox.yaml");
+  it("accepts a minimal sandbox policy", () => {
+    expectValid(validate, validSandboxPolicy, "minimal sandbox policy");
   });
-
-  it("openclaw-sandbox-permissive.yaml passes schema validation", () => {
-    expectValid(
-      validate,
-      loadYAML(repoPath("nemoclaw-blueprint/policies/openclaw-sandbox-permissive.yaml")),
-      "openclaw-sandbox-permissive.yaml",
-    );
-  });
-
-  for (const file of [
-    "agents/openclaw/policy-permissive.yaml",
-    "agents/hermes/policy-additions.yaml",
-    "agents/hermes/policy-permissive.yaml",
-  ]) {
-    if (existsSync(repoPath(file))) {
-      it(`${file} passes schema validation`, () => {
-        expectValid(validate, loadYAML(repoPath(file)), file);
-      });
-    }
-  }
 
   it("rejects policy with missing network_policies", () => {
-    const bad = cloneObject(data);
+    const bad = cloneObject(validSandboxPolicy);
     delete bad.network_policies;
     expect(validate(bad)).toBe(false);
   });
 
   it("rejects policy with unknown top-level property", () => {
-    const bad = { ...cloneObject(data), extra: true };
+    const bad = { ...validSandboxPolicy, extra: true };
     expect(validate(bad)).toBe(false);
   });
 
@@ -852,16 +900,20 @@ describe("sandbox-policy.schema.json", () => {
 describe("policy-preset.schema.json", () => {
   const validate = compileSchema("schemas/policy-preset.schema.json");
   registerOpenShellJsonRpcMcpMatcherTests("preset", validate);
-  const presetFiles =
-    discoverTargets().find((target) => target.schema === "schemas/policy-preset.schema.json")
-      ?.files ?? [];
+  const validPolicyPreset = {
+    preset: { name: "test", description: "Test preset" },
+    network_policies: {
+      test_service: {
+        name: "Test Service",
+        binaries: [{ path: "/usr/bin/node" }],
+        endpoints: [{ host: "api.example.com", port: 443, access: "full" }],
+      },
+    },
+  };
 
-  for (const file of presetFiles) {
-    it(`${file} passes schema validation`, () => {
-      const data = loadYAML(repoPath(file));
-      expectValid(validate, data, file);
-    });
-  }
+  it("accepts a minimal policy preset", () => {
+    expectValid(validate, validPolicyPreset, "minimal policy preset");
+  });
 
   it("rejects preset without preset metadata", () => {
     const bad = {
@@ -1255,7 +1307,6 @@ describe("policy-preset.schema.json", () => {
 
 describe("openclaw-plugin.schema.json", () => {
   const validate = compileSchema("schemas/openclaw-plugin.schema.json");
-  const data = loadJSON(repoPath("nemoclaw/openclaw.plugin.json"));
   const validPluginFixture = {
     id: "fixture-plugin",
     name: "Fixture Plugin",
@@ -1266,12 +1317,8 @@ describe("openclaw-plugin.schema.json", () => {
     activation: { onStartup: true },
   };
 
-  it("openclaw.plugin.json passes schema validation", () => {
-    expectValid(validate, data, "openclaw.plugin.json");
-  });
-
-  it("accepts runtime slash activation metadata", () => {
-    expectValid(validate, validPluginFixture, "runtime slash activation fixture");
+  it("accepts a minimal plugin manifest with runtime slash activation", () => {
+    expectValid(validate, validPluginFixture, "minimal plugin manifest");
   });
 
   it("rejects command alias without kind", () => {
@@ -1308,17 +1355,54 @@ describe("openclaw-plugin.schema.json", () => {
 
 describe("model-specific-setup/schema.json", () => {
   const validate = compileSchema("nemoclaw-blueprint/model-specific-setup/schema.json");
-  const data = loadJSON(
-    repoPath("nemoclaw-blueprint/model-specific-setup/openclaw/kimi-k2.6-managed-inference.json"),
-  );
+  const exactModelFixture = {
+    id: "fixture-openclaw-exact",
+    agent: "openclaw",
+    description: "Fixture OpenClaw setup",
+    match: { modelIds: ["fixture/model"] },
+    effects: { openclawCompat: {} },
+  };
+  const modelFamilyFixture = {
+    id: "fixture-openclaw-family",
+    agent: "openclaw",
+    description: "Fixture OpenClaw model family setup",
+    match: { modelIdPrefixes: ["fixture"] },
+    effects: { openclawCompat: {} },
+  };
 
-  it("accepts the OpenClaw Kimi manifest", () => {
-    expectValid(validate, data, "kimi-k2.6-managed-inference.json");
+  it("accepts an exact OpenClaw model selector", () => {
+    expectValid(validate, exactModelFixture, "exact OpenClaw model selector");
+  });
+
+  it("accepts a bounded OpenClaw model-family prefix", () => {
+    expectValid(validate, modelFamilyFixture, "OpenClaw model-family prefix");
+  });
+
+  it("rejects ambiguous exact and prefix model selectors", () => {
+    const bad = {
+      ...cloneObject(modelFamilyFixture),
+      match: {
+        ...asRecord(modelFamilyFixture.match),
+        modelIds: ["fixture/model"],
+      },
+    };
+    expect(validate(bad)).toBe(false);
+  });
+
+  it("rejects namespaced model-family prefixes", () => {
+    const bad = {
+      ...cloneObject(modelFamilyFixture),
+      match: {
+        ...asRecord(modelFamilyFixture.match),
+        modelIdPrefixes: ["provider/fixture"],
+      },
+    };
+    expect(validate(bad)).toBe(false);
   });
 
   it("rejects OpenClaw manifests with Hermes effects", () => {
     const bad = {
-      ...cloneObject(data),
+      ...cloneObject(exactModelFixture),
       effects: {
         hermesCompat: {
           future: true,
@@ -1330,7 +1414,7 @@ describe("model-specific-setup/schema.json", () => {
 
   it("rejects manifests with empty match objects", () => {
     const bad = {
-      ...cloneObject(data),
+      ...cloneObject(exactModelFixture),
       match: {},
     };
     expect(validate(bad)).toBe(false);
@@ -1338,7 +1422,7 @@ describe("model-specific-setup/schema.json", () => {
 
   it("rejects whitespace-only manifest strings", () => {
     const bad = {
-      ...cloneObject(data),
+      ...cloneObject(exactModelFixture),
       description: "   ",
       match: {
         modelIds: ["   "],
@@ -1356,7 +1440,7 @@ describe("model-specific-setup/schema.json", () => {
       ["openclaw-plugins/fixture", "/usr/local/share/nemoclaw/openclaw-plugins/subdir/../escape"],
     ]) {
       const bad = {
-        ...cloneObject(data),
+        ...cloneObject(exactModelFixture),
         effects: {
           openclawPlugins: [
             {
@@ -1373,7 +1457,7 @@ describe("model-specific-setup/schema.json", () => {
 
   it("accepts OpenClaw plugin paths inside the staged plugin trees", () => {
     const valid = {
-      ...cloneObject(data),
+      ...cloneObject(exactModelFixture),
       effects: {
         openclawPlugins: [
           {

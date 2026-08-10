@@ -59,6 +59,54 @@ function publicLookup() {
   return vi.fn(async () => [{ address: "8.8.8.8", family: 4 }]);
 }
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+describe("setupHermesProviderInference smoke verification", () => {
+  it("waits for the smoke check before persisting or logging success (#3771)", async () => {
+    const smoke = deferred();
+    const deps = makeDeps({
+      isNonInteractive: vi.fn(() => true),
+      verifyOnboardInferenceSmoke: vi.fn(() => smoke.promise),
+    });
+
+    const setup = setupHermesProviderInference(makeArgs(null), deps as never);
+
+    expect(deps.verifyOnboardInferenceSmoke).toHaveBeenCalledOnce();
+    expect(deps.registry.updateSandbox).not.toHaveBeenCalled();
+    expect(deps.log).not.toHaveBeenCalled();
+
+    smoke.resolve();
+    await expect(setup).resolves.toEqual({ ok: true });
+
+    expect(deps.registry.updateSandbox).toHaveBeenCalledWith("alpha", {
+      model: "m",
+      provider: "p",
+    });
+    expect(deps.log).toHaveBeenCalledWith("  ✓ Inference route set: p / m");
+  });
+
+  it("rejects setup without persisting or logging success when the smoke check rejects (#3771)", async () => {
+    const smokeError = new Error("Hermes smoke failed");
+    const deps = makeDeps({
+      isNonInteractive: vi.fn(() => true),
+      verifyOnboardInferenceSmoke: vi.fn(() => Promise.reject(smokeError)),
+    });
+
+    await expect(setupHermesProviderInference(makeArgs(null), deps as never)).rejects.toThrow(
+      smokeError,
+    );
+
+    expect(deps.registry.updateSandbox).not.toHaveBeenCalled();
+    expect(deps.log).not.toHaveBeenCalled();
+  });
+});
+
 describe("setupHermesProviderInference SSRF guard (#6072)", () => {
   it("rejects loopback address", async () => {
     await expect(
@@ -229,6 +277,33 @@ describe("setupHermesProviderInference SSRF guard (#6072)", () => {
       setupHermesProviderInference(makeArgs("https://8.8.8.8/v1"), deps as never),
     ).resolves.toEqual({ ok: true });
     expect(deps.runOpenshell).toHaveBeenCalled();
+  });
+
+  it("accepts the exact OpenShell host bridge endpoint without DNS lookup (#7453)", async () => {
+    const lookup = vi.fn(async () => {
+      throw new Error("lookup should not run for the OpenShell host bridge");
+    });
+    const deps = makeDeps({ lookup });
+
+    await expect(
+      setupHermesProviderInference(
+        makeArgs("http://host.openshell.internal:11434/v1"),
+        deps as never,
+      ),
+    ).resolves.toEqual({ ok: true });
+
+    expect(lookup).not.toHaveBeenCalled();
+    expect(deps.runOpenshell).toHaveBeenCalledWith(
+      ["inference", "set", "--no-verify", "--provider", "p", "--model", "m"],
+      { ignoreError: true },
+    );
+    expect(deps.verifyOnboardInferenceSmoke).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: "p",
+        model: "m",
+        endpointUrl: "http://host.openshell.internal:11434/v1",
+      }),
+    );
   });
 
   it("rejects a public HTTPS hostname that resolves to a public IP until runtime-aware pinning exists (#4684)", async () => {

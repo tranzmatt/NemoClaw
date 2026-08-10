@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { describe, expect, it } from "vitest";
+import { markPhaseActivity } from "../../core/phase-activity";
+import { markPromptActive } from "../../core/prompt-activity";
 import {
   createPhaseProgressReporter,
   ONBOARD_PHASE_LABELS,
@@ -118,6 +120,66 @@ describe("phase progress", () => {
       )
       .run("ctx");
     expect(state.timerCallback).not.toBeNull();
+  });
+
+  it("holds heartbeats while an interactive prompt owns the terminal (#6651)", async () => {
+    let promptActive = false;
+    const { reporter, state } = createHarness({ isPromptActive: () => promptActive });
+    const wrapped = reporter.wrap(
+      phase("sandbox", async (context) => {
+        state.clockMs = 30_000;
+        promptActive = true;
+        state.timerCallback?.();
+        promptActive = false;
+        state.clockMs = 60_000;
+        state.timerCallback?.();
+        return { context, result: advanceTo("agent_setup") };
+      }),
+    );
+
+    await wrapped.run("ctx");
+
+    expect(state.lines).toEqual(["  ⏳ Still working on Sandbox creation… (60s elapsed)"]);
+  });
+
+  it("pauses heartbeats through the shared prompt-activity registry by default (#6651)", async () => {
+    const { reporter, state } = createHarness();
+    const wrapped = reporter.wrap(
+      phase("sandbox", async (context) => {
+        state.clockMs = 30_000;
+        const releasePromptActivity = markPromptActive();
+        state.timerCallback?.();
+        releasePromptActivity();
+        state.timerCallback?.();
+        return { context, result: advanceTo("agent_setup") };
+      }),
+    );
+
+    await wrapped.run("ctx");
+
+    expect(state.lines).toEqual(["  ⏳ Still working on Sandbox creation… (30s elapsed)"]);
+  });
+
+  it("names a registered long-running sub-stage instead of the phase label (#7156)", async () => {
+    const { reporter, state } = createHarness({ interactive: false });
+    const wrapped = reporter.wrap(
+      phase("provider_selection", async (context) => {
+        state.clockMs = 30_000;
+        const releasePhaseActivity = markPhaseActivity("vLLM install");
+        state.timerCallback?.();
+        releasePhaseActivity();
+        state.clockMs = 60_000;
+        state.timerCallback?.();
+        return { context, result: advanceTo("inference") };
+      }),
+    );
+
+    await wrapped.run("ctx");
+
+    expect(state.lines).toEqual([
+      "  ⏳ Still working on vLLM install… (30s elapsed)",
+      "  ⏳ Still working on Provider selection… (60s elapsed)",
+    ]);
   });
 
   it("clears the timer and preserves the phase error", async () => {

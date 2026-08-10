@@ -18,6 +18,12 @@ describe("gateway restart failure markers", () => {
       [string, ReturnType<typeof classifyGatewayRestartFailure>["layer"]]
     > = [
       ["PRIVILEGED_CONTROL_UNAVAILABLE", "privileged control unavailable"],
+      ["SUPERVISOR_UNAVAILABLE", "privileged control unavailable"],
+      [
+        "SUPERVISOR_UNAVAILABLE\nNEMOCLAW_CONTROL_STAGE=await-replacement",
+        "supervisor unavailable",
+      ],
+      ["SUPERVISOR_NOT_RUNNING", "supervisor not running"],
       ["SUPERVISOR_REBUILD_REQUIRED", "privileged control unavailable"],
       ["SUPERVISOR_BUSY", "privileged control unavailable"],
       [MARKERS.SECRET_BOUNDARY_REFUSED, "secret-boundary refusal"],
@@ -43,6 +49,48 @@ describe("gateway restart failure markers", () => {
         }),
       ).toMatchObject({ layer });
     }
+  });
+});
+
+describe("gateway restart failure classification precedence", () => {
+  function classify(stdout: string, stderr = "") {
+    return classifyGatewayRestartFailure({ status: 1, stdout, stderr });
+  }
+
+  it.each([
+    ["SUPERVISOR_NOT_RUNNING", "supervisor not running"],
+    [MARKERS.SECRET_BOUNDARY_REFUSED, "secret-boundary refusal"],
+    [MARKERS.GATEWAY_UNSAFE_CONFIG_PATH, "unsafe config path"],
+    ["HERMES_MCP_CONFIG_DRIFT", "MCP reconciliation refusal"],
+    ["HERMES_CONFIG_HASH_MISMATCH", "config hash mismatch"],
+  ] as const)("classifies %s ahead of the health timeout it causes", (marker, layer) => {
+    expect(classify([marker, "GATEWAY_HEALTH_TIMEOUT"].join("\n"))).toMatchObject({ layer });
+  });
+
+  it("classifies a stopped supervisor ahead of the generic control-unavailable markers", () => {
+    expect(classify(["SUPERVISOR_NOT_RUNNING", "SUPERVISOR_UNAVAILABLE"].join("\n"))).toMatchObject(
+      { layer: "supervisor not running" },
+    );
+  });
+
+  it("keeps the replacement-stage layer when a generic control marker co-occurs", () => {
+    const output = [
+      "SUPERVISOR_UNAVAILABLE",
+      "NEMOCLAW_CONTROL_STAGE=await-replacement",
+      "SUPERVISOR_BUSY",
+    ].join("\n");
+    expect(classify(output)).toMatchObject({ layer: "supervisor unavailable" });
+  });
+
+  it("classifies MCP drift ahead of the config hash mismatch reported with it", () => {
+    const output = ["HERMES_MCP_CONFIG_DRIFT", "HERMES_CONFIG_HASH_MISMATCH"].join("\n");
+    expect(classify(output)).toMatchObject({ layer: "MCP reconciliation refusal" });
+  });
+
+  it("applies the same precedence when markers split across stdout and stderr", () => {
+    expect(classify("GATEWAY_HEALTH_TIMEOUT", "SUPERVISOR_NOT_RUNNING")).toMatchObject({
+      layer: "supervisor not running",
+    });
   });
 });
 
@@ -119,7 +167,7 @@ describe("restartSandboxGateway — host-mediated gateway restart", () => {
     }
   });
 
-  it("uses the injected supervisor action for the managed settle probe", () => {
+  it("uses the injected supervisor action for managed settle probes", () => {
     const restore = silenceConsole();
     const previousSettleSeconds = process.env.NEMOCLAW_GATEWAY_RECOVERY_SETTLE_SECONDS;
     process.env.NEMOCLAW_GATEWAY_RECOVERY_SETTLE_SECONDS = "0.001";
@@ -144,6 +192,7 @@ describe("restartSandboxGateway — host-mediated gateway restart", () => {
       expect(result).toMatchObject({ ok: true, restarted: true, healthPassed: true });
       expect(requestGatewaySupervisorAction.mock.calls).toEqual([
         ["alpha", "restart", 210000],
+        ["alpha", "probe"],
         ["alpha", "probe"],
       ]);
     } finally {
@@ -177,6 +226,36 @@ describe("restartSandboxGateway — host-mediated gateway restart", () => {
         ok: false,
         failureLayer: "privileged control unavailable",
       });
+    } finally {
+      restore();
+    }
+  });
+
+  it("distinguishes a supervisor that becomes unavailable during replacement (#7484)", () => {
+    const restore = silenceConsole();
+    try {
+      const deps = baseDeps({
+        requestGatewaySupervisorAction: vi.fn(() => ({
+          status: 1,
+          stdout: "",
+          stderr: [
+            "SUPERVISOR_UNAVAILABLE",
+            "NEMOCLAW_CONTROL_STAGE=await-replacement",
+            "NEMOCLAW_SUPERVISOR_PID=40",
+            "NEMOCLAW_GATEWAY_PID=0",
+          ].join("\n"),
+        })),
+      });
+      const result = restartSandboxGateway("alpha", { quiet: true, deps });
+
+      expect(result).toMatchObject({
+        ok: false,
+        failureLayer: "supervisor unavailable",
+        detail: expect.stringContaining("NEMOCLAW_CONTROL_STAGE=await-replacement"),
+      });
+      expect(console.error).toHaveBeenCalledWith(
+        "  Failure layer: supervisor unavailable - gateway restart failed for 'alpha'.",
+      );
     } finally {
       restore();
     }
@@ -260,6 +339,57 @@ describe("restartSandboxGateway — host-mediated gateway restart", () => {
     }
   });
 
+  it("prints bounded redacted evidence for a Hermes health timeout (#7484)", () => {
+    const restore = silenceConsole();
+    try {
+      const deps = baseDeps({
+        requestGatewaySupervisorAction: vi.fn(() => ({
+          status: 1,
+          stdout: "",
+          stderr: [
+            "GATEWAY_HEALTH_TIMEOUT",
+            "NEMOCLAW_CONTROL_STAGE=await-replacement",
+            "NEMOCLAW_SUPERVISOR_PID=40",
+            "NEMOCLAW_GATEWAY_PID=5252",
+            "\u001b[31mNEMOCLAW_START_LOG=[gateway] Hermes gateway launch failed; token=sk-review-secret\u0007",
+            "NEMOCLAW_START_LOG=[gateway] Hermes URL https://user:password@example.test/path?token=query-secret",
+            "NEMOCLAW_START_LOG=[gateway] Hermes HF_TOKEN=hf-review-secret",
+            ...Array.from(
+              { length: 15 },
+              (_, index) => `NEMOCLAW_START_LOG=[gateway] Hermes bounded marker ${index}`,
+            ),
+          ].join("\n"),
+        })),
+      });
+      const result = restartSandboxGateway("alpha", { deps });
+
+      expect(result).toMatchObject({
+        ok: false,
+        failureLayer: "health timeout",
+        detail: expect.stringContaining("NEMOCLAW_GATEWAY_PID=5252"),
+      });
+      expect(result.ok).toBe(false);
+      const detail = (result as Extract<typeof result, { ok: false }>).detail;
+      expect(detail).toContain("token=<REDACTED>");
+      expect(detail).toContain("HF_TOKEN=<REDACTED>");
+      expect(detail).not.toContain("sk-review-secret");
+      expect(detail).not.toContain("password");
+      expect(detail).not.toContain("query-secret");
+      expect(detail).not.toContain("hf-review-secret");
+      expect(detail).not.toContain("\u001b");
+      expect(detail).not.toContain("\u0007");
+      const errorOutput = vi.mocked(console.error).mock.calls.join("\n");
+      expect(vi.mocked(console.error).mock.calls).toHaveLength(13);
+      expect(errorOutput).toContain("NEMOCLAW_START_LOG=[gateway] Hermes bounded marker 14");
+      expect(errorOutput).not.toContain("NEMOCLAW_START_LOG=[gateway] Hermes bounded marker 2");
+      expect(errorOutput).not.toContain("sk-review-secret");
+      expect(errorOutput).not.toContain("query-secret");
+      expect(errorOutput).not.toContain("hf-review-secret");
+    } finally {
+      restore();
+    }
+  });
+
   it("reports a health timeout after the restart process marker", () => {
     const restore = silenceConsole();
     try {
@@ -321,6 +451,118 @@ describe("restartSandboxGateway — host-mediated gateway restart", () => {
       });
       expect(console.log).not.toHaveBeenCalledWith(
         expect.stringContaining("Gateway restarted; health passed"),
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("reports every failed auxiliary forward in declaration order", () => {
+    const restore = silenceConsole();
+    try {
+      const deps = baseDeps({
+        ensureHermesDashboardPortForwardIfEnabled: vi.fn(() => false),
+        recoverMessagingHostForward: vi.fn(() => false),
+        recoverDeclaredAgentForwardPorts: vi.fn(() => false),
+      });
+      const result = restartSandboxGateway("alpha", { deps });
+
+      expect(result).toMatchObject({ ok: false, failureLayer: "forward recovery failure" });
+      expect(result.ok).toBe(false);
+      const failure = result as Extract<typeof result, { ok: false }>;
+      expect(failure.detail).toBe(
+        "gateway health passed but the Hermes dashboard host forward, " +
+          "the messaging webhook host forward, one or more agent-declared host forwards " +
+          "could not be re-established",
+      );
+      const errorOutput = vi.mocked(console.error).mock.calls.join("\n");
+      expect(errorOutput).toContain(
+        "the Hermes dashboard host forward, the messaging webhook host forward, " +
+          "one or more agent-declared host forwards",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("omits recovered and not-enabled auxiliary forwards from the failure detail", () => {
+    const restore = silenceConsole();
+    try {
+      const deps = baseDeps({
+        ensureHermesDashboardPortForwardIfEnabled: vi.fn(() => true),
+        recoverMessagingHostForward: vi.fn(() => false),
+        recoverDeclaredAgentForwardPorts: vi.fn(() => null),
+      });
+      const result = restartSandboxGateway("alpha", { deps });
+
+      expect(result).toMatchObject({ ok: false, failureLayer: "forward recovery failure" });
+      expect(result.ok).toBe(false);
+      const failure = result as Extract<typeof result, { ok: false }>;
+      expect(failure.detail).toBe(
+        "gateway health passed but the messaging webhook host forward could not be re-established",
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("reports the agent-declared host forwards when only their recovery fails", () => {
+    const restore = silenceConsole();
+    try {
+      const deps = baseDeps({
+        recoverDeclaredAgentForwardPorts: vi.fn(() => false),
+      });
+      const result = restartSandboxGateway("alpha", { deps });
+
+      expect(result).toMatchObject({
+        ok: false,
+        failureLayer: "forward recovery failure",
+        detail:
+          "gateway health passed but one or more agent-declared host forwards could not be re-established",
+      });
+    } finally {
+      restore();
+    }
+  });
+
+  it("returns a recovered result when no auxiliary forward is enabled", () => {
+    const restore = silenceConsole();
+    try {
+      const deps = baseDeps();
+      const result = restartSandboxGateway("alpha", { deps });
+
+      expect(result).toEqual({
+        ok: true,
+        restarted: true,
+        healthPassed: true,
+        forwardRecovered: true,
+      });
+      expect(console.error).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it("reports the primary forward failure ahead of failed auxiliary forwards", () => {
+    const restore = silenceConsole();
+    try {
+      const deps = baseDeps({
+        ensureSandboxPortForward: vi.fn(() => false),
+        ensureHermesDashboardPortForwardIfEnabled: vi.fn(() => false),
+        recoverMessagingHostForward: vi.fn(() => false),
+        recoverDeclaredAgentForwardPorts: vi.fn(() => false),
+      });
+      const result = restartSandboxGateway("alpha", { deps });
+
+      expect(result).toMatchObject({
+        ok: false,
+        failureLayer: "forward recovery failure",
+        detail:
+          "gateway health passed but the primary dashboard/API host forward could not be re-established",
+      });
+      expect(result.ok).toBe(false);
+      expect((result as Extract<typeof result, { ok: false }>).detail).not.toContain(
+        "messaging webhook",
       );
     } finally {
       restore();

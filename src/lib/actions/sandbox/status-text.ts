@@ -5,8 +5,17 @@ import { resolveOpenshell } from "../../adapters/openshell/resolve";
 import * as agentRuntime from "../../agent/runtime";
 import { CLI_NAME } from "../../cli/branding";
 import { D, G, R, RD, YW } from "../../cli/terminal-style";
+import { shellQuote } from "../../core/shell-quote";
+import { formatInferenceRouteDriftForDisplay } from "../../inference/config";
 import type { ProviderHealthStatus } from "../../inference/health";
 import * as nim from "../../inference/nim";
+import { getEffectiveReasoningEffort } from "../../inference/selection";
+import { buildSshForwardHintLines } from "../../onboard/ssh-forward-hint";
+import { getBaselineExclusionRuntimeStatus } from "../../policy";
+import {
+  BASELINE_EXCLUSION_SUPPORT_IMPACT,
+  type BaselineExclusionRuntimeStatus,
+} from "../../policy/baseline-exclusion";
 import * as sandboxVersion from "../../sandbox/version";
 import * as shields from "../../shields";
 import type { SandboxEntry, SandboxGpuProofResult } from "../../state/registry";
@@ -16,8 +25,15 @@ import {
 } from "../../state/sandbox-session";
 import type { SandboxDockerRuntime } from "./docker-health";
 import type { SandboxGatewayState } from "./gateway-state";
-import { isSandboxGatewayRunningForStatus } from "./process-recovery";
-import type { SandboxStatusAgentInfo, SandboxStatusSnapshot } from "./status-snapshot";
+import { isSandboxGatewayRunningForStatus } from "./status/process-recovery";
+import {
+  isInferenceHealthFailing,
+  resolveSandboxStatusDcodeAutoApprovalMode,
+  type SandboxStatusAgentInfo,
+  type SandboxStatusRouteDrift,
+  type SandboxStatusSnapshot,
+  type ServingProcessHealth,
+} from "./status-snapshot";
 
 export interface SandboxStatusTextContext
   extends Pick<
@@ -26,8 +42,10 @@ export interface SandboxStatusTextContext
     | "lookup"
     | "currentModel"
     | "currentProvider"
+    | "routeDrift"
     | "inferenceHealth"
     | "terminalRuntimeHealth"
+    | "servingProcessHealth"
   > {
   sandboxName: string;
   statusAgent: SandboxStatusAgentInfo;
@@ -35,6 +53,42 @@ export interface SandboxStatusTextContext
 
 export interface SandboxStatusTextOutcome {
   exitCode: number | null;
+}
+
+function describeBaselineExclusionStatus(status: BaselineExclusionRuntimeStatus): string {
+  switch (status) {
+    case "excluded":
+      return "live policy verified";
+    case "agent-changed":
+      return "approval belongs to another agent";
+    case "baseline-unreadable":
+      return "agent baseline unreadable";
+    case "content-changed":
+      return "baseline content changed";
+    case "no-longer-in-baseline":
+      return "key no longer in baseline";
+    case "live-policy-unreadable":
+      return "live policy unreadable";
+    case "live-policy-mismatch":
+      return "excluded key is present in live policy";
+  }
+}
+
+function printBaselineExclusions(sandboxName: string, sandbox: SandboxEntry): void {
+  if (!sandbox.baselineExclusions?.length) return;
+  console.log(
+    `    Baseline exclusions: ${sandbox.baselineExclusions.map((entry) => entry.key).join(", ")}`,
+  );
+  console.log(`      Support impact: ${BASELINE_EXCLUSION_SUPPORT_IMPACT}`);
+  console.log(
+    `      Review or restore with \`${CLI_NAME} ${sandboxName} policy list\` or \`${CLI_NAME} ${sandboxName} policy restore <key>\`.`,
+  );
+  for (const exclusion of sandbox.baselineExclusions) {
+    const status = getBaselineExclusionRuntimeStatus(sandboxName, exclusion);
+    if (status !== "excluded") {
+      console.log(`      ${YW}${exclusion.key}: ${describeBaselineExclusionStatus(status)}${R}`);
+    }
+  }
 }
 
 /** Returns true when status can validate an agent version against the running sandbox. */
@@ -79,11 +133,20 @@ function printInferenceProbeLine(probe: ProviderHealthStatus): void {
     return;
   }
   if (probe.ok) {
-    console.log(`    ${label}: ${G}healthy${R} (${probe.endpoint})`);
+    console.log(`    ${label}: ${G}${probe.okLabel ?? "healthy"}${R} (${probe.endpoint})`);
     return;
   }
   console.log(`    ${label}: ${RD}${probe.failureLabel || "unreachable"}${R} (${probe.endpoint})`);
   console.log(`      ${probe.detail}`);
+}
+
+function printServingProcessHealth(
+  statusAgent: SandboxStatusAgentInfo,
+  health: ServingProcessHealth | null,
+): void {
+  if (!health) return;
+  const label = `Serving process (${statusAgent.agentDisplayName.toLowerCase()} gateway)`;
+  console.log(`    ${label}: ${D}not checked${R}`);
 }
 
 function printInferenceStatus(context: SandboxStatusTextContext): void {
@@ -96,6 +159,11 @@ function printInferenceStatus(context: SandboxStatusTextContext): void {
   if (context.lookup.state !== "present") {
     console.log("    Inference: not verified (gateway/sandbox state not verified)");
   }
+  printServingProcessHealth(context.statusAgent, context.servingProcessHealth);
+}
+
+function inferenceHealthExitCode(inferenceHealth: ProviderHealthStatus | null): number | null {
+  return isInferenceHealthFailing(inferenceHealth) ? 1 : null;
 }
 
 function getSandboxGpuDisplay(sandbox: SandboxEntry): {
@@ -161,8 +229,12 @@ function printTerminalHarness(context: SandboxStatusTextContext): number | null 
 }
 
 function printAgentHarness(context: SandboxStatusTextContext): number | null {
-  const { statusAgent } = context;
+  const { sb, statusAgent } = context;
   console.log(`    Harness:  ${statusAgent.agentDisplayName} (${statusAgent.agentRuntime})`);
+  const dcodeAutoApprovalMode = resolveSandboxStatusDcodeAutoApprovalMode(sb);
+  if (dcodeAutoApprovalMode) {
+    console.log(`    DCode auto-approval capability: ${dcodeAutoApprovalMode}`);
+  }
   if (statusAgent.agentLoadError) {
     console.log(`    Agent load error: ${statusAgent.agentLoadError}`);
   }
@@ -176,8 +248,8 @@ function printActiveSessions(sandboxName: string): void {
     const sessionResult = getActiveSandboxSessions(sandboxName, createSessionDeps(openshell));
     if (!sessionResult.detected) return;
     const count = sessionResult.sessions.length;
-    const connected = count > 0 ? `${G}yes${R} (${count} session${count > 1 ? "s" : ""})` : "no";
-    console.log(`    Connected: ${connected}`);
+    const sessions = count > 0 ? `${G}${count}${R}` : "none";
+    console.log(`    SSH sessions: ${sessions}`);
   } catch {
     // Session detection is informational; an unavailable OpenShell client must
     // not suppress the primary sandbox and gateway health report.
@@ -232,6 +304,38 @@ function printAgentVersion(context: SandboxStatusTextContext, sandbox: SandboxEn
   }
 }
 
+// The Model/Provider lines above show this sandbox's recorded route. The live
+// shared route can differ after another onboard, so report that drift
+// separately; wording mirrors the connect-time divergence warning (#3726).
+function printInferenceRouteDrift(
+  drift: SandboxStatusRouteDrift | null,
+  sandboxName: string,
+): void {
+  if (!drift) return;
+  const display = formatInferenceRouteDriftForDisplay(
+    drift.live,
+    drift.recorded,
+    "for this sandbox",
+  );
+  const { liveProvider, liveModel, recordedRoute } = display;
+  console.log(`    ${YW}Warning: ${display.warning}${R}`);
+  if (!drift.canConnect) {
+    console.log(
+      `    ${YW}The recorded route cannot be restored with ${CLI_NAME} connect while another registered sandbox uses different provider-global endpoint, API-family, or credential identity.${R}`,
+    );
+    console.log(
+      `    ${YW}Remove or re-onboard the conflicting sandbox before reconnecting '${sandboxName}'.${R}`,
+    );
+    return;
+  }
+  console.log(
+    `    ${YW}${CLI_NAME} ${shellQuote(sandboxName)} connect realigns the gateway to ${recordedRoute}; to adopt the live route instead:${R}`,
+  );
+  console.log(
+    `      ${CLI_NAME} inference set --provider ${shellQuote(liveProvider)} --model ${shellQuote(liveModel)} --sandbox ${shellQuote(sandboxName)}`,
+  );
+}
+
 /** Render registry-backed sandbox details and return any non-fatal degraded outcome. */
 export function printSandboxDetails(context: SandboxStatusTextContext): SandboxStatusTextOutcome {
   const { sb, currentModel, currentProvider, sandboxName } = context;
@@ -242,17 +346,53 @@ export function printSandboxDetails(context: SandboxStatusTextContext): SandboxS
   console.log(`  Sandbox: ${sb.name}`);
   console.log(`    Model:    ${currentModel}`);
   console.log(`    Provider: ${currentProvider}`);
+  if (sb.servingProfileProvenance) {
+    const provenance = sb.servingProfileProvenance;
+    console.log(`    Serving profile: ${provenance.preset.displayName} (${provenance.preset.id})`);
+    console.log(`    Serving recipe:  ${provenance.recipe.id}`);
+    console.log(`    Catalog digest:  ${provenance.catalogDigest}`);
+  }
+  const reasoningEffort = getEffectiveReasoningEffort(sb);
+  if (reasoningEffort) console.log(`    Reasoning effort: ${reasoningEffort}`);
+  printInferenceRouteDrift(context.routeDrift, sb.name);
   printInferenceStatus(context);
+  const inferenceExitCode = inferenceHealthExitCode(context.inferenceHealth);
   printSandboxGpuStatus(sb);
   console.log(
     `    OpenShell: ${sb.openshellVersion || "unknown"} (${sb.openshellDriver || "unknown"})`,
   );
   console.log(`    Policies: ${(sb.policies || []).join(", ") || "none"}`);
-  const exitCode = printAgentHarness(context);
+  printBaselineExclusions(sandboxName, sb);
+  if (sb.baselineExclusionTransition) {
+    const transition = sb.baselineExclusionTransition;
+    console.log(
+      `    Baseline policy repair required: interrupted ${transition.operation} for ${transition.exclusion.key} (rebuild blocked)`,
+    );
+    console.log(
+      `      Re-run \`${CLI_NAME} ${sandboxName} policy ${transition.operation} ${transition.exclusion.key}\` to reconcile live and durable state.`,
+    );
+  }
+  const agentExitCode = printAgentHarness(context);
   printActiveSessions(sandboxName);
   printShieldsPosture(sandboxName);
   printAgentVersion(context, sb);
-  return { exitCode };
+  return { exitCode: inferenceExitCode ?? agentExitCode };
+}
+
+// `status` does not print the dashboard URL, so direct SSH operators to
+// `dashboard-url` only when the shared SSH port forward check says the
+// dashboard still needs a loopback forward (#5925, #8465).
+function printDashboardRemoteAccessHint(context: SandboxStatusTextContext): void {
+  const { sandboxName, sb } = context;
+  const dashboardPort = sb?.dashboardPort;
+  if (!dashboardPort) return;
+  const accessUrl = sb?.dashboardRemoteBindPrepared
+    ? `http://0.0.0.0:${dashboardPort}`
+    : process.env.CHAT_UI_URL;
+  if (!buildSshForwardHintLines({ port: dashboardPort, accessUrl })) return;
+  console.log(
+    `      Remote access: run \`${CLI_NAME} ${shellQuote(sandboxName)} dashboard-url\` for SSH port forward instructions.`,
+  );
 }
 
 async function printGatewayProcessStatus(context: SandboxStatusTextContext): Promise<void> {
@@ -262,6 +402,7 @@ async function printGatewayProcessStatus(context: SandboxStatusTextContext): Pro
   const agentName = statusAgent.agentDisplayName;
   if (running) {
     console.log(`    ${agentName}: ${G}running${R}`);
+    printDashboardRemoteAccessHint(context);
     return;
   }
   console.log(`    ${agentName}: ${RD}not running${R}`);

@@ -697,31 +697,34 @@ EOF
       }
     });
 
-    it("bypasses shadowed ulimit functions for nproc and nofile enforcement and verification", () => {
-      const nprocLimit = process.platform === "darwin" ? 4000 : 4096;
-      const { stdout } = runWithLib(
-        [
-          `NEMOCLAW_SANDBOX_NPROC_LIMIT=${nprocLimit}`,
-          "ulimit() {",
-          '  case "$1:$#" in',
-          "    -Su:2 | -Hu:2 | -Sn:2 | -Hn:2) return 0 ;;",
-          "    -Su:1 | -Hu:1 | -Sn:1 | -Hn:1) printf '%s\\n' 999999; return 0 ;;",
-          "  esac",
-          "  return 0",
-          "}",
-          "harden_resource_limits --quiet",
-          "verify_resource_limits",
-          'printf "shadow=%s\\n" "$(type -t ulimit)"',
-          'printf "nproc=%s\\n" "$(builtin ulimit -u)"',
-          'printf "nofile=%s\\n" "$(builtin ulimit -n)"',
-        ].join("\n"),
-      );
-      expect(stdout).toContain("shadow=function");
-      expect(stdout).toContain(`nproc=${nprocLimit}`);
-      const nofile = Number(stdout.match(/nofile=(\d+)/)?.[1] ?? "NaN");
-      expect(nofile).toBeGreaterThan(0);
-      expect(nofile).toBeLessThanOrEqual(65536);
-    });
+    it.runIf(process.platform === "linux")(
+      "bypasses shadowed ulimit functions for nproc and nofile enforcement and verification",
+      () => {
+        const nprocLimit = 4096;
+        const { stdout } = runWithLib(
+          [
+            `NEMOCLAW_SANDBOX_NPROC_LIMIT=${nprocLimit}`,
+            "ulimit() {",
+            '  case "$1:$#" in',
+            "    -Su:2 | -Hu:2 | -Sn:2 | -Hn:2) return 0 ;;",
+            "    -Su:1 | -Hu:1 | -Sn:1 | -Hn:1) printf '%s\\n' 999999; return 0 ;;",
+            "  esac",
+            "  return 0",
+            "}",
+            "harden_resource_limits --quiet",
+            "verify_resource_limits",
+            'printf "shadow=%s\\n" "$(type -t ulimit)"',
+            'printf "nproc=%s\\n" "$(builtin ulimit -u)"',
+            'printf "nofile=%s\\n" "$(builtin ulimit -n)"',
+          ].join("\n"),
+        );
+        expect(stdout).toContain("shadow=function");
+        expect(stdout).toContain(`nproc=${nprocLimit}`);
+        const nofile = Number(stdout.match(/nofile=(\d+)/)?.[1] ?? "NaN");
+        expect(nofile).toBeGreaterThan(0);
+        expect(nofile).toBeLessThanOrEqual(65536);
+      },
+    );
 
     it("is best-effort: exits 0 and warns when ulimit fails", () => {
       const { stdout } = runWithLib(
@@ -770,7 +773,7 @@ EOF
 
     // SECURITY (#4527): the RLIMIT caps are only unraisable if they are set
     // while still root PID 1, BEFORE drop_capabilities (capsh) and the
-    // setpriv/gosu step-down. A refactor that moved the harden call after the
+    // setpriv step-down. A refactor that moved the harden call after the
     // privilege drop would turn it into dead code (cap set as the unprivileged
     // agent, hard limit no longer lowered) while every other test stayed green.
     // Pin the ordering so that regression is caught.
@@ -789,7 +792,7 @@ EOF
   });
 
   describe("init_step_down_prefixes", () => {
-    it("falls back to gosu when setpriv is unavailable", () => {
+    it("fails closed when setpriv is unavailable", () => {
       // Source-time init runs before our test body, so re-run it with a
       // PATH that hides setpriv and capsh to exercise the fallback.
       const { stdout, stderr } = runWithLib(
@@ -802,9 +805,19 @@ EOF
         ].join("\n"),
       );
       const combined = `${stdout}\n${stderr}`;
-      expect(combined).toContain("falling back to gosu");
-      expect(stdout).toContain("gosu\nsandbox");
-      expect(stdout).toContain("gosu\ngateway");
+      expect(combined).toContain("setpriv unavailable");
+      expect(stdout.match(/setpriv unavailable/g)?.length).toBeGreaterThanOrEqual(2);
+      expect(stdout).not.toContain("gosu");
+
+      const refusal = runWithLib(
+        [
+          "export PATH=/nonexistent",
+          "init_step_down_prefixes >/dev/null 2>&1",
+          '"${STEP_DOWN_PREFIX_SANDBOX[@]}" id',
+        ].join("\n"),
+        { expectFail: true },
+      );
+      expect(refusal.stderr).toContain("refusing to execute a root privilege transition");
     });
 
     it("uses setpriv with the issue-3280 bounding-set drop when available", () => {
@@ -822,7 +835,7 @@ EOF
           "STUB",
           'chmod +x "$TMP/setpriv" "$TMP/capsh"',
           'export PATH="$TMP:$PATH"',
-          "init_step_down_prefixes",
+          "init_step_down_prefixes 2>&1",
           "printf '%s\\n' \"${STEP_DOWN_PREFIX_SANDBOX[@]}\"",
           'echo "--"',
           "printf '%s\\n' \"${STEP_DOWN_PREFIX_GATEWAY[@]}\"",
@@ -845,6 +858,33 @@ EOF
       // array elements onto separate lines, so each prefix's last element
       // is a line containing just '--'.
       expect(stdout.match(/^--$/gm)?.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it("uses setpriv without the bounding-set drop when CAP_SETPCAP is unavailable", () => {
+      const { stdout } = runWithLib(
+        [
+          "TMP=$(mktemp -d)",
+          "cat >\"$TMP/setpriv\" <<'STUB'",
+          "#!/bin/sh",
+          "exit 0",
+          "STUB",
+          "cat >\"$TMP/capsh\" <<'STUB'",
+          "#!/bin/sh",
+          "exit 1",
+          "STUB",
+          'chmod +x "$TMP/setpriv" "$TMP/capsh"',
+          'export PATH="$TMP:$PATH"',
+          "init_step_down_prefixes 2>&1",
+          "printf '%s\\n' \"${STEP_DOWN_PREFIX_SANDBOX[@]}\"",
+          'echo "--"',
+          "printf '%s\\n' \"${STEP_DOWN_PREFIX_GATEWAY[@]}\"",
+          'rm -rf "$TMP"',
+        ].join("\n"),
+      );
+      expect(stdout).toContain("CAP_SETPCAP unavailable");
+      expect(stdout).toContain("--reuid=sandbox");
+      expect(stdout).toContain("--reuid=gateway");
+      expect(stdout).not.toContain("--bounding-set=");
     });
   });
 

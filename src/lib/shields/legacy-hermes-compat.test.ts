@@ -8,13 +8,28 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 
+import { testTimeout } from "../../../test/helpers/timeouts";
+
 const requireSource = createRequire(import.meta.url);
 const INDEX_MODULE = "./index.js";
 const HERMES_PYTHON = "/opt/hermes/.venv/bin/python";
 const HERMES_GUARD = "/usr/local/lib/nemoclaw/hermes-runtime-config-guard.py";
 const LOCK_TOKEN = "a".repeat(64);
+const SETUP_TIMEOUT_MS = 30_000;
 const OLD_GUARD_HELP = "usage: guard {ensure-api-key,refresh-hashes,provider-placeholders}";
 const PARTIAL_GUARD_HELP = "begin-shields-transition --rollback-shields-mode";
+const PREVIOUS_SEALED_GUARD_HELP = [
+  "begin-shields-transition",
+  "run-state-dir-transition",
+  "apply-shields-transition",
+  "finish-shields-transition",
+  "prepare-shields-abort",
+  "abort-shields-transition",
+  "--rollback-shields-mode",
+  "ensure-api-key",
+  "refresh-hashes",
+  "provider-placeholders",
+].join(" ");
 const CURRENT_GUARD_HELP = [
   "begin-shields-transition",
   "run-state-dir-transition",
@@ -23,9 +38,19 @@ const CURRENT_GUARD_HELP = [
   "prepare-shields-abort",
   "abort-shields-transition",
   "--rollback-shields-mode",
+  "--state-lock-plan-json",
 ].join(" ");
 
 type ShieldsModule = typeof import("./index");
+
+const STATE_LOCK_PLAN = {
+  version: 1 as const,
+  readOnlyRoots: ["skills"],
+  confidentialRoots: ["pairing"],
+  readOnlyPrefixes: [],
+  confidentialPrefixes: [],
+  writableSubpaths: [],
+};
 
 function hermesTarget() {
   return {
@@ -35,6 +60,8 @@ function hermesTarget() {
     format: "yaml",
     configFile: "config.yaml",
     sensitiveFiles: ["/sandbox/.hermes/.env", "/sandbox/.hermes/.config-hash"],
+    stateLockPlan: STATE_LOCK_PLAN,
+    stateLockPlanInImage: true,
   };
 }
 
@@ -63,6 +90,9 @@ describe("legacy Hermes shields compatibility", () => {
   let dockerExecSpy: MockInstance;
   let privilegedExecArgvSpy: MockInstance;
   let applyStateDirLockModeSpy: MockInstance;
+  let inferenceConvergenceSpy: MockInstance;
+  let auditSpy: MockInstance;
+  let errorSpy: MockInstance;
 
   beforeEach(() => {
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-legacy-hermes-"));
@@ -72,10 +102,11 @@ describe("legacy Hermes shields compatibility", () => {
 
     const runner = requireSource("../runner.js");
     const policy = requireSource("../policy/index.js");
-    const config = requireSource("../sandbox/config.js");
+    const agentConfig = requireSource("../sandbox/agent-config.js");
     const privilegedExec = requireSource("../sandbox/privileged-exec.js");
     const dockerExec = requireSource("../adapters/docker/exec.js");
     const stateDirLock = requireSource("./state-dir-lock.js");
+    const relockReconfirm = requireSource("./relock-reconfirm.js");
     const audit = requireSource("./audit.js");
     const permissiveRuntime = requireSource("./permissive-runtime.js");
     const tempFiles = requireSource("../onboard/temp-files.js");
@@ -86,6 +117,15 @@ describe("legacy Hermes shields compatibility", () => {
     privilegedExecArgvSpy = vi
       .spyOn(privilegedExec, "privilegedSandboxExecArgv")
       .mockImplementation((_sandboxName: unknown, cmd: unknown) => cmd as string[]);
+    inferenceConvergenceSpy = vi
+      .spyOn(relockReconfirm, "waitForHermesInferenceRouteConvergence")
+      .mockReturnValue({
+        ok: true,
+        attempts: 1,
+        httpStatus: 200,
+      });
+    auditSpy = vi.spyOn(audit, "appendAuditEntry").mockImplementation(() => undefined);
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     spies.push(
       runSpy,
       vi.spyOn(runner, "runCapture").mockReturnValue("version: 1\nnetwork_policies:\n  test: {}\n"),
@@ -102,24 +142,26 @@ describe("legacy Hermes shields compatibility", () => {
         ]),
       vi.spyOn(policy, "parseCurrentPolicy").mockImplementation((raw: unknown) => String(raw)),
       vi.spyOn(policy, "resolvePermissivePolicyPath").mockReturnValue("/mock/permissive.yaml"),
-      vi.spyOn(config, "resolveAgentConfig").mockImplementation(() => hermesTarget()),
+      vi.spyOn(agentConfig, "resolveAgentConfig").mockImplementation(() => hermesTarget()),
       privilegedExecArgvSpy,
       dockerExecSpy,
       applyStateDirLockModeSpy,
       vi.spyOn(stateDirLock, "preflightStateDirLock").mockReturnValue([]),
       vi.spyOn(stateDirLock, "restoreStateDirLockPosture").mockReturnValue([]),
-      vi.spyOn(audit, "appendAuditEntry").mockImplementation(() => undefined),
+      vi.spyOn(stateDirLock, "stateLockPlanCompatibilityIssues").mockReturnValue([]),
+      inferenceConvergenceSpy,
+      auditSpy,
       vi
         .spyOn(permissiveRuntime, "buildRuntimePermissivePolicy")
         .mockImplementation((basePath: unknown) => String(basePath)),
       vi.spyOn(tempFiles, "cleanupTempDir").mockImplementation(() => undefined),
       vi.spyOn(console, "log").mockImplementation(() => undefined),
       vi.spyOn(console, "warn").mockImplementation(() => undefined),
-      vi.spyOn(console, "error").mockImplementation(() => undefined),
+      errorSpy,
     );
 
     shields = requireSource(INDEX_MODULE);
-  });
+  }, testTimeout(SETUP_TIMEOUT_MS));
 
   afterEach(() => {
     for (const spy of spies) spy.mockRestore();
@@ -128,17 +170,48 @@ describe("legacy Hermes shields compatibility", () => {
     fs.rmSync(homeDir, { recursive: true, force: true });
   });
 
-  function installExecResponses(help: string): void {
+  function installExecResponses(
+    help: string,
+    hermesDirMode = "3770",
+    finishError?: Error,
+    simulateLockTransition = false,
+  ): void {
+    let pendingMode: "locked" | "mutable" = "mutable";
+    let appliedMode: "locked" | "mutable" = "mutable";
     dockerExecSpy.mockImplementation((cmd: string[]) => {
       switch (true) {
         case cmd.includes(HERMES_GUARD) && cmd.includes("--help"):
           return help;
-        case isGuardAction(cmd, "begin-shields-transition"):
+        case isGuardAction(cmd, "begin-shields-transition"): {
+          const modeIndex = cmd.indexOf("--shields-mode");
+          const mode = modeIndex >= 0 ? cmd[modeIndex + 1] : undefined;
+          switch (mode) {
+            case "locked":
+            case "mutable":
+              pendingMode = mode;
+              break;
+            default:
+              throw new Error("Invalid --shields-mode in test fixture");
+          }
           return `lock_token=${LOCK_TOKEN} original_locked=1`;
+        }
         case isGuardAction(cmd, "apply-shields-transition"):
-          return "shields_mode=mutable chattr_applied=0";
+          appliedMode = pendingMode;
+          return `shields_mode=${appliedMode} chattr_applied=0`;
+        case isGuardAction(cmd, "finish-shields-transition") && finishError !== undefined:
+          throw finishError;
+        case cmd[0] === "stat" && simulateLockTransition && appliedMode === "locked":
+          return cmd.at(-1) === "/sandbox/.hermes"
+            ? "3770 root:sandbox"
+            : cmd.at(-1) === "/sandbox"
+              ? "1775 root:sandbox"
+              : "444 root:root";
         case cmd[0] === "stat":
-          return cmd.at(-1) === "/sandbox/.hermes" ? "3770 sandbox:sandbox" : "640 sandbox:sandbox";
+          return cmd.at(-1) === "/sandbox/.hermes"
+            ? `${hermesDirMode} sandbox:sandbox`
+            : "640 sandbox:sandbox";
+        case cmd[0] === "sha256sum":
+          return `${"b".repeat(64)}  ${cmd.at(-1)}`;
         case cmd[0] === "lsattr":
           return `---------------- ${cmd.at(-1)}`;
         default:
@@ -256,12 +329,79 @@ describe("legacy Hermes shields compatibility", () => {
           isGuardAction(cmd, "run-state-dir-transition") &&
           cmd.includes("--state-action") &&
           cmd.includes("unlock") &&
+          cmd.includes("--state-lock-plan-json") &&
+          cmd.includes(JSON.stringify(STATE_LOCK_PLAN)) &&
           cmd.includes(LOCK_TOKEN),
       ),
     ).toBe(true);
     expect(commands.some((cmd) => isGuardAction(cmd, "apply-shields-transition"))).toBe(true);
     expect(commands.some((cmd) => isGuardAction(cmd, "finish-shields-transition"))).toBe(true);
     expect(commands.some(isInlinePython)).toBe(false);
+  });
+
+  it("keeps the immediately previous sealed protocol token-owned without sending a plan argument", () => {
+    installExecResponses(PREVIOUS_SEALED_GUARD_HELP);
+
+    expect(() =>
+      shields.unlockAgentConfig("previous-hermes", hermesTarget(), true, true),
+    ).not.toThrow();
+
+    const commands = dockerExecSpy.mock.calls.map(commandFromCall);
+    expect(commands.some((cmd) => isGuardAction(cmd, "begin-shields-transition"))).toBe(true);
+    const transition = commands.find((cmd) => isGuardAction(cmd, "run-state-dir-transition"));
+    expect(transition).toEqual(expect.arrayContaining(["--state-action", "unlock", LOCK_TOKEN]));
+    expect(transition).not.toContain("--state-lock-plan-json");
+    expect(commands.some((cmd) => isGuardAction(cmd, "apply-shields-transition"))).toBe(true);
+    expect(commands.some((cmd) => isGuardAction(cmd, "finish-shields-transition"))).toBe(true);
+    expect(commands.some(isInlinePython)).toBe(false);
+  });
+
+  it("delegates a private Hermes root to the sealed guard before completing unlock", () => {
+    installExecResponses(CURRENT_GUARD_HELP, "700");
+
+    expect(() =>
+      shields.unlockAgentConfig("current-hermes", hermesTarget(), true, true),
+    ).not.toThrow();
+
+    const commands = dockerExecSpy.mock.calls.map(commandFromCall);
+    expect(commands.some((cmd) => isGuardAction(cmd, "finish-shields-transition"))).toBe(true);
+  });
+
+  it("rolls back when the sealed guard cannot attest a private Hermes root", () => {
+    installExecResponses(
+      CURRENT_GUARD_HELP,
+      "700",
+      new Error("private mutable .hermes lacks an attested same-UID topology"),
+    );
+
+    expect(() => shields.unlockAgentConfig("current-hermes", hermesTarget(), true, true)).toThrow(
+      /attested same-UID topology/,
+    );
+
+    const commands = dockerExecSpy.mock.calls.map(commandFromCall);
+    expect(commands.some((cmd) => isGuardAction(cmd, "finish-shields-transition"))).toBe(true);
+    const prepareIndex = commands.findIndex((cmd) => isGuardAction(cmd, "prepare-shields-abort"));
+    const restoreIndex = commands.findIndex(
+      (cmd) =>
+        isGuardAction(cmd, "run-state-dir-transition") &&
+        cmd.includes("--state-action") &&
+        cmd.includes("lock"),
+    );
+    const abortIndex = commands.findIndex((cmd) => isGuardAction(cmd, "abort-shields-transition"));
+    expect(prepareIndex).toBeGreaterThan(-1);
+    expect(restoreIndex).toBeGreaterThan(prepareIndex);
+    expect(abortIndex).toBeGreaterThan(restoreIndex);
+  });
+
+  it("rejects other sandbox-owned Hermes root modes before finishing a sealed unlock", () => {
+    installExecResponses(CURRENT_GUARD_HELP, "750");
+
+    expect(() => shields.unlockAgentConfig("current-hermes", hermesTarget(), true, true)).toThrow(
+      /config dir mode/,
+    );
+
+    const commands = dockerExecSpy.mock.calls.map(commandFromCall);
+    expect(commands.some((cmd) => isGuardAction(cmd, "finish-shields-transition"))).toBe(false);
   });
 
   it("isolates Hermes guard Python and scrubs every privileged shields exec", () => {
@@ -304,6 +444,41 @@ describe("legacy Hermes shields compatibility", () => {
     expect(commands.some((cmd) => isGuardAction(cmd, "begin-shields-transition"))).toBe(true);
   });
 
+  it.each([
+    401, 403, 404,
+  ])("rolls back Shields down when Hermes returns unusable HTTP %i", (httpStatus) => {
+    installExecResponses(CURRENT_GUARD_HELP, "3770", undefined, true);
+    inferenceConvergenceSpy.mockReturnValue({
+      ok: false,
+      attempts: 4,
+      httpStatus,
+    });
+
+    expect(() =>
+      shields.shieldsDown("current-hermes", {
+        skipTimer: true,
+        throwOnError: true,
+      }),
+    ).toThrow(
+      new RegExp(`inference route did not converge.*HTTP ${String(httpStatus)}.*4 attempts`, "i"),
+    );
+
+    const errors = errorSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(errors).toContain(
+      "Recover the Hermes inference route, then re-run `nemoclaw current-hermes shields down`.",
+    );
+    expect(errors).not.toContain("after correcting file ownership");
+    const stateDir = path.join(homeDir, ".nemoclaw", "state");
+    const state = JSON.parse(
+      fs.readFileSync(path.join(stateDir, "shields-current-hermes.json"), "utf-8"),
+    );
+    expect(state).toMatchObject({ shieldsDown: false });
+    expect(
+      fs.readdirSync(stateDir).filter((entry) => entry.startsWith("shields-transition-")),
+    ).toEqual([]);
+    expect(auditSpy).not.toHaveBeenCalled();
+  });
+
   it("descriptor-safely protects and verifies the sandbox parent when a failed rebuild relocks an old image", () => {
     dockerExecSpy.mockImplementation((cmd: string[]) => {
       switch (true) {
@@ -313,7 +488,7 @@ describe("legacy Hermes shields compatibility", () => {
           return cmd.at(-1) === "/sandbox"
             ? "1775 root:sandbox"
             : cmd.at(-1) === "/sandbox/.hermes"
-              ? "755 root:root"
+              ? "3770 root:sandbox"
               : "444 root:root";
         case cmd[0] === "lsattr":
           return `----i----------- ${cmd.at(-1)}`;
@@ -353,7 +528,7 @@ describe("legacy Hermes shields compatibility", () => {
           return cmd.at(-1) === "/sandbox"
             ? "755 sandbox:sandbox"
             : cmd.at(-1) === "/sandbox/.hermes"
-              ? "755 root:root"
+              ? "3770 root:sandbox"
               : "444 root:root";
         case cmd[0] === "lsattr":
           return `----i----------- ${cmd.at(-1)}`;

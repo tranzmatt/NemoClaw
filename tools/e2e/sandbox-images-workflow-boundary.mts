@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import YAML from "yaml";
@@ -22,9 +22,25 @@ const CLEANUP_RUN = "bash .github/scripts/docker-auth-cleanup.sh";
 const HERMES_SECRET_BOUNDARY_STEP_ID = "hermes-secret-boundary";
 const HERMES_ROOT_AFTER_SECRET_CONDITION =
   "${{ !cancelled() && (steps.hermes-secret-boundary.outcome == 'success' || steps.hermes-secret-boundary.outcome == 'failure') }}";
+const HERMES_EXPORT_SWAP_STEP_NAME = "Add swap for Hermes image export";
+const HERMES_SETUP_BUILDX_ACTION =
+  "docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c";
+const HERMES_BUILD_PUSH_ACTION =
+  "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a";
+const HERMES_DEFAULT_TRUST_STEP_NAME = "Verify Hermes default-trust final image";
+const HERMES_DOWNLOAD_ARTIFACT_ACTION =
+  "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c";
+const HERMES_UPLOAD_ARTIFACT_ACTION =
+  "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a";
+const HERMES_BASE_IMAGE_RESOLVER_ACTION = "./.github/actions/resolve-hermes-base-image";
+const HERMES_CACHE_FROM = "type=gha,scope=hermes-production-${{ runner.os }}-${{ runner.arch }}";
+const HERMES_CACHE_TO =
+  "type=gha,mode=max,scope=hermes-production-${{ runner.os }}-${{ runner.arch }}";
+const MESSAGING_PLAN_IMAGE_BOUNDARY_JOB = "messaging-plan-image-boundary";
 const IMAGE_BUILD_JOBS = [
   "build-sandbox-images",
   "build-hermes-sandbox-image",
+  MESSAGING_PLAN_IMAGE_BOUNDARY_JOB,
   "build-sandbox-images-arm64",
 ] as const;
 const OPENCLAW_IMAGE_CONSUMER_JOBS = [
@@ -49,8 +65,20 @@ const EXPECTED_AUTH_ENV = {
   DOCKERHUB_TOKEN: `\${{ ${TRUSTED_PREDICATE} && secrets.DOCKERHUB_TOKEN || '' }}`,
 };
 const FULL_SHA_ACTION = /^[^\s@]+@[0-9a-f]{40}$/u;
+// Shell-expanded values are unknown; only literal `--push=false` is statically non-writing.
 const REGISTRY_WRITE =
-  /(?:\bdocker\s+(?:image\s+)?push\b|\bdocker\s+buildx\s+build\b[^\n]*\s--push(?:\s|$)|\b(?:oras|crane)\s+push\b|\bskopeo\s+copy\b)/u;
+  /(?:\bdocker\s+(?:image\s+)?push\b|\bdocker\s+buildx\s+build\b[^\n]*\s--push(?:=(?!false(?=$|[\s;&|<>()]))[^\s;&|<>()]+)?(?=$|[\s;&|<>()])|\b(?:oras|crane)\s+push\b|\bskopeo\s+copy\b)/u;
+
+function normalizeShellContinuations(run: string): string {
+  return run.replace(/\\\r?\n[ \t]*/gu, " ");
+}
+
+function normalizeLocalActionPath(uses: string | undefined): string | undefined {
+  if (!uses?.startsWith("./")) {
+    return uses;
+  }
+  return posix.normalize(uses).replace(/\/+$/u, "");
+}
 
 type GuardedProductionBuildContract = {
   args: string;
@@ -77,7 +105,7 @@ const GUARDED_PRODUCTION_BUILD_CONTRACTS: readonly GuardedProductionBuildContrac
     envName: "HERMES_BASE_IMAGE",
     jobName: "build-hermes-sandbox-image",
     label: "Hermes production image",
-    stepName: "Build Hermes production image",
+    stepName: "Validate Hermes production build args",
     target: "nemoclaw-hermes-production",
   },
   {
@@ -174,6 +202,9 @@ function validateMainCaller(errors: string[], mainWorkflow: SandboxImagesWorkflo
   if (caller.uses !== "./.github/workflows/sandbox-images-and-e2e.yaml") {
     errors.push("main workflow must call the local sandbox image workflow");
   }
+  if (!isDeepStrictEqual(caller.needs, ["static-checks", "build-typecheck"])) {
+    errors.push("main sandbox image workflow must start after the cheap preflight jobs");
+  }
   const callerSecrets = record(caller.secrets);
   const expectedSecrets = {
     DOCKERHUB_USERNAME: "${{ secrets.DOCKERHUB_USERNAME }}",
@@ -183,6 +214,21 @@ function validateMainCaller(errors: string[], mainWorkflow: SandboxImagesWorkflo
     errors.push(
       "main sandbox image caller must map only the optional Docker Hub secrets explicitly",
     );
+  }
+
+  const checks = record(record(mainWorkflow.jobs).checks);
+  if (!Array.isArray(checks.needs) || !checks.needs.includes("sandbox-images-and-e2e")) {
+    errors.push("main checks must wait for the sandbox image workflow");
+  }
+  const gate = requireStep(errors, "main checks", checks, "Verify required main checks");
+  if (
+    record(gate.env).SANDBOX_IMAGES_E2E_RESULT !==
+      "${{ needs['sandbox-images-and-e2e'].result }}" ||
+    !(gate.run ?? "").includes(
+      'require_success "sandbox-images-and-e2e" "$SANDBOX_IMAGES_E2E_RESULT"',
+    )
+  ) {
+    errors.push("main checks must require the sandbox image workflow result");
   }
 }
 
@@ -293,7 +339,12 @@ function validateSecretScopeAndRegistryWrites(
     for (const step of steps(job)) {
       const label = `${jobName} step '${step.name ?? step.uses ?? "<unnamed>"}'`;
       const run = typeof step.run === "string" ? step.run : "";
-      const serialized = `${JSON.stringify(record(step.env))}\n${run}`;
+      const normalizedRun = normalizeShellContinuations(run);
+      const serialized = [
+        JSON.stringify(record(step.env)),
+        JSON.stringify(record(step.with)),
+        run,
+      ].join("\n");
       for (const secret of FORBIDDEN_RUNTIME_SECRETS) {
         if (serialized.includes(secret)) {
           errors.push(`${label} must not receive ${secret}`);
@@ -305,14 +356,17 @@ function validateSecretScopeAndRegistryWrites(
             errors.push(`${label} must not receive ${secret}`);
           }
         }
-        if (/\bdocker\s+login\b/u.test(run)) {
+        if (
+          /\bdocker\s+login\b/u.test(normalizedRun) ||
+          String(step.uses ?? "").startsWith("docker/login-action@")
+        ) {
           errors.push(`${label} must not authenticate to a registry`);
         }
       }
-      if (
-        REGISTRY_WRITE.test(run) ||
-        String(step.uses ?? "").includes("docker/build-push-action")
-      ) {
+      const buildActionWritesRegistry =
+        String(step.uses ?? "").startsWith("docker/build-push-action@") &&
+        record(step.with).push !== false;
+      if (REGISTRY_WRITE.test(normalizedRun) || buildActionWritesRegistry) {
         errors.push(`${label} must not write images to a registry`);
       }
     }
@@ -321,10 +375,10 @@ function validateSecretScopeAndRegistryWrites(
 
 function dockerBuildLines(job: SandboxImagesWorkflowJob): string[] {
   return steps(job).flatMap((step) =>
-    (step.run ?? "")
+    normalizeShellContinuations(step.run ?? "")
       .split("\n")
       .map((line) => line.trim())
-      .filter((line) => /^docker\s+build(?:\s|$)/u.test(line)),
+      .filter((line) => /^docker\s+(?:build|buildx\s+build)(?:\s|$)/u.test(line)),
   );
 }
 
@@ -345,6 +399,70 @@ function validateGuardedProductionBuild(
   const expectedEnv = {
     [contract.envName]: `\${{ env.${contract.envName} }}`,
   };
+
+  if (contract.jobName === "build-hermes-sandbox-image") {
+    const expectedValidationRun = [
+      "set -euo pipefail",
+      `build_args=(${contract.args})`,
+      'scripts/check-production-build-args.sh "${build_args[@]}"',
+      "",
+    ].join("\n");
+    if (!isDeepStrictEqual(record(build.env), expectedEnv) || build.run !== expectedValidationRun) {
+      errors.push(`${contract.label} must validate the guarded build_args shape`);
+    }
+    const setupBuildx = requireStep(errors, contract.jobName, job, "Set up Docker Buildx");
+    if (
+      steps(job).filter((step) => step.name === "Set up Docker Buildx").length !== 1 ||
+      setupBuildx.uses !== HERMES_SETUP_BUILDX_ACTION
+    ) {
+      errors.push("Hermes producer must use the canonical Docker Buildx setup action exactly once");
+    }
+    const action = requireStep(errors, contract.jobName, job, "Build Hermes production image");
+    const actionWith = record(action.with);
+    const buildActions = steps(job).filter((step) =>
+      String(step.uses ?? "").startsWith("docker/build-push-action@"),
+    );
+    if (
+      buildActions.length !== 1 ||
+      dockerBuildLines(job).length !== 0 ||
+      action.uses !== HERMES_BUILD_PUSH_ACTION ||
+      actionWith.context !== "." ||
+      actionWith.file !== "agents/hermes/Dockerfile" ||
+      actionWith.load !== true ||
+      actionWith.push !== false ||
+      actionWith.tags !== contract.target ||
+      actionWith["build-args"] !== "BASE_IMAGE=${{ env.HERMES_BASE_IMAGE }}" ||
+      actionWith["cache-from"] !== HERMES_CACHE_FROM ||
+      actionWith["cache-to"] !== HERMES_CACHE_TO
+    ) {
+      errors.push(
+        "Hermes producer must build the production image exactly once with the canonical local-load Buildx action and OS/architecture-scoped GHA cache",
+      );
+    }
+    const defaultTrust = requireStep(errors, contract.jobName, job, HERMES_DEFAULT_TRUST_STEP_NAME);
+    const defaultTrustRun = normalizedShell(defaultTrust.run);
+    const requiredDefaultTrustFragments = [
+      "set -euo pipefail",
+      "docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 64 --memory 256m --entrypoint /bin/sh nemoclaw-hermes-production -eu -c",
+      'test "$NODE_EXTRA_CA_CERTS" = /usr/local/share/nemoclaw/corporate-ca.pem',
+      "test ! -e /usr/local/share/nemoclaw/corporate-ca.pem",
+      "test ! -L /usr/local/share/nemoclaw/corporate-ca.pem",
+      "test -x /usr/local/bin/hermes",
+      'node -e "const tls = require(\\"node:tls\\"); if (tls.rootCertificates.length === 0) process.exit(1); tls.createSecureContext()"',
+      '/opt/hermes/.venv/bin/python -I -c "import ssl; assert ssl.create_default_context().get_ca_certs()"',
+    ];
+    if (
+      steps(job).filter((step) => step.name === HERMES_DEFAULT_TRUST_STEP_NAME).length !== 1 ||
+      defaultTrust.shell !== "bash" ||
+      requiredDefaultTrustFragments.some((fragment) => !defaultTrustRun.includes(fragment)) ||
+      stepIndex(job, action.name ?? "") >= stepIndex(job, HERMES_DEFAULT_TRUST_STEP_NAME)
+    ) {
+      errors.push(
+        "Hermes producer must verify that the final image uses default trust when no corporate CA is supplied.",
+      );
+    }
+    return;
+  }
 
   if (!isDeepStrictEqual(record(build.env), expectedEnv) || build.run !== expectedRun) {
     errors.push(`${contract.label} must use the guarded build_args shape under ${contract.target}`);
@@ -368,13 +486,220 @@ function validateGuardedProductionBuildContracts(
   }
 }
 
+function normalizedShell(run: string | undefined): string {
+  return (run ?? "")
+    .replace(/\\\r?\n\s*/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim();
+}
+
+function validateMessagingPlanBoundaryBuild(
+  errors: string[],
+  job: SandboxImagesWorkflowJob,
+  options: {
+    readonly agent: "hermes" | "openclaw";
+    readonly baseArgName: "BASE_IMAGE";
+    readonly baseEnvName: "BASE_IMAGE" | "HERMES_BASE_IMAGE";
+    readonly extraRequiredFragments?: readonly string[];
+    readonly stepName: string;
+    readonly target: string;
+  },
+): void {
+  const step = requireStep(errors, MESSAGING_PLAN_IMAGE_BOUNDARY_JOB, job, options.stepName);
+  const run = normalizedShell(step.run);
+  const expectedEnv = {
+    [options.baseEnvName]: `\${{ env.${options.baseEnvName} }}`,
+  };
+  const requiredFragments = [
+    "set -euo pipefail",
+    `node --experimental-strip-types scripts/check-messaging-plan-image-boundary.mts plan ${options.agent}`,
+    `--build-arg \"${options.baseArgName}=\${${options.baseEnvName}}\"`,
+    '--build-arg "NEMOCLAW_MESSAGING_PLAN_B64=${messaging_plan_b64}"',
+    'scripts/check-production-build-args.sh "${build_args[@]}"',
+    `docker build \"\${build_args[@]}\" -t ${options.target} .`,
+    `node --experimental-strip-types scripts/check-messaging-plan-image-boundary.mts verify ${options.target} ${options.agent}`,
+    ...(options.extraRequiredFragments ?? []),
+  ];
+
+  if (step.shell !== "bash" || !isDeepStrictEqual(record(step.env), expectedEnv)) {
+    errors.push(`${options.agent} messaging plan image boundary must use guarded bash env scope`);
+  }
+  for (const fragment of requiredFragments) {
+    if (!run.includes(fragment)) {
+      errors.push(`${options.agent} messaging plan image boundary must include ${fragment}`);
+    }
+  }
+
+  const planIndex = run.indexOf("check-messaging-plan-image-boundary.mts plan");
+  const guardIndex = run.indexOf("check-production-build-args.sh");
+  const buildIndex = run.indexOf(`docker build \"\${build_args[@]}\" -t ${options.target}`);
+  const verifyIndex = run.indexOf("check-messaging-plan-image-boundary.mts verify");
+  if (
+    planIndex < 0 ||
+    guardIndex <= planIndex ||
+    buildIndex <= guardIndex ||
+    verifyIndex <= buildIndex
+  ) {
+    errors.push(`${options.agent} messaging plan image boundary steps are out of order`);
+  }
+}
+
+function validateHermesMessagingPlanCaFixture(
+  errors: string[],
+  job: SandboxImagesWorkflowJob,
+): void {
+  const step = findStep(job, "Build and verify Hermes messaging plan boundary");
+  const run = normalizedShell(step?.run);
+  const helperInvocation =
+    'node --experimental-strip-types scripts/checks/select-ci-endpoint-ca-roots.mts --output "$compact_ca_bundle"';
+  const compactEncoding = 'corporate_ca_b64="$(base64 -w 0 "$compact_ca_bundle")"';
+  const sourceHash = 'corporate_ca_sha256="$(sha256sum "$compact_ca_bundle" | cut -d \' \' -f 1)"';
+  const corporateCaBuildArg = '--build-arg "NEMOCLAW_CORPORATE_CA_B64=${corporate_ca_b64}"';
+  const installedHash =
+    "installed_ca_sha256=\"$( docker run --rm --network none --entrypoint sha256sum nemoclaw-hermes-plan-boundary /usr/local/share/nemoclaw/corporate-ca.pem | cut -d ' ' -f 1 )\"";
+  const matchingHash = 'test "$installed_ca_sha256" = "$corporate_ca_sha256"';
+  const parseProof =
+    "docker run --rm --network none --entrypoint openssl nemoclaw-hermes-plan-boundary crl2pkcs7 -nocrl -certfile /usr/local/share/nemoclaw/corporate-ca.pem -out /dev/null";
+  const orderedFragments = [
+    'compact_ca_bundle="$(mktemp)"',
+    "trap 'rm -f \"$compact_ca_bundle\"' EXIT",
+    helperInvocation,
+    compactEncoding,
+    sourceHash,
+    "check-messaging-plan-image-boundary.mts plan",
+    corporateCaBuildArg,
+    "check-production-build-args.sh",
+    'docker build "${build_args[@]}" -t nemoclaw-hermes-plan-boundary',
+    installedHash,
+    matchingHash,
+    parseProof,
+    "check-messaging-plan-image-boundary.mts verify",
+  ];
+  for (const fragment of orderedFragments) {
+    if (!run.includes(fragment)) {
+      errors.push(`hermes messaging plan image boundary must include ${fragment}`);
+    }
+  }
+  if (
+    run.split("select-ci-endpoint-ca-roots.mts").length - 1 !== 1 ||
+    !run.includes(`${helperInvocation} ${compactEncoding}`)
+  ) {
+    errors.push(`hermes messaging plan image boundary must include exactly ${helperInvocation}`);
+  }
+  if (
+    run.includes("/etc/ssl/certs/ca-certificates.crt") ||
+    /base64 -w 0 "?\$\{?system_ca_bundle\}?"?/u.test(run)
+  ) {
+    errors.push(
+      "hermes messaging plan image boundary must not encode the system CA bundle directly",
+    );
+  }
+  const positions = orderedFragments.map((fragment) => run.indexOf(fragment));
+  if (
+    positions.some((position, index) => position < 0 || position <= (positions[index - 1] ?? -1))
+  ) {
+    errors.push("hermes messaging plan image boundary CA fixture steps are out of order");
+  }
+}
+
+function validateMessagingPlanImageBoundary(
+  errors: string[],
+  workflow: SandboxImagesWorkflow,
+): void {
+  const job = workflow.jobs[MESSAGING_PLAN_IMAGE_BOUNDARY_JOB] ?? {};
+  if (job["timeout-minutes"] !== 30) {
+    errors.push("messaging plan image boundary must retain its 30-minute budget");
+  }
+  if (job.needs !== undefined) {
+    errors.push("messaging plan image boundary must remain isolated from canonical image jobs");
+  }
+  const nodeSetupSteps = steps(job).filter((step) => step.name === "Set up Node");
+  if (nodeSetupSteps.length !== 1) {
+    errors.push("messaging plan image boundary must set up Node exactly once");
+  }
+  if (record(nodeSetupSteps[0]?.with)["node-version"] !== "22.19.0") {
+    errors.push("messaging plan image boundary must use Node 22.19.0");
+  }
+  for (const [stepName, action] of [
+    ["Resolve sandbox base image", "./.github/actions/resolve-sandbox-base-image"],
+    ["Resolve Hermes base image", "./.github/actions/resolve-hermes-base-image"],
+  ] as const) {
+    if (findStep(job, stepName)?.uses !== action) {
+      errors.push(`messaging plan image boundary must run '${stepName}'`);
+    }
+  }
+
+  validateMessagingPlanBoundaryBuild(errors, job, {
+    agent: "openclaw",
+    baseArgName: "BASE_IMAGE",
+    baseEnvName: "BASE_IMAGE",
+    stepName: "Build and verify OpenClaw messaging plan boundary",
+    target: "nemoclaw-openclaw-plan-boundary",
+  });
+  validateMessagingPlanBoundaryBuild(errors, job, {
+    agent: "hermes",
+    baseArgName: "BASE_IMAGE",
+    baseEnvName: "HERMES_BASE_IMAGE",
+    extraRequiredFragments: ['--build-arg "NEMOCLAW_CORPORATE_CA_B64=${corporate_ca_b64}"'],
+    stepName: "Build and verify Hermes messaging plan boundary",
+    target: "nemoclaw-hermes-plan-boundary",
+  });
+  validateHermesMessagingPlanCaFixture(errors, job);
+
+  const builds = dockerBuildLines(job);
+  if (
+    !isDeepStrictEqual(builds, [
+      'docker build "${build_args[@]}" -t nemoclaw-openclaw-plan-boundary .',
+      'docker build "${build_args[@]}" -t nemoclaw-hermes-plan-boundary .',
+    ])
+  ) {
+    errors.push("messaging plan image boundary must build exactly two disposable local images");
+  }
+  if (steps(job).some((step) => String(step.uses ?? "").includes("upload-artifact"))) {
+    errors.push("messaging plan image boundary must not publish probe image artifacts");
+  }
+}
+
+function validateHermesExportSwap(errors: string[], workflow: SandboxImagesWorkflow): void {
+  for (const [jobName, buildStepName] of [
+    ["build-hermes-sandbox-image", "Build Hermes production image"],
+    [MESSAGING_PLAN_IMAGE_BOUNDARY_JOB, "Build and verify Hermes messaging plan boundary"],
+  ] as const) {
+    const job = workflow.jobs[jobName] ?? {};
+    const swapSteps = steps(job).filter((step) => step.name === HERMES_EXPORT_SWAP_STEP_NAME);
+    if (swapSteps.length !== 1) {
+      errors.push(`${jobName} must provision Hermes export swap exactly once`);
+      continue;
+    }
+    const run = swapSteps[0]?.run ?? "";
+    for (const fragment of [
+      "swap_file=/mnt/nemoclaw-hermes-image-export.swap",
+      'sudo fallocate -l 32G "$swap_file"',
+      'sudo chmod 0600 "$swap_file"',
+      'sudo mkswap "$swap_file"',
+      'sudo swapon "$swap_file"',
+      "swapon --show",
+      "free -h",
+      "df -h / /mnt",
+      "docker system df",
+    ]) {
+      if (!run.includes(fragment)) {
+        errors.push(`${jobName} Hermes export swap must include ${fragment}`);
+      }
+    }
+    if (stepIndex(job, HERMES_EXPORT_SWAP_STEP_NAME) >= stepIndex(job, buildStepName)) {
+      errors.push(`${jobName} must provision swap before the Hermes image build`);
+    }
+  }
+}
+
 function validateRuntimeImageReuse(errors: string[], workflow: SandboxImagesWorkflow): void {
   const producerName = "build-sandbox-images";
   const producer = workflow.jobs[producerName] ?? {};
   const runtimeName = "runtime-overrides";
   const runtimeJob = workflow.jobs[runtimeName] ?? {};
-  if (producer["timeout-minutes"] !== 15) {
-    errors.push("build-sandbox-images must retain its 15-minute producer budget");
+  if (producer["timeout-minutes"] !== 45) {
+    errors.push("build-sandbox-images must retain its 45-minute producer budget");
   }
   if (runtimeJob["timeout-minutes"] !== 60) {
     errors.push("runtime-overrides timeout must cover its 45-minute probe budget");
@@ -428,6 +753,7 @@ function validateRuntimeImageReuse(errors: string[], workflow: SandboxImagesWork
       name: "isolation-image",
       path: "/tmp/isolation-image.tar.gz",
       "retention-days": 1,
+      "if-no-files-found": "error",
     }) ||
     stepIndex(producer, save.name ?? "") >= stepIndex(producer, isolationUpload.name ?? "")
   ) {
@@ -499,39 +825,92 @@ function validateRuntimeImageReuse(errors: string[], workflow: SandboxImagesWork
 }
 
 function validateHermesImageReuse(errors: string[], workflow: SandboxImagesWorkflow): void {
-  const jobName = "build-hermes-sandbox-image";
-  const job = workflow.jobs[jobName] ?? {};
-  if (job["timeout-minutes"] !== 150) {
-    errors.push("Hermes image job timeout must cover both inherited probe budgets");
+  const producerName = "build-hermes-sandbox-image";
+  const producer = workflow.jobs[producerName] ?? {};
+  const testJobName = "test-hermes-sandbox-image";
+  const testJob = workflow.jobs[testJobName] ?? {};
+  if (producer["timeout-minutes"] !== 30) {
+    errors.push("Hermes image producer must retain its 30-minute budget");
+  }
+  if (testJob["timeout-minutes"] !== 90) {
+    errors.push("Hermes image test consumer must retain its 90-minute budget");
+  }
+  if (testJob.needs !== producerName) {
+    errors.push("Hermes image tests must depend on the Hermes image producer");
+  }
+  const consumerAuthSteps = steps(testJob).filter(
+    (step) =>
+      step.name === AUTH_STEP_NAME ||
+      String(step.uses ?? "").startsWith("docker/login-action@") ||
+      /\bdocker\s+login\b/u.test(normalizeShellContinuations(step.run ?? "")),
+  );
+  if (consumerAuthSteps.length !== 0) {
+    errors.push("Hermes image test consumer must not authenticate to Docker Hub");
+  }
+  const consumerBuilds = steps(testJob).filter(
+    (step) =>
+      String(step.uses ?? "").startsWith("docker/build-push-action@") ||
+      /\bdocker\s+(?:build|buildx\s+build)\b/u.test(normalizeShellContinuations(step.run ?? "")),
+  );
+  if (consumerBuilds.length !== 0) {
+    errors.push("Hermes image test consumer must not rebuild the prebuilt image");
   }
   for (const stepName of ["Set up Node", "Install root dependencies"]) {
-    if (steps(job).filter((step) => step.name === stepName).length !== 1) {
-      errors.push(`${jobName} must run '${stepName}' exactly once`);
+    if (steps(producer).some((step) => step.name === stepName)) {
+      errors.push(`${producerName} must not install Node dependencies`);
+    }
+    if (steps(testJob).filter((step) => step.name === stepName).length !== 1) {
+      errors.push(`${testJobName} must run '${stepName}' exactly once`);
     }
   }
   const secretBoundary = requireStep(
     errors,
-    jobName,
-    job,
+    testJobName,
+    testJob,
     "Run Hermes sandbox secret boundary test",
   );
+  const resolverActionPath = normalizeLocalActionPath(HERMES_BASE_IMAGE_RESOLVER_ACTION);
+  const resolverSteps = steps(testJob).filter(
+    (step) =>
+      step.name === "Resolve Hermes base image" ||
+      normalizeLocalActionPath(step.uses) === resolverActionPath,
+  );
+  const baseImageResolver = resolverSteps.find(
+    (step) => normalizeLocalActionPath(step.uses) === resolverActionPath,
+  );
+  if (
+    resolverSteps.length !== 1 ||
+    baseImageResolver?.name !== "Resolve Hermes base image" ||
+    stepIndex(testJob, baseImageResolver?.name ?? "") >=
+      stepIndex(testJob, secretBoundary.name ?? "")
+  ) {
+    errors.push(
+      "Hermes image tests must resolve the Hermes base image exactly once with the canonical action before the secret-boundary probe",
+    );
+  }
+  if (resolverSteps.some((step) => step.if !== undefined)) {
+    errors.push("Hermes base-image resolver must run unconditionally");
+  }
+  if (resolverSteps.some((step) => step["continue-on-error"] !== undefined)) {
+    errors.push("Hermes base-image resolver must fail closed");
+  }
   const rootEntrypoint = requireStep(
     errors,
-    jobName,
-    job,
+    testJobName,
+    testJob,
     "Run Hermes root entrypoint smoke Vitest test",
   );
   if (secretBoundary.id !== HERMES_SECRET_BOUNDARY_STEP_ID) {
     errors.push("Hermes secret boundary step must expose its outcome to the next probe");
   }
-  if (secretBoundary["timeout-minutes"] !== 60) {
-    errors.push("Hermes secret boundary must retain its 60-minute probe budget");
+  if (secretBoundary["timeout-minutes"] !== 45) {
+    errors.push("Hermes secret boundary must retain its 45-minute probe budget");
   }
   if (rootEntrypoint.if !== HERMES_ROOT_AFTER_SECRET_CONDITION) {
     errors.push("Hermes root entrypoint must run after either secret-boundary outcome");
   }
-  if (rootEntrypoint["timeout-minutes"] !== 45) {
-    errors.push("Hermes root entrypoint must retain its 45-minute probe budget");
+  if (rootEntrypoint["timeout-minutes"] !== 30) {
+    errors.push("Hermes root entrypoint must retain its 30-minute probe budget");
   }
   for (const [label, step, target, artifactDirectory] of [
     [
@@ -563,9 +942,158 @@ function validateHermesImageReuse(errors: string[], workflow: SandboxImagesWorkf
     if (/\bdocker\s+build\b/u.test(step.run ?? "")) {
       errors.push(`${label} step must not rebuild the prebuilt image`);
     }
-    if (stepIndex(job, "Build Hermes production image") >= stepIndex(job, step.name ?? "")) {
-      errors.push(`${label} must run after the Hermes production image build`);
+    if (stepIndex(testJob, "Load Hermes production image") >= stepIndex(testJob, step.name ?? "")) {
+      errors.push(`${label} must run after loading the Hermes production image`);
     }
+  }
+
+  const download = requireStep(errors, testJobName, testJob, "Download Hermes production image");
+  const load = requireStep(errors, testJobName, testJob, "Load Hermes production image");
+  if (
+    steps(testJob).filter((step) => step.name === "Download Hermes production image").length !==
+      1 ||
+    download.uses !== HERMES_DOWNLOAD_ARTIFACT_ACTION ||
+    !isDeepStrictEqual(record(download.with), {
+      name: "hermes-isolation-image",
+      path: "/tmp",
+    }) ||
+    steps(testJob).filter((step) => step.name === "Load Hermes production image").length !== 1 ||
+    !(load.run ?? "").includes("/tmp/hermes-isolation-image.tar.gz | docker load") ||
+    !(load.run ?? "").includes("docker image inspect nemoclaw-hermes-production") ||
+    stepIndex(testJob, download.name ?? "") >= stepIndex(testJob, load.name ?? "")
+  ) {
+    errors.push(
+      "Hermes image tests must download and load the producer artifact exactly once with the canonical action",
+    );
+  }
+
+  const save = requireStep(errors, producerName, producer, "Save Hermes production image");
+  if (
+    steps(producer).filter((step) => step.name === "Save Hermes production image").length !== 1 ||
+    !(save.run ?? "").includes(
+      "docker save nemoclaw-hermes-production | gzip > /tmp/hermes-isolation-image.tar.gz",
+    ) ||
+    !(save.run ?? "").includes("gzip -t /tmp/hermes-isolation-image.tar.gz")
+  ) {
+    errors.push("Hermes producer must save and verify its production image exactly once");
+  }
+  const upload = requireStep(errors, producerName, producer, "Upload Hermes isolation image");
+  if (
+    steps(producer).filter((step) => step.name === "Upload Hermes isolation image").length !== 1 ||
+    upload.uses !== HERMES_UPLOAD_ARTIFACT_ACTION ||
+    !isDeepStrictEqual(record(upload.with), {
+      name: "hermes-isolation-image",
+      path: "/tmp/hermes-isolation-image.tar.gz",
+      "retention-days": 1,
+      "if-no-files-found": "error",
+    }) ||
+    stepIndex(producer, save.name ?? "") >= stepIndex(producer, upload.name ?? "") ||
+    stepIndex(producer, upload.name ?? "") >= stepIndex(producer, CLEANUP_STEP_NAME)
+  ) {
+    errors.push("Hermes producer must upload the saved production image before auth cleanup");
+  }
+}
+
+function validateStateDirGuardMetadataImageReuse(
+  errors: string[],
+  workflow: SandboxImagesWorkflow,
+): void {
+  const jobName = "state-dir-guard-metadata";
+  const job = workflow.jobs[jobName] ?? {};
+  const expectedNeeds = ["build-sandbox-images", "build-hermes-sandbox-image"];
+  if (!isDeepStrictEqual(job.needs, expectedNeeds)) {
+    errors.push("state-dir guard metadata must depend on both production image producers");
+  }
+  if (job["timeout-minutes"] !== 30) {
+    errors.push("state-dir guard metadata job must retain its 30-minute budget");
+  }
+
+  const expectedEnv = {
+    E2E_ARTIFACT_DIR: "${{ github.workspace }}/e2e-artifacts/live/state-dir-guard-metadata",
+    E2E_TARGET_ID: "state-dir-guard-metadata",
+    NEMOCLAW_RUN_LIVE_E2E: "1",
+    NEMOCLAW_OPENCLAW_TEST_IMAGE: "nemoclaw-production",
+    NEMOCLAW_HERMES_TEST_IMAGE: "nemoclaw-hermes-production",
+  };
+  if (!isDeepStrictEqual(record(job.env), expectedEnv)) {
+    errors.push("state-dir guard metadata must consume both named prebuilt production images");
+  }
+  for (const stepName of ["Set up Node", "Install root dependencies"]) {
+    if (steps(job).filter((step) => step.name === stepName).length !== 1) {
+      errors.push(`${jobName} must run '${stepName}' exactly once`);
+    }
+  }
+  if (findStep(job, AUTH_STEP_NAME)) {
+    errors.push("state-dir guard metadata must not authenticate to Docker Hub");
+  }
+  const allRuns = steps(job)
+    .map((step) => step.run ?? "")
+    .join("\n");
+  if (/\bdocker\s+build\b/u.test(allRuns)) {
+    errors.push("state-dir guard metadata must not rebuild either production image");
+  }
+  for (const producerName of expectedNeeds) {
+    const producerRuns = steps(workflow.jobs[producerName] ?? {})
+      .map((step) => step.run ?? "")
+      .join("\n");
+    if (producerRuns.includes("test/e2e/live/state-dir-guard-metadata.test.ts")) {
+      errors.push(`${producerName} must not run the failure-isolated state-dir guard probe`);
+    }
+  }
+
+  const openclawDownload = requireStep(errors, jobName, job, "Download OpenClaw production image");
+  const hermesDownload = requireStep(errors, jobName, job, "Download Hermes production image");
+  for (const [label, step, expectedWith] of [
+    ["OpenClaw", openclawDownload, { name: "isolation-image", path: "/tmp" }],
+    ["Hermes", hermesDownload, { name: "hermes-isolation-image", path: "/tmp" }],
+  ] as const) {
+    if (
+      step.uses !== HERMES_DOWNLOAD_ARTIFACT_ACTION ||
+      !isDeepStrictEqual(record(step.with), expectedWith)
+    ) {
+      errors.push(`state-dir guard metadata must download the saved ${label} production image`);
+    }
+  }
+
+  const load = requireStep(errors, jobName, job, "Load production images");
+  for (const fragment of [
+    "/tmp/isolation-image.tar.gz | docker load",
+    "/tmp/hermes-isolation-image.tar.gz | docker load",
+    "docker image inspect nemoclaw-production",
+    "docker image inspect nemoclaw-hermes-production",
+  ]) {
+    if (!(load.run ?? "").includes(fragment)) {
+      errors.push(`state-dir guard metadata image load must include ${fragment}`);
+    }
+  }
+  const tools = requireStep(errors, jobName, job, "Install filesystem metadata tools");
+  for (const fragment of [
+    "sudo apt-get install --yes --no-install-recommends acl attr",
+    "command -v setfacl getfacl setfattr getfattr",
+  ]) {
+    if (!(tools.run ?? "").includes(fragment)) {
+      errors.push(`state-dir guard metadata tool setup must include ${fragment}`);
+    }
+  }
+  const probe = requireStep(errors, jobName, job, "Run installed state-dir guard metadata test");
+  if (probe["timeout-minutes"] !== 15) {
+    errors.push("state-dir guard metadata probe must retain its 15-minute budget");
+  }
+  if (!(probe.run ?? "").includes("test/e2e/live/state-dir-guard-metadata.test.ts")) {
+    errors.push("state-dir guard metadata step must run its focused live Vitest target");
+  }
+  const upload = requireStep(errors, jobName, job, "Upload state-dir guard metadata artifacts");
+  if (upload.if !== "always()" || upload.uses !== "./.github/actions/upload-e2e-artifacts") {
+    errors.push("state-dir guard metadata must always use the shared E2E artifact uploader");
+  }
+  if (
+    stepIndex(job, openclawDownload.name ?? "") >= stepIndex(job, load.name ?? "") ||
+    stepIndex(job, hermesDownload.name ?? "") >= stepIndex(job, load.name ?? "") ||
+    stepIndex(job, load.name ?? "") >= stepIndex(job, tools.name ?? "") ||
+    stepIndex(job, tools.name ?? "") >= stepIndex(job, probe.name ?? "") ||
+    stepIndex(job, probe.name ?? "") >= stepIndex(job, upload.name ?? "")
+  ) {
+    errors.push("state-dir guard metadata image handoff and evidence steps are out of order");
   }
 }
 
@@ -596,8 +1124,11 @@ export function validateSandboxImagesWorkflow(
   }
   validateSecretScopeAndRegistryWrites(errors, workflow);
   validateGuardedProductionBuildContracts(errors, workflow);
+  validateHermesExportSwap(errors, workflow);
+  validateMessagingPlanImageBoundary(errors, workflow);
   validateRuntimeImageReuse(errors, workflow);
   validateHermesImageReuse(errors, workflow);
+  validateStateDirGuardMetadataImageReuse(errors, workflow);
   return errors;
 }
 

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { OLLAMA_HOST_DOCKER_INTERNAL, validateOllamaPortConfiguration } from "../inference/local";
 import { OLLAMA_PORT } from "../core/ports";
+import { OLLAMA_HOST_DOCKER_INTERNAL, validateOllamaPortConfiguration } from "../inference/local";
 import {
   getInstalledOllamaVersion,
   getRunningOllamaDaemonVersion,
@@ -15,6 +15,11 @@ export interface OllamaInstallMenuInput {
   hasOllama: boolean;
   ollamaRunning: boolean;
   hasWindowsOllama: boolean;
+  /** Whether the sandbox can reach a Windows-host Ollama daemon at all. A
+   *  Windows install behind a container runtime without `host.docker.internal`
+   *  routing covers nothing, so the WSL-local install entry stays on offer.
+   *  Only read when `hasWindowsOllama` is set; defaults to reachable. */
+  windowsHostOllamaSupported?: boolean;
   platform: NodeJS.Platform;
   isWsl: boolean;
   /** Resolved host for the running Ollama daemon. `host.docker.internal`
@@ -80,9 +85,13 @@ export function resolveRunningOllamaMenuEntry(
     (input.ollamaHost === OLLAMA_HOST_DOCKER_INTERNAL ? !windowsHostSuffix : !input.isWsl);
   const runningSuffix = input.ollamaRunning ? " — running" : "";
   const suggestionSuffix = suggested ? " (suggested)" : "";
+  // A stopped daemon renders as an action, not a status: selecting the entry
+  // starts Ollama, and a bare "Local Ollama (WSL:11434)" reads as a
+  // reachability claim when the daemon is down (#6750).
+  const labelPrefix = input.ollamaRunning ? "Local Ollama" : "Start local Ollama";
   return {
     key: "ollama",
-    label: `Local Ollama (${hostDisplay})${runningSuffix}${windowsHostSuffix}${suggestionSuffix}`,
+    label: `${labelPrefix} (${hostDisplay})${runningSuffix}${windowsHostSuffix}${suggestionSuffix}`,
   };
 }
 
@@ -106,9 +115,9 @@ function osTagFor(platform: NodeJS.Platform, isWsl: boolean): string | null {
  * Decide whether the onboard provider menu should expose an `install-ollama`
  * entry, and which label to render. Two cases:
  *
- *   1. No Ollama anywhere (host, running, or Windows) — offer a fresh install
- *      as a fallback (e.g. when the NVIDIA API server is down and cloud keys
- *      are unavailable).
+ *   1. No usable Ollama anywhere (host, running, or a Windows install the
+ *      sandbox can reach) — offer a fresh install as a fallback (e.g. when the
+ *      NVIDIA API server is down and cloud keys are unavailable).
  *   2. Host Ollama exists but its version is below `MIN_OLLAMA_VERSION` —
  *      offer an explicit upgrade so the express setup path doesn't reuse a
  *      daemon that crashes loading newer starter models.
@@ -143,8 +152,13 @@ export function resolveOllamaInstallMenuEntry(
   const daemonNeedsUpgrade =
     daemonProbeApplies && !isOllamaVersionAtLeast(runningOllamaVersion, MIN_OLLAMA_VERSION);
   const hasUpgradableOllama = binaryNeedsUpgrade || daemonNeedsUpgrade;
+  // A Windows-host install only covers the local-inference need when the
+  // sandbox can route to it. Under a container runtime without that routing,
+  // WSL-local Ollama is the only workable local provider, and suppressing its
+  // entry left a requested `install-ollama` with nothing to select (#8199).
+  const usableWindowsOllama = input.hasWindowsOllama && (input.windowsHostOllamaSupported ?? true);
   const showEntry =
-    (!input.hasOllama && !input.ollamaRunning && !input.hasWindowsOllama) || hasUpgradableOllama;
+    (!input.hasOllama && !input.ollamaRunning && !usableWindowsOllama) || hasUpgradableOllama;
   if (!showEntry) {
     return { entry: null, hasUpgradableOllama };
   }

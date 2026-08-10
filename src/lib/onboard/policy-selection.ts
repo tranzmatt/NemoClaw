@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { type WebSearchConfig, webSearchProviderForConfig } from "../inference/web-search";
+import * as policies from "../policy";
+import { PERSONAL_POLICY_TIER_NAME } from "../policy/tiers";
+import * as tiers from "../policy/tiers";
 import {
   filterSetupPolicyPresetNamesForAgent,
   filterSetupPolicyPresetsForAgent,
@@ -11,7 +14,10 @@ import {
   allHermesToolGatewayPolicyPresets,
   HERMES_TOOL_GATEWAY_PRESET_NAMES,
 } from "./hermes-managed-tools";
-import { allMessagingChannelPolicyPresets } from "./messaging-policy-presets";
+import {
+  allMessagingChannelPolicyPresets,
+  mergePolicyMessagingChannels,
+} from "./messaging-policy-presets";
 import {
   isInactiveObservabilityPolicyPreset,
   OBSERVABILITY_OTLP_LOCAL_POLICY_PRESET,
@@ -23,6 +29,17 @@ import {
   isStaleBuiltinWebSearchPolicyPreset,
   mergeRequiredSetupPolicyPresets,
 } from "./policy-preset-reconciliation";
+import { syncPresetSelection } from "./policy-preset-sync";
+import { getSuggestedPolicyPresets } from "./policy-presets";
+import {
+  type PreparedPolicyResumeSelection,
+  preparePolicyPresetResumeSelection,
+} from "./policy-resume-selection";
+import {
+  createPolicySelectionPromptHelpers,
+  type PolicySelectionPromptDeps,
+} from "./policy-selection-prompts";
+import * as policyTierEnv from "./policy-tier-env";
 import {
   agentRequiredPresetAdditions,
   emitSuppressedAgentRequiredPresetsNote,
@@ -36,6 +53,21 @@ export {
   mergeRequiredSetupPolicyPresets,
 } from "./policy-preset-reconciliation";
 export { suppressedAgentRequiredPresets } from "./policy-tier-suppression";
+
+export type OnboardPolicyApplicationDeps = Omit<
+  PolicySelectionPromptDeps,
+  "tiers" | "policyTierEnv"
+> & {
+  step: (number: number, total: number, title: string) => void;
+  localInferenceProviders: readonly string[];
+  withSandboxMutationLock: typeof import("../state/mcp-lifecycle-lock").withSandboxMutationLock;
+  waitForSandboxReady(sandboxName: string): boolean;
+  waitForSandboxControlPlaneReady(sandboxName: string): boolean;
+  setPolicyTier(sandboxName: string, tierName: string): void;
+  getRecordedPolicyTier(sandboxName: string): string | null | undefined;
+  parsePolicyPresetEnv(raw: string): string[];
+  env: NodeJS.ProcessEnv;
+};
 
 type Preset = { name: string; access?: string };
 type SupportOptions = { webSearchSupported?: boolean | null; agent?: string | null };
@@ -96,6 +128,7 @@ export type SetupPolicySelectionDeps = {
   note: (message: string) => void;
   isNonInteractive: () => boolean;
   waitForSandboxReady: (sandboxName: string) => boolean;
+  waitForSandboxControlPlaneReady: (sandboxName: string) => boolean;
   syncPresetSelection: (
     sandboxName: string,
     currentAppliedPresets: string[],
@@ -108,18 +141,91 @@ export type SetupPolicySelectionDeps = {
   selectTierPresetsAndAccess: (
     tierName: string,
     presets: Preset[],
-    extraSelected: string[],
+    initialSelected: string[],
   ) => Promise<Array<Preset & { access: string }>>;
   parsePolicyPresetEnv: (raw: string) => string[];
   env?: NodeJS.ProcessEnv;
 };
 
-export type PreparedPolicyResumeSelection = {
-  policyPresets: string[];
-  recordedPolicyPresetsNeedReconcile: boolean;
-  disabledMessagingPolicyPresetApplied: boolean;
-  suppressedAgentRequiredPresetsLive: boolean;
-};
+export function createOnboardPolicyApplication(deps: OnboardPolicyApplicationDeps) {
+  const promptHelpers = () =>
+    createPolicySelectionPromptHelpers({
+      ...deps,
+      tiers,
+      policyTierEnv,
+    });
+  const selectPolicyTier = () => promptHelpers().selectPolicyTier();
+  const selectTierPresetsAndAccess = (
+    tierName: string,
+    allPresets: Array<{ name: string; description?: string }>,
+    initialSelected?: string[],
+  ) => promptHelpers().selectTierPresetsAndAccess(tierName, allPresets, initialSelected);
+  const presetsCheckboxSelector = (
+    allPresets: Array<{ name: string; description: string }>,
+    initialSelected: string[],
+  ) => promptHelpers().presetsCheckboxSelector(allPresets, initialSelected);
+  const setupDeps: SetupPolicySelectionDeps = {
+    policies,
+    tiers,
+    localInferenceProviders: deps.localInferenceProviders,
+    step: deps.step,
+    note: deps.note,
+    isNonInteractive: deps.isNonInteractive,
+    waitForSandboxReady: deps.waitForSandboxReady,
+    waitForSandboxControlPlaneReady: deps.waitForSandboxControlPlaneReady,
+    syncPresetSelection,
+    selectPolicyTier,
+    setPolicyTier: deps.setPolicyTier,
+    getRecordedPolicyTier: deps.getRecordedPolicyTier,
+    selectTierPresetsAndAccess,
+    parsePolicyPresetEnv: deps.parsePolicyPresetEnv,
+    env: deps.env,
+  };
+
+  return {
+    arePolicyPresetsApplied(sandboxName: string, selectedPresets: string[] = []): boolean {
+      if (!Array.isArray(selectedPresets) || selectedPresets.length === 0) return false;
+      const applied = new Set(policies.getAppliedPresets(sandboxName));
+      return selectedPresets.every((preset) => applied.has(preset));
+    },
+    computeSetupPresetSuggestions(
+      tierName: string,
+      options: SetupPresetSuggestionOptions = {},
+    ): string[] {
+      return computeSetupPresetSuggestions(
+        {
+          policies,
+          tiers,
+          localInferenceProviders: deps.localInferenceProviders,
+        },
+        tierName,
+        options,
+      );
+    },
+    filterSetupPolicyPresets: policies.filterSetupPolicyPresets,
+    getSuggestedPolicyPresets,
+    mergePolicyMessagingChannels,
+    preparePolicyPresetResumeSelection(
+      sandboxName: string,
+      options: Parameters<typeof preparePolicyPresetResumeSelection>[2],
+    ): PreparedPolicyResumeSelection {
+      return preparePolicyPresetResumeSelection({ policies }, sandboxName, options);
+    },
+    presetsCheckboxSelector,
+    resolveSandboxBaselinePolicy: policies.resolveSandboxBaselinePolicy,
+    selectPolicyTier,
+    selectTierPresetsAndAccess,
+    setupPoliciesWithSelection(
+      sandboxName: string,
+      options: SetupPolicySelectionOptions = {},
+    ): Promise<string[]> {
+      return deps.withSandboxMutationLock(sandboxName, () =>
+        setupPoliciesWithSelection(setupDeps, sandboxName, options),
+      );
+    },
+    validatePolicyTierEnvEarly: policyTierEnv.validatePolicyTierEnvEarly,
+  };
+}
 
 export function computeSetupPresetSuggestions(
   deps: {
@@ -141,12 +247,14 @@ export function computeSetupPresetSuggestions(
   } = options;
   const known = Array.isArray(options.knownPresetNames) ? new Set(options.knownPresetNames) : null;
   const supportOptions = { webSearchSupported: options.webSearchSupported };
+  const preservesAllWebSearchPresets = tierName === PERSONAL_POLICY_TIER_NAME;
   const suggestions = deps.tiers
     .resolveTierPresets(tierName)
     .map((preset) => preset.name)
     .filter((name) => setupPolicyPresetAppliesToAgent(name, agent))
     .filter(
       (name) =>
+        preservesAllWebSearchPresets ||
         !isStaleBuiltinWebSearchPolicyPreset(name, {
           webSearchConfig,
           customPresetNames: options.customPresetNames,
@@ -216,7 +324,7 @@ export function computeSetupPresetSuggestions(
   return suggestions;
 }
 
-export { preparePolicyPresetResumeSelection } from "./policy-resume-selection";
+export { type PreparedPolicyResumeSelection, preparePolicyPresetResumeSelection };
 
 export async function setupPoliciesWithSelection(
   deps: SetupPolicySelectionDeps,
@@ -228,6 +336,23 @@ export async function setupPoliciesWithSelection(
   );
   seedInitialPolicyContext(sandboxName);
   return chosen;
+}
+
+function requireSandboxReady(
+  deps: SetupPolicySelectionDeps,
+  sandboxName: string,
+  stage: "before" | "after",
+): void {
+  if (!deps.waitForSandboxReady(sandboxName)) {
+    console.error(`  Sandbox '${sandboxName}' was not ready ${stage} policy application.`);
+    process.exit(1);
+  }
+  if (stage === "after" && !deps.waitForSandboxControlPlaneReady(sandboxName)) {
+    console.error(
+      `  Sandbox '${sandboxName}' did not re-register with OpenShell after policy application.`,
+    );
+    process.exit(1);
+  }
 }
 
 async function setupPoliciesWithSelectionInner(
@@ -334,23 +459,25 @@ async function setupPoliciesWithSelectionInner(
       customPresetNames,
       customOwnsObservability,
     });
-    chosen = pruneUnavailablePresets(chosen);
+    // Pass the recorded tier so the pruner exempts that tier's egress defaults
+    // (e.g. `brave` on Balanced) via provenance — a reconcile-triggered reuse
+    // reapply must not narrow an applied tier default. (#6844)
+    chosen = pruneUnavailablePresets(chosen, { tierName: recordedTierName });
   }
 
   if (selectedPresets !== null) {
     const resumeSelection = chosen || [];
     if (onSelection) onSelection(resumeSelection);
-    if (!deps.waitForSandboxReady(sandboxName)) {
-      console.error(`  Sandbox '${sandboxName}' was not ready for policy application.`);
-      process.exit(1);
-    }
+    requireSandboxReady(deps, sandboxName, "before");
     deps.note(`  [resume] Reapplying policy presets: ${resumeSelection.join(", ")}`);
     deps.syncPresetSelection(sandboxName, currentAppliedPresets, resumeSelection);
+    requireSandboxReady(deps, sandboxName, "after");
     return resumeSelection;
   }
 
   const tierName = recordedTierName ?? (await deps.selectPolicyTier());
   deps.setPolicyTier?.(sandboxName, tierName);
+  const personalTier = tierName === PERSONAL_POLICY_TIER_NAME;
   const suggestions = pruneUnavailablePresets(
     computeSetupPresetSuggestions(deps, tierName, {
       enabledChannels,
@@ -365,6 +492,7 @@ async function setupPoliciesWithSelectionInner(
       hermesToolGateways,
       env: deps.env,
     }),
+    { preserveExplicitWebSearch: personalTier },
   );
   const suppressedNames = emitSuppressedAgentRequiredPresetsNote(tierName, agent, deps.note);
 
@@ -417,7 +545,7 @@ async function setupPoliciesWithSelectionInner(
       customOwnsObservability,
     });
     chosen = pruneUnavailablePresets(chosen, {
-      preserveExplicitWebSearch: isAuthoritative,
+      preserveExplicitWebSearch: isAuthoritative || personalTier,
     });
 
     const invalidPresets = chosen.filter((name) => !knownPresets.has(name));
@@ -447,24 +575,22 @@ async function setupPoliciesWithSelectionInner(
     }
 
     if (onSelection) onSelection(chosen);
-    if (!deps.waitForSandboxReady(sandboxName)) {
-      console.error(`  Sandbox '${sandboxName}' was not ready for policy application.`);
-      process.exit(1);
-    }
+    requireSandboxReady(deps, sandboxName, "before");
     deps.note(`  [non-interactive] Applying policy presets: ${chosen.join(", ")}`);
     deps.syncPresetSelection(sandboxName, currentAppliedPresets, chosen);
+    requireSandboxReady(deps, sandboxName, "after");
     return chosen;
   }
 
   const knownNames = new Set(allPresets.map((preset) => preset.name));
-  const extraSelected = [
+  const initialSelected = [
     ...appliedForPreservation.filter((name) => knownNames.has(name)),
     ...suggestions.filter((name) => knownNames.has(name) && !applied.includes(name)),
   ];
   const resolvedPresets = await deps.selectTierPresetsAndAccess(
     tierName,
     allPresets,
-    extraSelected,
+    initialSelected,
   );
   const interactiveChoice = pruneUnavailablePresets(
     mergeRequiredSetupPolicyPresets(
@@ -486,13 +612,11 @@ async function setupPoliciesWithSelectionInner(
   );
 
   if (onSelection) onSelection(interactiveChoice);
-  if (!deps.waitForSandboxReady(sandboxName)) {
-    console.error(`  Sandbox '${sandboxName}' was not ready for policy application.`);
-    process.exit(1);
-  }
+  requireSandboxReady(deps, sandboxName, "before");
 
   const accessByName: Record<string, string> = {};
   for (const preset of resolvedPresets) accessByName[preset.name] = preset.access;
   deps.syncPresetSelection(sandboxName, currentAppliedPresets, interactiveChoice, accessByName);
+  requireSandboxReady(deps, sandboxName, "after");
   return interactiveChoice;
 }

@@ -11,9 +11,10 @@ import type { HostCliClient } from "../fixtures/clients/host.ts";
 import { expect, test } from "../fixtures/e2e-test.ts";
 import { requireHostedInferenceConfig } from "../fixtures/hosted-inference.ts";
 import type { ShellProbeResult, ShellProbeRunOptions } from "../fixtures/shell-probe.ts";
+import { trackOverlayfsAutofixCleanup } from "./overlayfs-autofix-cleanup.ts";
 import { negativeOverlayOutcome } from "./overlayfs-autofix-outcome.ts";
 
-// Keep this direct: the the contract mutates the host Docker daemon into
+// Keep this direct: the contract mutates the host Docker daemon into
 // Docker 26+ containerd-snapshotter overlayfs mode, runs the real installer,
 // proves NemoClaw routes the OpenShell cluster through a local
 // fuse-overlayfs-patched image, and then proves disabling the auto-fix exposes
@@ -21,11 +22,7 @@ import { negativeOverlayOutcome } from "./overlayfs-autofix-outcome.ts";
 // not reproduce that kernel-specific failure).
 
 const TEST_SANDBOX_PREFIX = "e2e-overlayfs";
-const SANDBOX_NAME =
-  process.env.NEMOCLAW_SANDBOX_NAME ??
-  [TEST_SANDBOX_PREFIX, process.env.GITHUB_RUN_ID, process.env.GITHUB_RUN_ATTEMPT, process.pid]
-    .filter(Boolean)
-    .join("-");
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? TEST_SANDBOX_PREFIX;
 const TEST_TIMEOUT_MS = Number(process.env.NEMOCLAW_E2E_TIMEOUT_SECONDS ?? 1_500) * 1_000;
 const NEGATIVE_TIMEOUT_SECONDS = Number(process.env.NEMOCLAW_OVERLAYFS_E2E_NEGATIVE_TIMEOUT ?? 300);
 const GATEWAY_CONTAINER = "openshell-cluster-nemoclaw";
@@ -67,14 +64,6 @@ async function bash(
   options: ShellProbeRunOptions = {},
 ): Promise<ShellProbeResult> {
   return host.command("bash", ["-lc", script], options);
-}
-
-async function bestEffort(run: () => Promise<unknown>): Promise<void> {
-  try {
-    await run();
-  } catch {
-    // Cleanup stays best-effort so the primary setup/assertion failure is visible.
-  }
 }
 
 async function preCleanup(
@@ -143,7 +132,19 @@ async function waitForDocker(host: HostCliClient): Promise<boolean> {
 
 test.skipIf(overlayfsAutofixNotInRuntimePath())(
   "overlayfs-autofix: patched cluster image handles Docker containerd overlayfs",
-  async ({ artifacts, cleanup, host, secrets, skip }) => {
+  {
+    timeout: TEST_TIMEOUT_MS * 3,
+    meta: {
+      e2ePhases: [
+        "confirm Docker overlayfs eligibility",
+        "enable containerd snapshotter mode",
+        "install with the overlayfs auto-fix enabled",
+        "confirm patched cluster image reuse",
+        "reproduce the failure with the auto-fix disabled",
+      ],
+    },
+  },
+  async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
     assertTestOwnedSandboxName();
 
     await artifacts.writeJson("contract.json", {
@@ -239,11 +240,18 @@ test.skipIf(overlayfsAutofixNotInRuntimePath())(
       expect(await waitForDocker(host), "Docker must come back after daemon restore").toBe(true);
       fs.rmSync(stateDir, { recursive: true, force: true });
     });
-    cleanup.add(`destroy overlayfs-autofix sandbox ${SANDBOX_NAME}`, async () => {
-      process.env.NEMOCLAW_E2E_KEEP_SANDBOX !== "1" &&
-        (await bestEffort(() => preCleanup(host, apiKey, "cleanup-overlayfs-sandbox")));
+    trackOverlayfsAutofixCleanup({
+      cleanup,
+      cleanupEnv: overlayEnv(apiKey, { GATEWAY_CONTAINER }),
+      gatewayContainer: GATEWAY_CONTAINER,
+      host,
+      preserveSandbox: process.env.NEMOCLAW_E2E_KEEP_SANDBOX === "1",
+      redactionValues,
+      sandbox,
+      sandboxName: SANDBOX_NAME,
     });
 
+    progress.phase("enable containerd snapshotter mode");
     const backup = await bash(
       host,
       `if [ -f ${DAEMON_JSON} ]; then sudo cp ${DAEMON_JSON} ${JSON.stringify(daemonBackup)}; else touch ${JSON.stringify(daemonAbsentMarker)}; fi`,
@@ -289,6 +297,7 @@ sudo systemctl restart docker`,
 
     await preCleanup(host, apiKey, "phase-2-pre-cleanup");
 
+    progress.phase("install with the overlayfs auto-fix enabled");
     const positive = await host.command("bash", ["install.sh", "--non-interactive"], {
       artifactName: "phase-3-install-autofix-on",
       cwd: process.cwd(),
@@ -341,6 +350,7 @@ sudo systemctl restart docker`,
     });
     expect(text(gatewayLogs)).not.toMatch(/overlayfs.*snapshotter cannot be enabled/i);
 
+    progress.phase("confirm patched cluster image reuse");
     const beforeCreated = await bash(
       host,
       `docker inspect --format '{{.Created}}' ${JSON.stringify(patchedTag)}`,
@@ -387,6 +397,7 @@ sudo systemctl restart docker`,
     expect(afterCreated.exitCode).toBe(0);
     expect(afterCreated.stdout.trim()).toBe(beforeCreated.stdout.trim());
 
+    progress.phase("reproduce the failure with the auto-fix disabled");
     await preCleanup(host, apiKey, "phase-5-negative-pre-cleanup");
     const negative = await host.command(
       "timeout",
@@ -431,5 +442,4 @@ sudo systemctl restart docker`,
         );
     }
   },
-  TEST_TIMEOUT_MS * 3,
 );

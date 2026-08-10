@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { captureOpenshell } from "../adapters/openshell/runtime";
 import { OPENSHELL_PROBE_TIMEOUT_MS } from "../adapters/openshell/timeouts";
-import { getLiveGatewayInference } from "../inference/live";
+import { sanitizeRouteValueForDisplay } from "../inference/config";
+import { captureOpenshell, getLiveGatewayInference } from "../inference/live";
 
 export interface InferenceGetOptions {
   json?: boolean;
@@ -59,10 +59,14 @@ export async function runInferenceGet(
     if (options.json) {
       deps.log(JSON.stringify(payload, null, 2));
     } else {
-      deps.log(`Provider: ${payload.provider ?? "unknown"}`);
-      deps.log(`Model:    ${payload.model ?? "unknown"}`);
+      deps.log(`Provider: ${formatRouteValueForDisplay(payload.provider)}`);
+      deps.log(`Model:    ${formatRouteValueForDisplay(payload.model)}`);
     }
   }
 
   return payload;
+}
+
+function formatRouteValueForDisplay(value: string | null): string {
+  return sanitizeRouteValueForDisplay(value) || "unknown";
 }

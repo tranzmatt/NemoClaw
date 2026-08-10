@@ -14,6 +14,7 @@ import { PREPARE_E2E_STEP } from "./prepare-e2e-workflow-boundary.mts";
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DEFAULT_WORKFLOW_PATH = join(REPO_ROOT, ".github", "workflows", "e2e.yaml");
 const JOB_NAME = "sandbox-operations";
+const RETIRED_JOB_NAME = "sandbox-rlimits-connect";
 const FULL_SHA_ACTION = /^[^\s@]+@[0-9a-f]{40}$/u;
 const GITHUB_ENV_REFERENCE = /\$\{?GITHUB_ENV\}?/u;
 const DOCKER_CREDENTIALS = ["DOCKERHUB_USERNAME", "DOCKERHUB_TOKEN"] as const;
@@ -30,6 +31,8 @@ type WorkflowStep = {
 type WorkflowJob = {
   env?: Record<string, unknown>;
   steps?: WorkflowStep[];
+  "runs-on"?: string;
+  "timeout-minutes"?: number;
 };
 
 export type SandboxOperationsWorkflow = {
@@ -72,6 +75,19 @@ export function validateSandboxOperationsWorkflow(workflow: {
   const job = (workflow.jobs[JOB_NAME] ?? {}) as WorkflowJob;
   const jobEnv = job.env ?? {};
   const steps = job.steps ?? [];
+
+  if (workflow.jobs[RETIRED_JOB_NAME] !== undefined) {
+    errors.push(`${RETIRED_JOB_NAME} must remain consolidated into ${JOB_NAME}`);
+  }
+  if (job["runs-on"] !== "ubuntu-latest") {
+    errors.push(`${JOB_NAME} must run on ubuntu-latest`);
+  }
+  if (job["timeout-minutes"] !== 60) {
+    errors.push(`${JOB_NAME} must retain its 60 minute recovery budget`);
+  }
+  if (jobEnv.E2E_ARTIFACT_DIR !== "${{ github.workspace }}/e2e-artifacts/live/sandbox-operations") {
+    errors.push(`${JOB_NAME} must use its isolated artifact directory`);
+  }
 
   if (Object.hasOwn(jobEnv, "DOCKER_CONFIG")) {
     errors.push(`${JOB_NAME} must not configure Docker auth at job scope`);
@@ -155,7 +171,7 @@ export function validateSandboxOperationsWorkflow(workflow: {
       errors.push(`${JOB_NAME} exposes the inference key outside the live test step`);
     }
   }
-  requireRunContains(errors, run, "npx vitest run --project e2e-live");
+  requireRunContains(errors, run, "tools/e2e/live-vitest-invocation.mts run --test-path");
   requireRunContains(errors, run, "test/e2e/live/sandbox-operations.test.ts");
 
   const cleanup = findStep(job, "Clean up Docker auth");

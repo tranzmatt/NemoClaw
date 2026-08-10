@@ -35,6 +35,7 @@ if __name__ == "__main__":
   "main.py": `from __future__ import annotations
 
 import os
+import asyncio
 from types import SimpleNamespace
 
 class Parser:
@@ -51,12 +52,39 @@ def parse_args():
     return args
 
 def cli_main():
-    return parse_args()
+    args = parse_args()
+    output_format = getattr(args, "output_format", "text")
+    if getattr(args, "non_interactive_message", None):
+        from deepagents_code.client.non_interactive import run_non_interactive
+
+        timeout = getattr(args, "timeout", None)
+        exit_code = asyncio.run(
+            asyncio.wait_for(
+                run_non_interactive(
+                            message=args.non_interactive_message,
+                ),
+                        timeout=timeout,
+            )
+        )
+        raise SystemExit(exit_code)
+    return args
 `,
-  "app.py": fs.readFileSync(
-    path.join(repoRoot, "test", "fixtures", "langchain-deepagents-code", "app.py"),
-    "utf8",
-  ),
+  "app.py": fs
+    .readFileSync(
+      path.join(repoRoot, "test", "fixtures", "langchain-deepagents-code", "app.py"),
+      "utf8",
+    )
+    .replace(
+      "    async def _switch_model(self, model_spec, **kwargs):\n",
+      `    async def _resume_thread(self, thread_id):
+        del thread_id
+
+    async def _restart_server_for_agent_swap(self, agent_name):
+        del agent_name
+
+    async def _switch_model(self, model_spec, **kwargs):
+`,
+    ),
   "auth_store.py": `from __future__ import annotations
 
 class StoredCredential: pass
@@ -78,6 +106,15 @@ def _load_dotenv(*, start_path=None, refresh_loaded=False): return False
 def _parse_interpreter_ptc(raw): return raw
 def _preview_dotenv_environ(*, start_path=None): return {}
 def _tracing_enabled(): return False
+`,
+  "tools.py": `from __future__ import annotations
+
+_MAX_FETCH_REDIRECTS = 5
+
+class _UrlValidationError(ValueError): pass
+
+def _fetch_with_redirects(url, *, timeout):
+    return url, timeout
 `,
   "model_config.py": `from __future__ import annotations
 
@@ -262,7 +299,17 @@ def _run_single_hook(command, event, payload_bytes): return None
 `,
   "client/non_interactive.py": `from __future__ import annotations
 
-async def run_non_interactive(*args, **kwargs): return kwargs
+async def run_non_interactive(*args, **kwargs):
+    try:
+        return kwargs
+    except Exception as e:
+        logger.exception("Unexpected error during non-interactive execution")
+        console.print(
+            f"\\n[red]Unexpected error ({type(e).__name__}): "
+            f"{escape_markup(str(e))}[/red]"
+        )
+        return 1
+
 async def _run_startup_command(command, console, *, quiet): return command
 `,
 };

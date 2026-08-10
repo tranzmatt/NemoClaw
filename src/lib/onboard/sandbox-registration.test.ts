@@ -6,9 +6,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const requireDist = createRequire(import.meta.url);
 const onboardSession = requireDist("../state/onboard-session.js");
-const { buildCreatedSandboxRegistryEntry, registerCreatedSandbox, selection } = requireDist(
-  "./sandbox-registration.ts",
-) as typeof import("./sandbox-registration");
+const {
+  assertBaselineExclusionsMatchCreateIntent,
+  baselineExclusionsForCreate,
+  buildCreatedSandboxRegistryEntry,
+  creationFidelity,
+  registerCreatedSandbox,
+  selection,
+} = requireDist("./sandbox-registration.ts") as typeof import("./sandbox-registration");
 
 const runtimeFields = {
   gpuEnabled: true,
@@ -21,11 +26,126 @@ const runtimeFields = {
 };
 
 describe("buildCreatedSandboxRegistryEntry", () => {
+  it("copies matching session profile provenance into the durable registry (#8246)", () => {
+    const provenance = {
+      schemaVersion: 1,
+      catalogDigest: `sha256:${"1".repeat(64)}`,
+      preset: {
+        id: "vllm.dgx-spark-gb10.single.example",
+        digest: `sha256:${"2".repeat(64)}`,
+        displayName: "Example Spark profile",
+        supportState: "experimental",
+      },
+      recipe: {
+        id: "vllm.dgx-spark-gb10.single.example",
+        digest: `sha256:${"3".repeat(64)}`,
+        backend: "vllm",
+      },
+      model: { id: "example/model", revision: "revision-1" },
+      runtimeImage: null,
+      estimatedImageDownloadBytes: null,
+      estimatedModelDownloadBytes: null,
+    } as const;
+    const loadSession = vi.spyOn(onboardSession, "loadSession").mockReturnValue({
+      sandboxName: "demo",
+      servingProfileProvenance: provenance,
+    });
+
+    const entry = buildCreatedSandboxRegistryEntry({
+      sandboxName: "demo",
+      inferenceSelection: {
+        model: "example/model",
+        provider: "vllm-local",
+        endpointUrl: null,
+        credentialEnv: null,
+        preferredInferenceApi: null,
+        compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
+        nimContainer: null,
+      },
+      runtimeFields,
+      agent: null,
+      agentVersionKnown: true,
+      imageTag: null,
+      appliedPolicies: [],
+      plannedMessagingState: undefined,
+      hermesToolGateways: [],
+      hermesDashboardState: { enabled: false, config: null },
+      dashboardPort: 18789,
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+    });
+
+    expect(entry.servingProfileProvenance).toEqual(provenance);
+    loadSession.mockRestore();
+  });
+
+  it("blocks create intent while a baseline policy transaction needs repair (#7178)", () => {
+    const registry = requireDist("../state/registry.js");
+    const transitionSpy = vi.spyOn(registry, "getBaselineExclusionTransition").mockReturnValue({
+      id: "tx-1",
+      operation: "exclude",
+      exclusion: {
+        version: 1,
+        agent: "openclaw",
+        key: "nous_research",
+        digest: "approved",
+      },
+      targetLiveDigest: null,
+      startedAt: "2026-07-19T00:00:00.000Z",
+    });
+
+    expect(() => baselineExclusionsForCreate("alpha")).toThrow(
+      /policy exclude.*needs repair before sandbox creation/i,
+    );
+
+    transitionSpy.mockRestore();
+  });
+
+  it("rejects a resolved create intent when durable baseline exclusions changed (#7194)", () => {
+    const registry = requireDist("../state/registry.js");
+    const transitionSpy = vi
+      .spyOn(registry, "getBaselineExclusionTransition")
+      .mockReturnValue(null);
+    const exclusionsSpy = vi.spyOn(registry, "getBaselineExclusions").mockReturnValue([
+      {
+        version: 1,
+        agent: "openclaw",
+        key: "nous_research",
+        digest: "b".repeat(64),
+        acknowledgedAt: "2026-07-19T00:00:00.000Z",
+      },
+    ]);
+    try {
+      expect(() =>
+        assertBaselineExclusionsMatchCreateIntent("alpha", [
+          {
+            version: 1,
+            agent: "openclaw",
+            key: "nous_research",
+            digest: "a".repeat(64),
+            acknowledgedAt: "2026-07-19T00:00:00.000Z",
+          },
+        ]),
+      ).toThrow(/changed while sandbox creation was being prepared/i);
+    } finally {
+      exclusionsSpy.mockRestore();
+      transitionSpy.mockRestore();
+    }
+  });
+
   it("records the final created sandbox metadata with configured messaging channels", () => {
     const plannedMessagingState = {
       schemaVersion: 1 as const,
       plan: { sandboxName: "demo" },
     };
+    const openclawImagePluginInstalls = [
+      {
+        id: "weather",
+        installPath: "/sandbox/.openclaw/extensions/weather",
+        loadPaths: ["/opt/weather-plugin"],
+      },
+    ];
 
     const entry = buildCreatedSandboxRegistryEntry({
       sandboxName: "demo",
@@ -36,14 +156,17 @@ describe("buildCreatedSandboxRegistryEntry", () => {
         credentialEnv: "COMPATIBLE_API_KEY",
         preferredInferenceApi: "openai-completions",
         compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
         nimContainer: null,
       },
       runtimeFields,
       agent: null,
       agentVersionKnown: true,
       imageTag: "nemoclaw-demo:123",
+      openclawImagePluginInstalls,
       appliedPolicies: ["discord", "slack"],
       observabilityEnabled: true,
+      dcodeAutoApprovalMode: "thread-opt-in",
       policyTier: "restricted",
       webSearchEnabled: true,
       fromDockerfile: "/tmp/Dockerfile.custom",
@@ -55,6 +178,8 @@ describe("buildCreatedSandboxRegistryEntry", () => {
         config: { enabled: true, port: 18790, internalPort: 19123, tuiEnabled: true },
       },
       dashboardPort: 18789,
+      lifecycleGeneration: "22222222-2222-4222-8222-222222222222",
+      lifecycleLiveIdentityFingerprint: "d".repeat(64),
       gatewayName: "nemoclaw-19080",
       gatewayPort: 19080,
     });
@@ -67,9 +192,11 @@ describe("buildCreatedSandboxRegistryEntry", () => {
       credentialEnv: "COMPATIBLE_API_KEY",
       preferredInferenceApi: "openai-completions",
       imageTag: "nemoclaw-demo:123",
+      openclawImagePluginInstalls,
       policies: ["discord", "slack"],
       toolDisclosure: "progressive",
       observabilityEnabled: true,
+      dcodeAutoApprovalMode: "thread-opt-in",
       policyTier: "restricted",
       webSearchEnabled: true,
       fromDockerfile: "/tmp/Dockerfile.custom",
@@ -80,6 +207,8 @@ describe("buildCreatedSandboxRegistryEntry", () => {
       hermesDashboardInternalPort: 19123,
       hermesDashboardTui: true,
       dashboardPort: 18789,
+      lifecycleGeneration: "22222222-2222-4222-8222-222222222222",
+      lifecycleLiveIdentityFingerprint: "d".repeat(64),
       gatewayName: "nemoclaw-19080",
       gatewayPort: 19080,
       gpuEnabled: true,
@@ -89,6 +218,11 @@ describe("buildCreatedSandboxRegistryEntry", () => {
     expect(entry.agent).toBeNull();
     expect(entry.agentVersion).toBeTruthy();
     expect(entry.nemoclawVersion).toBeTruthy();
+    expect(entry.openclawImagePluginInstalls).not.toBe(openclawImagePluginInstalls);
+    expect(entry.openclawImagePluginInstalls?.[0]).not.toBe(openclawImagePluginInstalls[0]);
+    expect(entry.openclawImagePluginInstalls?.[0]?.loadPaths).not.toBe(
+      openclawImagePluginInstalls[0]?.loadPaths,
+    );
     expect(entry.messaging).toBe(plannedMessagingState);
     const rawEntry = entry as unknown as Record<string, unknown>;
     expect(rawEntry.messagingChannels).toBeUndefined();
@@ -106,6 +240,7 @@ describe("buildCreatedSandboxRegistryEntry", () => {
         credentialEnv: "",
         preferredInferenceApi: "",
         compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
         nimContainer: "",
       },
       runtimeFields,
@@ -147,6 +282,7 @@ describe("buildCreatedSandboxRegistryEntry", () => {
     expect(entry.hermesAuthMethod).toBeNull();
     expect(entry.toolDisclosure).toBe("progressive");
     expect(entry.observabilityEnabled).toBe(false);
+    expect(entry.dcodeAutoApprovalMode).toBeUndefined();
   });
 
   it("carries a durable MCP rebuild manifest into the replacement registry entry", () => {
@@ -173,6 +309,7 @@ describe("buildCreatedSandboxRegistryEntry", () => {
         credentialEnv: null,
         preferredInferenceApi: null,
         compatibleEndpointReasoning: "true",
+        compatibleEndpointReasoningEffort: null,
         nimContainer: null,
       },
       runtimeFields,
@@ -196,6 +333,52 @@ describe("buildCreatedSandboxRegistryEntry", () => {
     expect(entry.toolDisclosure).toBe("direct");
   });
 
+  it("carries complete baseline exclusion records through consecutive registrations", () => {
+    const baselineExclusions = [
+      {
+        version: 1 as const,
+        agent: "openclaw",
+        key: "nous_research",
+        digest: "abc",
+        acknowledgedAt: "2026-07-19T00:00:00.000Z",
+        appliedAgentVersion: null,
+      },
+    ];
+    const fidelity = creationFidelity(null, null, null, false, baselineExclusions);
+    const common = {
+      sandboxName: "demo",
+      inferenceSelection: {
+        model: "llama",
+        provider: "compatible-endpoint",
+        endpointUrl: null,
+        credentialEnv: null,
+        preferredInferenceApi: null,
+        compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
+        nimContainer: null,
+      },
+      runtimeFields,
+      agent: null,
+      agentVersionKnown: true,
+      imageTag: null,
+      appliedPolicies: [],
+      plannedMessagingState: undefined,
+      hermesToolGateways: [],
+      hermesDashboardState: { enabled: false as const, config: null },
+      dashboardPort: 18789,
+      gatewayName: "nemoclaw",
+      gatewayPort: 8080,
+    };
+
+    const first = buildCreatedSandboxRegistryEntry({ ...common, ...fidelity });
+    const secondFidelity = creationFidelity(null, null, null, false, first.baselineExclusions);
+    const second = buildCreatedSandboxRegistryEntry({ ...common, ...secondFidelity });
+
+    expect(second.baselineExclusions).toEqual(baselineExclusions);
+    expect(second.baselineExclusions).not.toBe(first.baselineExclusions);
+    expect(second.baselineExclusions?.[0]).not.toBe(first.baselineExclusions?.[0]);
+  });
+
   it("normalizes invalid preferred inference API values", () => {
     const entry = buildCreatedSandboxRegistryEntry({
       sandboxName: "demo",
@@ -206,6 +389,7 @@ describe("buildCreatedSandboxRegistryEntry", () => {
         credentialEnv: "COMPATIBLE_API_KEY",
         preferredInferenceApi: "chat",
         compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
         nimContainer: null,
       },
       runtimeFields,
@@ -234,6 +418,7 @@ describe("buildCreatedSandboxRegistryEntry", () => {
         credentialEnv: null,
         preferredInferenceApi: null,
         compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
         nimContainer: null,
       },
       runtimeFields,
@@ -267,16 +452,21 @@ describe("selection", () => {
       endpointUrl: "https://wrong.test/v1",
       credentialEnv: "WRONG_KEY",
       compatibleEndpointReasoning: "true",
+      compatibleEndpointReasoningEffort: null,
       nimContainer: "wrong",
     });
 
-    expect(selection("demo", "compatible-endpoint", "llama", "openai-completions")).toEqual({
+    expect(
+      selection("demo", "compatible-endpoint", "llama", "openai-completions", "onboard"),
+    ).toEqual({
       provider: "compatible-endpoint",
       model: "llama",
       endpointUrl: null,
+      endpointSource: null,
       credentialEnv: null,
       preferredInferenceApi: "openai-completions",
       compatibleEndpointReasoning: null,
+      compatibleEndpointReasoningEffort: null,
       nimContainer: null,
     });
   });
@@ -289,16 +479,21 @@ describe("selection", () => {
       endpointUrl: "https://right.test/v1",
       credentialEnv: "COMPATIBLE_API_KEY",
       compatibleEndpointReasoning: "true",
+      compatibleEndpointReasoningEffort: "high",
       nimContainer: "nim-right",
     });
 
-    expect(selection("demo", "compatible-endpoint", "llama", "openai-completions")).toEqual({
+    expect(
+      selection("demo", "compatible-endpoint", "llama", "openai-completions", "onboard"),
+    ).toEqual({
       provider: "compatible-endpoint",
       model: "llama",
       endpointUrl: "https://right.test/v1",
+      endpointSource: "onboard",
       credentialEnv: "COMPATIBLE_API_KEY",
       preferredInferenceApi: "openai-completions",
       compatibleEndpointReasoning: "true",
+      compatibleEndpointReasoningEffort: "high",
       nimContainer: "nim-right",
     });
   });
@@ -308,7 +503,7 @@ describe("registerCreatedSandbox", () => {
   it("passes the built entry to the supplied registry writer", () => {
     const registerSandbox = vi.fn();
 
-    const entry = registerCreatedSandbox({
+    const input = {
       sandboxName: "demo",
       inferenceSelection: {
         model: "llama",
@@ -317,12 +512,20 @@ describe("registerCreatedSandbox", () => {
         credentialEnv: null,
         preferredInferenceApi: null,
         compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
         nimContainer: null,
       },
       runtimeFields,
       agent: null,
       agentVersionKnown: true,
       imageTag: null,
+      workload: {
+        schemaVersion: 1,
+        kind: "legacy-dockerfile",
+        reference: null,
+        shared: false,
+      },
+      openclawImagePluginInstalls: [],
       appliedPolicies: [],
       plannedMessagingState: undefined,
       hermesToolGateways: [],
@@ -331,9 +534,52 @@ describe("registerCreatedSandbox", () => {
       gatewayName: "nemoclaw",
       gatewayPort: 8080,
       registerSandbox,
-    });
+    } satisfies Parameters<typeof registerCreatedSandbox>[0];
+    const entry = registerCreatedSandbox(input);
 
     expect(registerSandbox).toHaveBeenCalledWith(entry);
     expect(entry.name).toBe("demo");
+    expect(entry.openclawImagePluginInstalls).toEqual([]);
+    expect(entry.workload).toEqual(input.workload);
+    expect(() =>
+      registerCreatedSandbox({
+        ...input,
+        workload: { ...input.workload, reference: "" },
+      }),
+    ).toThrow(/workload ownership receipt failed closed validation/u);
+    expect(registerSandbox).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails before registry mutation for an unknown durable provider identity", () => {
+    const registerSandbox = vi.fn();
+
+    expect(() =>
+      registerCreatedSandbox({
+        sandboxName: "demo",
+        inferenceSelection: {
+          model: "llama",
+          provider: "openai-compatible",
+          endpointUrl: null,
+          credentialEnv: null,
+          preferredInferenceApi: null,
+          compatibleEndpointReasoning: null,
+          compatibleEndpointReasoningEffort: null,
+          nimContainer: null,
+        },
+        runtimeFields: { ...runtimeFields, openshellDriver: "unknown-runtime" },
+        agent: null,
+        agentVersionKnown: true,
+        imageTag: null,
+        appliedPolicies: [],
+        plannedMessagingState: undefined,
+        hermesToolGateways: [],
+        hermesDashboardState: { enabled: false, config: null },
+        dashboardPort: 18789,
+        gatewayName: "nemoclaw",
+        gatewayPort: 8080,
+        registerSandbox,
+      }),
+    ).toThrow(/not registered/u);
+    expect(registerSandbox).not.toHaveBeenCalled();
   });
 });

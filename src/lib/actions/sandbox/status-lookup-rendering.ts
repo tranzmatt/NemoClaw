@@ -47,9 +47,30 @@ export async function printSandboxGatewayLookupStatus(
     case "gateway_missing_after_restart":
       await printGatewayMissingAfterRestartLookupStatus(context);
       return;
+    case "sandbox_recovery_failed":
+      printSandboxRecoveryFailedLookupStatus(context);
+      return;
     default:
       await printUnknownGatewayLookupStatus(context);
   }
+}
+
+function printSandboxRecoveryFailedLookupStatus({
+  sandboxName,
+  lookup,
+}: SandboxGatewayLookupStatusContext): void {
+  console.log("");
+  const recoveredFromDocker = "recoveredSandbox" in lookup && lookup.recoveredSandbox === true;
+  console.log(
+    recoveredFromDocker
+      ? `  Sandbox '${sandboxName}' was restored from Docker, but its agent delivery chain could not be proven.`
+      : `  Sandbox '${sandboxName}' is present, but its agent delivery chain could not be proven.`,
+  );
+  if (lookup.output) console.log(lookup.output);
+  console.log(
+    `  Retry \`${CLI_NAME} ${sandboxName} recover\` after addressing the reported layer.`,
+  );
+  process.exit(1);
 }
 
 function printMissingLiveSandboxStatusGuidance(
@@ -243,6 +264,15 @@ function printNonReadySandboxPhaseGuidance({
     "  This usually happens when a process crash inside the sandbox prevented clean startup.",
   );
   console.log("");
+  if (phase === "Error" && dockerRuntime?.containerName) {
+    console.log(
+      `  Run \`${CLI_NAME} ${sandboxName} start\` to restart the crashed container and recover the sandbox with workspace state preserved.`,
+    );
+    console.log(
+      `  (\`${CLI_NAME} ${sandboxName} rebuild --yes\` recreates the sandbox instead, but its pre-rebuild backup cannot snapshot a stopped container, so start it first.)`,
+    );
+    return;
+  }
   console.log(
     `  Run \`${CLI_NAME} ${sandboxName} rebuild --yes\` to recreate the sandbox (--yes skips the confirmation prompt; workspace state will be preserved).`,
   );

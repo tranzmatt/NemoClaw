@@ -247,17 +247,25 @@ export function createDynamicGatewayRuntimeHelpers(deps: DynamicGatewayRuntimeDe
     deps.getDockerDriverGatewayEndpoint(deps.getGatewayPort());
   const getGatewayClusterImageDrift = () =>
     deps.getGatewayClusterImageDrift({ gatewayName: deps.getGatewayName() });
-  const isGatewayHttpReady = (timeoutMs?: number, url?: string, method?: "GET" | "POST") =>
-    deps.probeGatewayHttpReady(
-      timeoutMs,
-      url ?? `${deps.getDockerDriverGatewayEndpoint(deps.getGatewayPort())}/`,
-      method,
-    );
-  const isDockerDriverGatewayHttpReady = (timeoutMs?: number, url?: string) =>
+  const isGatewayHttpReady = (
+    timeoutMs?: number,
+    url?: string,
+    method?: "GET" | "POST",
+    signal?: AbortSignal,
+  ) => {
+    const targetUrl = url ?? `${deps.getDockerDriverGatewayEndpoint(deps.getGatewayPort())}/`;
+    return deps.probeGatewayHttpReady(timeoutMs, targetUrl, method, signal);
+  };
+  const isDockerDriverGatewayHttpReady = (
+    timeoutMs?: number,
+    url?: string,
+    env?: NodeJS.ProcessEnv,
+  ) =>
     deps.probeDockerDriverGatewayHttpReady(
       timeoutMs,
       url ??
         `${deps.getDockerDriverGatewayEndpoint(deps.getGatewayPort())}/openshell.v1.OpenShell/Health`,
+      env,
     );
   const waitForGatewayHttpReady = (
     opts: import("./gateway-http-readiness").WaitForGatewayHttpReadyOpts = {},

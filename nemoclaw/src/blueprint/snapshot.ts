@@ -11,14 +11,12 @@
  *   - Rollback: restore host config from snapshot
  */
 
-import type { Dirent } from "node:fs";
 import {
   cpSync,
   existsSync,
   lstatSync,
   mkdirSync,
   readdirSync,
-  readFileSync,
   readlinkSync,
   renameSync,
   rmSync,
@@ -29,11 +27,18 @@ import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { execa } from "execa";
 
+import * as importedSandboxName from "../shared/sandbox-name.cjs";
+
 const HOME = homedir();
 const OPENCLAW_DIR = join(HOME, ".openclaw");
 const NEMOCLAW_DIR = join(HOME, ".nemoclaw");
 const SNAPSHOTS_DIR = join(NEMOCLAW_DIR, "snapshots");
-const SANDBOX_NAME_RE = /^[a-z]([a-z0-9-]*[a-z0-9])?$/;
+
+// sourceOfTruth: nemoclaw/src/shared/sandbox-name.cts
+const sourceOrGeneratedSandboxName = importedSandboxName as typeof importedSandboxName & {
+  default?: typeof importedSandboxName;
+};
+const { assertValidName } = sourceOrGeneratedSandboxName.default ?? sourceOrGeneratedSandboxName;
 
 function compactTimestamp(): string {
   return new Date()
@@ -95,16 +100,6 @@ function collectFiles(dir: string): { files: string[]; symlinks: string[] } {
   return { files, symlinks };
 }
 
-function validateSandboxName(sandboxName: string): void {
-  if (!SANDBOX_NAME_RE.test(sandboxName) || sandboxName.length > 63) {
-    const preview = sandboxName.length > 80 ? `${sandboxName.slice(0, 80)}…` : sandboxName;
-    throw new Error(
-      `Invalid sandbox name: '${preview}'. ` +
-        "Allowed format: lowercase, starts with a letter, letters/numbers/internal hyphens only, ends with letter/number.",
-    );
-  }
-}
-
 export function createSnapshot(): string | null {
   if (!existsSync(OPENCLAW_DIR)) {
     return null;
@@ -146,7 +141,7 @@ export async function restoreIntoSandbox(
   snapshotDir: string,
   sandboxName = "openclaw",
 ): Promise<boolean> {
-  validateSandboxName(sandboxName);
+  assertValidName(sandboxName, "sandbox name");
 
   const source = join(snapshotDir, "openclaw");
   if (!existsSync(source)) {
@@ -290,59 +285,10 @@ export function rollbackFromSnapshot(snapshotDir: string): boolean {
   }
 }
 
-// Named BlueprintSnapshotManifest to avoid collision with migration-state.ts SnapshotManifest
-export interface BlueprintSnapshotManifest {
-  timestamp: string;
-  source: string;
-  file_count: number;
-  contents: string[];
-  path: string;
-}
-
-type SnapshotManifestJson = {
-  timestamp?: string;
-  source?: string;
-  file_count?: number;
-  contents?: Array<string | null>;
-};
-
-function isSnapshotManifestJson(value: object | null): value is SnapshotManifestJson {
-  return value !== null && !Array.isArray(value);
-}
-
-function readStringArray(value: SnapshotManifestJson["contents"]): string[] {
-  return Array.isArray(value)
-    ? value.filter((entry): entry is string => typeof entry === "string")
-    : [];
-}
-
-export function listSnapshots(): BlueprintSnapshotManifest[] {
-  let entries: Dirent[];
-  try {
-    entries = readdirSync(SNAPSHOTS_DIR, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-
-  const snapshots: BlueprintSnapshotManifest[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const snapDir = join(SNAPSHOTS_DIR, entry.name);
-    try {
-      const parsed: unknown = JSON.parse(readFileSync(join(snapDir, "snapshot.json"), "utf-8"));
-      const raw = typeof parsed === "object" && parsed !== null ? parsed : null;
-      if (!isSnapshotManifestJson(raw) || typeof raw.timestamp !== "string") continue;
-      snapshots.push({
-        timestamp: raw.timestamp,
-        source: typeof raw.source === "string" ? raw.source : "",
-        file_count: typeof raw.file_count === "number" ? raw.file_count : 0,
-        contents: readStringArray(raw.contents),
-        path: snapDir,
-      });
-    } catch {
-      // Skip snapshots with missing or unreadable manifests
-    }
-  }
-
-  return snapshots.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-}
+export {
+  deleteSnapshot,
+  isSnapshotPathInsideSnapshotsDir,
+  listSnapshots,
+  pruneSnapshots,
+} from "./snapshot-management.js";
+export type { BlueprintSnapshotManifest } from "./snapshot-management.js";

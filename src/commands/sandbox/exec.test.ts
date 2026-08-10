@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const execSandboxMock = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock("../../lib/actions/sandbox/exec", () => ({
   execSandbox: execSandboxMock,
 }));
 
+import { log } from "../../lib/cli/logger";
 import SandboxExecCommand from "./exec";
 
 const rootDir = process.cwd();
@@ -15,6 +16,10 @@ const rootDir = process.cwd();
 describe("SandboxExecCommand oclif parse path", () => {
   beforeEach(() => {
     execSandboxMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("forwards everything after -- as the inner command argv", async () => {
@@ -27,6 +32,21 @@ describe("SandboxExecCommand oclif parse path", () => {
       ["openclaw", "agent", "--agent", "main", "-m", "hi"],
       { workdir: undefined, tty: null, timeoutSeconds: undefined, stdin: undefined },
     );
+  });
+
+  it("does not assign host meaning to logging flags after --", async () => {
+    const configure = vi.spyOn(log, "configure").mockImplementation(() => undefined);
+
+    await SandboxExecCommand.run(["alpha", "--", "agent-cli", "--debug", "--quiet"], rootDir);
+
+    expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["agent-cli", "--debug", "--quiet"], {
+      workdir: undefined,
+      tty: null,
+      timeoutSeconds: undefined,
+    });
+    expect(configure).toHaveBeenCalledWith({ debug: false, quiet: false });
+    expect(configure).not.toHaveBeenCalledWith({ debug: true, quiet: false });
+    expect(configure).not.toHaveBeenCalledWith({ debug: false, quiet: true });
   });
 
   it("preserves repeated flag/value pairs after -- in their original order", async () => {
@@ -75,7 +95,7 @@ describe("SandboxExecCommand oclif parse path", () => {
         "-c",
         "pass",
       ],
-      { workdir: undefined, tty: null, timeoutSeconds: undefined },
+      { workdir: undefined, tty: null, timeoutSeconds: undefined, stdin: undefined },
     );
   });
 
@@ -92,10 +112,9 @@ describe("SandboxExecCommand oclif parse path", () => {
     });
   });
 
-  it("forwards a multi-line heredoc command verbatim to the action guard (#5980)", async () => {
-    // The command layer forwards argv unchanged; execSandbox() applies the
-    // newline guard (exit 2 before dispatch), which is asserted directly in the
-    // action test. Here we pin that the heredoc reaches the action intact.
+  it("forwards a multi-line heredoc command verbatim to the action", async () => {
+    // The action dispatches this exact argument through OpenShell. Its
+    // byte-preserving boundary is asserted directly in the action test.
     const heredoc = "cat <<EOF\nline1\nline2\nEOF";
     await SandboxExecCommand.run(["alpha", "--", "bash", "-lc", heredoc], rootDir);
     expect(execSandboxMock).toHaveBeenCalledWith("alpha", ["bash", "-lc", heredoc], {
@@ -106,10 +125,7 @@ describe("SandboxExecCommand oclif parse path", () => {
     });
   });
 
-  it("forwards the semicolon workaround to dispatch (#5980)", async () => {
-    // Mirrors the action-layer "forwards the semicolon workaround to dispatch"
-    // test: the single-line semicolon-joined command carries no newline, so the
-    // command layer hands it to execSandbox() unchanged, which then dispatches.
+  it("forwards a semicolon-joined command unchanged", async () => {
     await SandboxExecCommand.run(["alpha", "--", "bash", "-lc", "echo line1; echo line2"], rootDir);
     expect(execSandboxMock).toHaveBeenCalledWith(
       "alpha",
@@ -118,7 +134,7 @@ describe("SandboxExecCommand oclif parse path", () => {
     );
   });
 
-  it("preserves --workdir and forwards a single-line command unchanged (#5980)", async () => {
+  it("preserves --workdir and forwards a single-line command unchanged", async () => {
     await SandboxExecCommand.run(
       ["alpha", "--workdir", "/sandbox", "--", "bash", "-lc", "echo line1; echo line2"],
       rootDir,

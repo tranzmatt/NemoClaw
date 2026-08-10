@@ -157,6 +157,24 @@ describe.skipIf(!canRun)(
       });
     });
 
+    it("reports native OpenRouter identity for a managed OpenRouter config (#6678)", () => {
+      withTempDir((dir) => {
+        const config = SAMPLE_CONFIG.replace(
+          "upstream provider: nvidia-prod",
+          "upstream provider: openrouter-api",
+        )
+          .replace('default = "openai:demo-model"', 'default = "openrouter:demo-model"')
+          .replace("[models.providers.openai]", "[models.providers.openrouter]");
+        const run = runBashWrapper(buildFixture(dir, config), ["status"], {});
+
+        expect(run.status).toBe(0);
+        expect(run.stdout).toContain("Provider: openrouter");
+        expect(run.stdout).toContain("Model:    openrouter:demo-model");
+        expect(run.stdout).toContain("Endpoint: https://inference.local/v1");
+        expect(run.stdout).not.toContain("Provider: openrouter-api");
+      });
+    });
+
     it("uses the upstream default agent when configured preferences are stale", () => {
       withTempDir((dir) => {
         const run = runBashWrapper(buildFixture(dir, SAMPLE_CONFIG), ["status"], {});
@@ -469,17 +487,22 @@ describe.skipIf(!canRun)(
 );
 
 describe.skipIf(!canRun)(
-  "agents/langchain-deepagents-code/dcode-wrapper.sh OpenShell infra-key allowlist",
+  "agents/langchain-deepagents-code/dcode-wrapper.sh OpenShell supervisor identity boundary",
   () => {
-    it("starts dcode when runtime OPENSHELL_TLS_KEY carries the canonical mounted path", () => {
+    it.each([
+      ["OPENSHELL_TLS_CA", "/etc/openshell/tls/client/ca.crt"],
+      ["OPENSHELL_TLS_CERT", "/etc/openshell/tls/client/tls.crt"],
+      ["OPENSHELL_TLS_KEY", CANONICAL_TLS_KEY_PATH],
+    ])("refuses supervisor-only runtime %s regardless of mounted-path shape", (name, value) => {
       withTempDir((dir) => {
         const run = runBashWrapper(buildFixture(dir, SAMPLE_CONFIG), ["--version"], {
-          OPENSHELL_TLS_KEY: CANONICAL_TLS_KEY_PATH,
+          [name]: value,
         });
 
-        expect(run.status).toBe(0);
-        expect(run.launched).toBe(true);
-        expect(run.stderr).not.toContain("refusing to start");
+        expect(run.status).toBe(2);
+        expect(run.launched).toBe(false);
+        expect(run.stderr).toContain(name);
+        expect(run.stderr).not.toContain(value);
       });
     });
 

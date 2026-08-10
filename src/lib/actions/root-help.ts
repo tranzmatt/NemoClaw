@@ -85,6 +85,9 @@ export function help(): void {
   lines.push(
     `    --destroy-user-data${" ".repeat(15)}Remove preserved ~/.nemoclaw/ user data (rebuild-backups/, backups/, sandboxes.json)`,
   );
+  lines.push(
+    `    --all-gateway-ports${" ".repeat(15)}Uninstall every gateway port on this host, not only NEMOCLAW_GATEWAY_PORT`,
+  );
 
   lines.push("");
   lines.push(`  ${G}Reconfiguration (after onboard):${R}`);
@@ -92,7 +95,7 @@ export function help(): void {
     `    ${D}• Check inference route:   ${CLI_NAME} inference get${R}`,
     `    ${D}• Change inference model:  ${CLI_NAME} inference set --model <model> --provider <provider>${R}`,
   );
-  lines.push(`    ${D}• Add network presets:     use the policy-add command on your sandbox${R}`);
+  lines.push(`    ${D}• Add network presets:     use the policy add command on your sandbox${R}`);
   lines.push(
     `    ${D}• Change credentials:      credentials reset <PROVIDER>, then re-run onboard${R}`,
   );

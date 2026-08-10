@@ -15,7 +15,9 @@
 // so they accept whatever the orchestrator hands in without needing to
 // duplicate every helper's exact signature.
 
+import type { TrustedPrivateEndpointCapability } from "../../inference/endpoint-ssrf-preflight";
 import type { HermesAuthMethod } from "../hermes-auth";
+import type { OnboardInferenceCapabilityCache } from "../inference-capability-cache";
 
 export type SetupInferenceResult = { ok: true; retry?: undefined } | { retry: "selection" };
 
@@ -65,7 +67,10 @@ export type VerifyOnboardInferenceSmoke = (input: {
   endpointUrl?: string | null;
   credentialEnv?: string | null;
   forceOpenAiLike?: boolean;
-}) => void;
+  pinnedAddresses?: readonly string[];
+  trustedPrivateCapability?: TrustedPrivateEndpointCapability;
+  capabilityCache?: OnboardInferenceCapabilityCache;
+}) => void | Promise<void>;
 
 export type PromptValidationRecovery = (
   label: string,
@@ -108,7 +113,7 @@ export type RemoteProviderDeps = CommonDeps & {
     model: string,
     apiKey: string,
     options?: Record<string, unknown>,
-  ) => { ok: boolean; message?: string };
+  ) => { ok: boolean; message?: string } | Promise<{ ok: boolean; message?: string }>;
   readGatewayProviderMetadata?: (
     name: string,
     runOpenshell: RunOpenshell,
@@ -124,6 +129,26 @@ export type RemoteProviderDeps = CommonDeps & {
       model: string;
       endpointUrl: string | null;
       credentialEnv: string | null;
+      isNonInteractive: () => boolean;
+      runOpenshell: RunOpenshell;
+      upsertProvider: UpsertProvider;
+      verifyInferenceRoute: VerifyInferenceRoute;
+      verifyOnboardInferenceSmoke: any;
+      updateSandbox: Registry["updateSandbox"];
+      exitProcess: CommonDeps["exitProcess"];
+      error: (message: string) => void;
+      log: (message: string) => void;
+    }): Promise<{ handled: true; result: SetupInferenceResult } | { handled: false }>;
+  };
+  openrouterRuntimeOnboard: {
+    setupOpenRouterRuntimeInference(input: {
+      sandboxName: string | null;
+      provider: string;
+      model: string;
+      credentialEnv: string | null;
+      credentialValue: string | null;
+      reuseGatewayCredentialWithoutLocalKey?: boolean;
+      skipHostInferenceSmoke?: boolean;
       isNonInteractive: () => boolean;
       runOpenshell: RunOpenshell;
       upsertProvider: UpsertProvider;
@@ -201,6 +226,11 @@ export type VllmDeps = CommonDeps & {
   applyLocalInferenceRoute: (provider: string, model: string) => Promise<boolean>;
   run: RunFn;
   VLLM_LOCAL_CREDENTIAL_ENV: string;
+  getManagedVllmProviderBinding: () => {
+    baseUrl: string;
+    validationBaseUrl?: string;
+    apiKey: string;
+  } | null;
 };
 
 export type OllamaDeps = CommonDeps & {
@@ -249,10 +279,12 @@ export const REMOTE_PROVIDER_NAMES = [
   "nvidia-prod",
   "nvidia-nim",
   "openai-api",
+  "openrouter-api",
   "anthropic-prod",
   "compatible-anthropic-endpoint",
   "gemini-api",
   "compatible-endpoint",
+  "llama-cpp-local",
 ] as const;
 
 export type RemoteProviderName = (typeof REMOTE_PROVIDER_NAMES)[number];

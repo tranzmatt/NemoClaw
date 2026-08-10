@@ -12,48 +12,85 @@
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
+  readSync,
+  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { spawnSync } from "child_process";
 
-import { captureSandboxSshConfigCommand } from "../adapters/openshell/client.js";
+import {
+  captureSandboxSshConfigCommand,
+  resolveOpenshellSandboxSshHost,
+} from "../adapters/openshell/client.js";
 import { resolveOpenshell } from "../adapters/openshell/resolve.js";
 import { OPENSHELL_PROBE_TIMEOUT_MS } from "../adapters/openshell/timeouts.js";
 import type { AgentStateFile } from "../agent/defs.js";
 import { loadAgent } from "../agent/defs.js";
-import { isRecord, type UnknownRecord } from "../core/json-types.js";
+import { isObjectRecord, type UnknownRecord } from "../core/json-types.js";
+import { GATEWAY_PORT } from "../core/ports.js";
+import {
+  BACKUP_FAILURE_ABSENT_AFTER_EXTRACTION,
+  classifyFailedDirsFromTarStderr,
+} from "../domain/backup-failure.js";
 import { shellQuote } from "../runner.js";
 import { createTempSshConfig } from "../sandbox/temp-ssh-config.js";
-import { isSensitiveFile, sanitizeConfigFile } from "../security/credential-filter.js";
-import {
-  buildOpenClawConfigRestoreInputFromSandbox,
-  shouldMergeOpenClawConfigStateFile,
-} from "./openclaw-config-restore-input.js";
+import { sanitizeSnapshotDirectory } from "../security/snapshot-sanitizer.js";
 import {
   buildRestoreCleanupCommand,
   buildRestoreTarArgs,
   isAllowedStateSymlink,
-  shouldPreserveOpenClawManagedExtensions,
 } from "./openclaw-managed-extensions.js";
+import {
+  discoverFreshOpenClawImagePluginInstalls,
+  hasCompleteOpenClawImagePluginProvenance,
+  type OpenClawImagePluginInstall,
+  parseOpenClawImagePluginInstalls,
+  planOpenClawPluginRestore,
+} from "./openclaw-plugin-restore.js";
+import {
+  extractPreservedEnvAssignments,
+  HERMES_PRESERVED_ENV_INVENTORY,
+  type PreservedEnvFile,
+  type PreservedEnvInventory,
+  validatePreservedEnvFiles,
+} from "./preserved-env/index.js";
+import {
+  cloneSandboxRuntimeSnapshot,
+  type SandboxRuntimeSnapshot,
+} from "./registry/runtime-snapshot.js";
+import type { SandboxEntry, SandboxWorkloadReceipt } from "./registry/types.js";
+import { cloneSandboxWorkloadReceipt } from "./registry/workload.js";
 import type { CustomPolicyEntry } from "./registry.js";
 import * as registry from "./registry.js";
 import { isSshTransportFailure } from "./ssh-transport.js";
-import type { StateFileRestorePolicy } from "./state-file-restore-policy.js";
-import { runTarListing } from "./tar-listing.js";
+import { restoreStateFile } from "./state-file-restore.js";
+import { nemoclawStateRoot } from "./state-root.js";
+import { runTarListing, type TarArchiveSource } from "./tar-listing.js";
 
 const HOME_DIR = path.resolve(process.env.HOME || os.homedir());
-const REBUILD_BACKUPS_DIR = path.join(HOME_DIR, ".nemoclaw", "rebuild-backups");
+const REBUILD_BACKUPS_DIR = path.join(nemoclawStateRoot(HOME_DIR, GATEWAY_PORT), "rebuild-backups");
 
 const MANIFEST_VERSION = 1;
+export const OPENCLAW_IMAGE_PLUGIN_PROVENANCE_RESTORE_ERROR =
+  "custom-image OpenClaw plugin provenance is missing or invalid";
+export const MANAGED_SNAPSHOT_RESTORE_AUTHORITY_ERROR =
+  "managed snapshot restore requires exact content and runtime authority";
 
 function parseJson<T>(text: string): T {
   return JSON.parse(text);
@@ -68,9 +105,15 @@ export interface RebuildManifest {
   agentType: string;
   agentVersion: string | null;
   expectedVersion: string | null;
+  /** Fresh-image plugin baseline captured before user state was restored. */
+  openclawImagePluginInstalls?: OpenClawImagePluginInstall[];
+  /** The plugin baseline is authoritative and must be reconciled during recreation. */
+  reconcileOpenClawImagePluginProvenance?: boolean;
   stateDirs: string[];
   /** Directories verified as safe to restore. Absent on older manifests. */
   backedUpDirs?: string[];
+  /** Declared directories that could not be backed up. Absent on older manifests. */
+  failedBackupDirs?: string[];
   stateFiles?: StateFileSpec[];
   /** Single config/state directory */
   dir: string;
@@ -88,6 +131,18 @@ export interface RebuildManifest {
    * zero-custom snapshot); absent only on legacy manifests.
    */
   customPolicies?: CustomPolicyEntry[];
+  /** Allowlisted non-secret environment assignments captured for image recreation. */
+  preservedEnv?: PreservedEnvFile[];
+  /**
+   * Provider-neutral runtime and acceleration state captured before the
+   * filesystem copy. Required when `workload` is a managed-image receipt.
+   */
+  runtimeSnapshot?: SandboxRuntimeSnapshot;
+  /**
+   * Exact immutable managed workload/profile authority associated with this
+   * snapshot. Older and explicit Dockerfile snapshots omit this field.
+   */
+  workload?: SandboxWorkloadReceipt;
   instances?: InstanceBackup[];
   // Optional user-provided label for `snapshot restore <name>`.
   name?: string;
@@ -100,6 +155,14 @@ export type SnapshotEntry = RebuildManifest & { snapshotVersion: number };
 
 export interface BackupOptions {
   name?: string | null;
+  runtimeSnapshot?: SandboxRuntimeSnapshot;
+  workload?: SandboxWorkloadReceipt;
+  /**
+   * Internal publication fence for provider-backed backups. The callback
+   * runs after data capture and sanitization but before the manifest becomes
+   * visible to restore and rebuild flows.
+   */
+  validateBeforePublish?: () => void;
 }
 
 export interface InstanceBackup {
@@ -124,6 +187,12 @@ export interface BackupResult {
   manifest?: RebuildManifest;
   backedUpDirs: string[];
   failedDirs: string[];
+  // Per-dir failure cause for entries in failedDirs, keyed by dir name.
+  // Distinguishes "permission denied" (tar could not read the content) from
+  // "absent after extraction" (tar succeeded but the dir never materialized)
+  // so operators can tell an ownership problem from a missing dir (#6455).
+  // Dirs failed for other reasons may be absent from this map.
+  failedDirReasons?: Record<string, string>;
   // Set when the failure is a precondition (e.g. duplicate --name) rather
   // than a mid-backup error. CLI surfaces this to the user verbatim.
   error?: string;
@@ -141,11 +210,43 @@ export interface RestoreResult {
   failedDirs: string[];
   restoredFiles: string[];
   failedFiles: string[];
+  /** A safe, user-actionable explanation for a restore precondition failure. */
+  error?: string;
 }
 
-export interface RestoreOptions {
-  /** Optional file-specific restore capability authorized by the caller. */
-  stateFileRestorePolicy?: StateFileRestorePolicy;
+export interface SnapshotRestoreAuthority {
+  readonly schemaVersion: 1;
+  readonly backupPath: string;
+  readonly contentSha256: string;
+}
+
+export interface SnapshotRestoreOptions {
+  /**
+   * Content identity captured from the selected manifest and every backup
+   * payload. The state layer revalidates it after local staging and before
+   * the first remote filesystem mutation.
+   */
+  readonly authority?: SnapshotRestoreAuthority;
+  /** Internal provider fence invoked at the same last-safe mutation edge. */
+  readonly validateBeforeMutation?: () => void;
+}
+
+export interface RecreatedSandboxRestoreOptions extends SnapshotRestoreOptions {
+  /** Agent in the newly created target image, not the backup manifest agent. */
+  targetAgentType: string;
+  /** Explicit capability for custom images whose config must be restored wholesale. */
+  allowCustomImageWholeStateFileRestore?: true;
+  /** Pre-captured baseline avoids a second remote read during onboarding finalization. */
+  freshOpenClawImagePluginInstalls?: readonly OpenClawImagePluginInstall[];
+}
+
+interface InternalRestoreOptions {
+  targetAgentType: string;
+  allowCustomImageWholeStateFileRestore?: true;
+  discoverFreshOpenClawImagePluginInstalls?: true;
+  freshOpenClawImagePluginInstalls?: readonly OpenClawImagePluginInstall[];
+  authority?: SnapshotRestoreAuthority;
+  validateBeforeMutation?: () => void;
 }
 
 export interface TarValidationResult {
@@ -165,7 +266,7 @@ function isStringArray(value: unknown): value is string[] {
 
 function isStateFileSpec(value: unknown): value is StateFileSpec {
   return (
-    isRecord(value) &&
+    isObjectRecord(value) &&
     typeof value.path === "string" &&
     (value.strategy === "copy" || value.strategy === "sqlite_backup") &&
     normalizeStateFileSpec({ path: value.path, strategy: value.strategy }) !== null
@@ -173,7 +274,7 @@ function isStateFileSpec(value: unknown): value is StateFileSpec {
 }
 
 function isInstanceBackup(value: unknown): value is InstanceBackup {
-  if (!isRecord(value) || !isStateDirArray(value.stateDirs)) return false;
+  if (!isObjectRecord(value) || !isStateDirArray(value.stateDirs)) return false;
   return (
     typeof value.instanceId === "string" &&
     typeof value.agentType === "string" &&
@@ -183,22 +284,49 @@ function isInstanceBackup(value: unknown): value is InstanceBackup {
 }
 
 function isCustomPolicyEntryArray(value: unknown): value is CustomPolicyEntry[] {
+  if (!Array.isArray(value)) return false;
+  if (value.length === 0) return true;
+  try {
+    return registry.normalizeCustomPolicyEntries(value) !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+function cloneOpenClawImagePluginInstalls(
+  installs: readonly OpenClawImagePluginInstall[],
+): OpenClawImagePluginInstall[] {
+  return installs.map((install) => ({
+    ...install,
+    ...(install.loadPaths !== undefined ? { loadPaths: [...install.loadPaths] } : {}),
+  }));
+}
+
+export function hasAuthoritativeOpenClawImagePluginProvenance(value: {
+  agentType?: unknown;
+  dir?: unknown;
+  writableDir?: unknown;
+  openclawImagePluginInstalls?: unknown;
+  reconcileOpenClawImagePluginProvenance?: unknown;
+}): boolean {
+  const dir = typeof value.dir === "string" ? value.dir : value.writableDir;
   return (
-    Array.isArray(value) &&
-    value.every(
-      (entry) =>
-        typeof entry === "object" &&
-        entry !== null &&
-        typeof (entry as { name?: unknown }).name === "string" &&
-        typeof (entry as { content?: unknown }).content === "string" &&
-        ((entry as { pendingContent?: unknown }).pendingContent === undefined ||
-          typeof (entry as { pendingContent?: unknown }).pendingContent === "string"),
-    )
+    value.agentType === "openclaw" &&
+    typeof dir === "string" &&
+    value.reconcileOpenClawImagePluginProvenance === true &&
+    hasCompleteOpenClawImagePluginProvenance(value.openclawImagePluginInstalls, dir)
   );
 }
 
 function isRebuildManifest(value: unknown): value is RebuildManifest {
-  if (!isRecord(value) || !isStateDirArray(value.stateDirs)) return false;
+  if (!isObjectRecord(value) || !isStateDirArray(value.stateDirs)) return false;
+  const dir = typeof value.dir === "string" ? value.dir : value.writableDir;
+  const runtimeSnapshot =
+    value.runtimeSnapshot === undefined
+      ? undefined
+      : cloneSandboxRuntimeSnapshot(value.runtimeSnapshot);
+  const workload =
+    value.workload === undefined ? undefined : cloneSandboxWorkloadReceipt(value.workload as never);
   return (
     typeof value.version === "number" &&
     typeof value.sandboxName === "string" &&
@@ -207,7 +335,15 @@ function isRebuildManifest(value: unknown): value is RebuildManifest {
     (value.agentVersion === null || typeof value.agentVersion === "string") &&
     (value.expectedVersion === null || typeof value.expectedVersion === "string") &&
     (value.backedUpDirs === undefined || isBackedUpDirArray(value.backedUpDirs, value.stateDirs)) &&
-    (typeof value.dir === "string" || typeof value.writableDir === "string") &&
+    (value.failedBackupDirs === undefined ||
+      isBackedUpDirArray(value.failedBackupDirs, value.stateDirs)) &&
+    typeof dir === "string" &&
+    (value.openclawImagePluginInstalls === undefined ||
+      parseOpenClawImagePluginInstalls(value.openclawImagePluginInstalls, dir).ok) &&
+    (value.reconcileOpenClawImagePluginProvenance === undefined ||
+      typeof value.reconcileOpenClawImagePluginProvenance === "boolean") &&
+    (value.reconcileOpenClawImagePluginProvenance !== true ||
+      hasAuthoritativeOpenClawImagePluginProvenance(value)) &&
     typeof value.backupPath === "string" &&
     (value.stateFiles === undefined ||
       (Array.isArray(value.stateFiles) && value.stateFiles.every(isStateFileSpec))) &&
@@ -216,6 +352,12 @@ function isRebuildManifest(value: unknown): value is RebuildManifest {
       typeof value.blueprintDigest === "string") &&
     (value.policyPresets === undefined || isStringArray(value.policyPresets)) &&
     (value.customPolicies === undefined || isCustomPolicyEntryArray(value.customPolicies)) &&
+    (value.preservedEnv === undefined ||
+      (value.agentType === "hermes" &&
+        validatePreservedEnvFiles(value.preservedEnv, HERMES_PRESERVED_ENV_INVENTORY))) &&
+    (value.runtimeSnapshot === undefined || runtimeSnapshot !== undefined) &&
+    (value.workload === undefined || workload !== undefined) &&
+    (workload?.kind !== "managed-image" || runtimeSnapshot !== undefined) &&
     (value.instances === undefined ||
       (Array.isArray(value.instances) &&
         value.instances.every((entry) => isInstanceBackup(entry)))) &&
@@ -284,9 +426,12 @@ function rejectSymlinksOnPath(targetPath: string): void {
  * List tar entries and validate every path is within targetDir.
  * Rejects absolute paths, path traversal (..), and null bytes.
  */
-export function validateTarEntries(tarBuffer: Buffer, targetDir: string): TarValidationResult {
+export function validateTarEntries(
+  tarArchive: TarArchiveSource,
+  targetDir: string,
+): TarValidationResult {
   const entries: string[] = [];
-  const listingFailure = runTarListing(tarBuffer, ["-tf", "-"], "tar listing", (line) => {
+  const listingFailure = runTarListing(tarArchive, ["-tf", "-"], "tar listing", (line) => {
     entries.push(line);
   });
   if (listingFailure) {
@@ -345,13 +490,11 @@ function auditExtractedSymlinks(dirPath: string, allowedRoots: string[]): string
         if (stat.isSymbolicLink()) {
           const linkTarget = readlinkSync(fullPath);
 
-          // Whitelisted npm symlinks baked into the base image at build time
-          // (see AUDIT_SYMLINK_WHITELIST). Accepting them here matches the
-          // pre-backup audit so legitimate plugin installs in extensions/
-          // can survive a rebuild without tripping the post-extraction check.
-          // Match both the source path AND the link target — a whitelisted
-          // path with a tampered target falls through to the normal
-          // containment check.
+          // Allowed npm symlinks baked into managed or custom images. The
+          // shared matcher checks both source shape and exact target so the
+          // pre-backup and post-extraction audits enforce the same contract.
+          // A recognized path with a tampered target falls through to the
+          // normal containment check.
           const relFromDir = path.relative(dirPath, fullPath).split(path.sep).join("/");
           if (isAllowedStateSymlink(relFromDir, linkTarget)) {
             continue;
@@ -409,9 +552,9 @@ function auditExtractedSymlinks(dirPath: string, allowedRoots: string[]): string
  * legitimate reason to contain them, and they can be used to reference
  * files outside the extraction root.
  */
-export function rejectHardLinks(tarBuffer: Buffer): string[] {
+export function rejectHardLinks(tarArchive: TarArchiveSource): string[] {
   const violations: string[] = [];
-  const listingFailure = runTarListing(tarBuffer, ["-tvf", "-"], "tar verbose listing", (line) => {
+  const listingFailure = runTarListing(tarArchive, ["-tvf", "-"], "tar verbose listing", (line) => {
     // Both GNU tar and bsdtar prefix hard-link entries with 'h' in verbose mode
     // and include " link to " in the line.
     if (line.startsWith("h") || / link to /.test(line)) {
@@ -427,9 +570,9 @@ export function rejectHardLinks(tarBuffer: Buffer): string[] {
  * SECURITY: Validate tar contents, extract with safety flags, then
  * audit for symlink escapes. Nukes the extraction on any violation.
  */
-export function safeTarExtract(tarBuffer: Buffer, targetDir: string): SafeExtractResult {
+export function safeTarExtract(tarArchive: TarArchiveSource, targetDir: string): SafeExtractResult {
   // Phase 1a: Validate entry paths before extraction
-  const validation = validateTarEntries(tarBuffer, targetDir);
+  const validation = validateTarEntries(tarArchive, targetDir);
   if (!validation.safe) {
     return {
       success: false,
@@ -438,7 +581,7 @@ export function safeTarExtract(tarBuffer: Buffer, targetDir: string): SafeExtrac
   }
 
   // Phase 1b: Reject hard links (not detectable via tar -tf, require verbose listing)
-  const hardLinkViolations = rejectHardLinks(tarBuffer);
+  const hardLinkViolations = rejectHardLinks(tarArchive);
   if (hardLinkViolations.length > 0) {
     return {
       success: false,
@@ -447,11 +590,25 @@ export function safeTarExtract(tarBuffer: Buffer, targetDir: string): SafeExtrac
   }
 
   // Phase 2: Extract with --no-same-owner to prevent ownership manipulation
-  const extractResult = spawnSync("tar", ["-xf", "-", "--no-same-owner", "-C", targetDir], {
-    input: tarBuffer,
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: 60000,
-  });
+  let archiveFd: number | null = null;
+  let extractResult: ReturnType<typeof spawnSync>;
+  try {
+    extractResult = Buffer.isBuffer(tarArchive)
+      ? spawnSync("tar", ["-xf", "-", "--no-same-owner", "-C", targetDir], {
+          input: tarArchive,
+          stdio: ["pipe", "pipe", "pipe"],
+          timeout: 60000,
+        })
+      : (() => {
+          archiveFd = openSync(tarArchive.filePath, "r");
+          return spawnSync("tar", ["-xf", "-", "--no-same-owner", "-C", targetDir], {
+            stdio: [archiveFd, "pipe", "pipe"],
+            timeout: 60000,
+          });
+        })();
+  } finally {
+    if (archiveFd !== null) closeSync(archiveFd);
+  }
 
   if (extractResult.status !== 0) {
     return {
@@ -498,6 +655,12 @@ export function getSshConfig(sandboxName: string): string | null {
 }
 
 export function sshArgs(configFile: string, sandboxName: string): string[] {
+  const sshHost = resolveOpenshellSandboxSshHost(sandboxName, readFileSync(configFile, "utf8"));
+  if (sshHost === null) {
+    throw new Error(
+      `OpenShell SSH config does not declare an exact host alias for sandbox '${sandboxName}'`,
+    );
+  }
   return [
     "-F",
     configFile,
@@ -509,14 +672,19 @@ export function sshArgs(configFile: string, sandboxName: string): string[] {
     "ConnectTimeout=10",
     "-o",
     "LogLevel=ERROR",
-    `openshell-${sandboxName}`,
+    sshHost,
   ];
 }
 
 function computeBlueprintDigest(): string | null {
   // Look for blueprint.yaml relative to the agent-defs ROOT
   const candidates = [
-    path.join(process.env.HOME || "/tmp", ".nemoclaw", "blueprints", "0.1.0", "blueprint.yaml"),
+    path.join(
+      nemoclawStateRoot(process.env.HOME || "/tmp", GATEWAY_PORT),
+      "blueprints",
+      "0.1.0",
+      "blueprint.yaml",
+    ),
     path.join(__dirname, "..", "..", "nemoclaw-blueprint", "blueprint.yaml"),
   ];
   for (const p of candidates) {
@@ -527,52 +695,65 @@ function computeBlueprintDigest(): string | null {
   return null;
 }
 
-/**
- * Walk a local directory and sanitize any JSON config files found.
- * Also removes files that match CREDENTIAL_SENSITIVE_BASENAMES.
- */
-function sanitizeBackupDirectory(dirPath: string): void {
-  if (!existsSync(dirPath)) return;
+export interface BackupSanitizationOperations {
+  sanitizeDirectory: (backupPath: string) => void;
+  removeBackup: (backupPath: string) => void;
+  backupExists: (backupPath: string) => boolean;
+}
 
-  const walk = (current: string): void => {
-    for (const entry of readdirSync(current, { withFileTypes: true })) {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        walk(fullPath);
-      } else if (entry.isFile()) {
-        if (isSensitiveFile(entry.name)) {
-          try {
-            require("node:fs").unlinkSync(fullPath);
-          } catch {
-            /* best effort */
-          }
-        } else if (entry.name.endsWith(".json")) {
-          sanitizeConfigFile(fullPath);
-        } else if (entry.name === ".env" || entry.name.endsWith(".env")) {
-          // Strip credential lines from .env files (KEY=value format).
-          // Hermes stores API keys in .env alongside config.yaml.
-          try {
-            const envContent = readFileSync(fullPath, "utf-8");
-            const filtered = envContent
-              .split("\n")
-              .map((line) => {
-                const key = line.split("=")[0]?.trim().toUpperCase() || "";
-                if (/KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/.test(key)) {
-                  return `${line.split("=")[0]}=[STRIPPED_BY_MIGRATION]`;
-                }
-                return line;
-              })
-              .join("\n");
-            writeFileSync(fullPath, filtered);
-            chmodSync(fullPath, 0o600);
-          } catch {
-            /* best effort */
-          }
-        }
-      }
+const DEFAULT_BACKUP_SANITIZATION_OPERATIONS: BackupSanitizationOperations = {
+  sanitizeDirectory: sanitizeSnapshotDirectory,
+  removeBackup: (backupPath) => rmSync(backupPath, { recursive: true, force: true }),
+  backupExists: existsSync,
+};
+
+/** @visibleForTesting */
+export function sanitizeBackupDirectory(
+  dirPath: string,
+  overrides: Partial<BackupSanitizationOperations> = {},
+): void {
+  const operations = { ...DEFAULT_BACKUP_SANITIZATION_OPERATIONS, ...overrides };
+
+  try {
+    operations.sanitizeDirectory(dirPath);
+  } catch (error) {
+    try {
+      operations.removeBackup(dirPath);
+    } catch (cleanupError) {
+      throw new Error("Credential sanitization failed and backup cleanup failed", {
+        cause: cleanupError,
+      });
     }
-  };
-  walk(dirPath);
+    if (operations.backupExists(dirPath)) {
+      throw new Error("Credential sanitization failed and the incomplete backup remains", {
+        cause: error,
+      });
+    }
+    throw new Error("Credential sanitization failed; removed the incomplete backup", {
+      cause: error,
+    });
+  }
+}
+
+export interface IncompleteSnapshotRemoval {
+  readonly removed: boolean;
+  readonly error?: string;
+}
+
+export function removeIncompleteSnapshot(
+  backupPath: string,
+  overrides: Partial<Pick<BackupSanitizationOperations, "removeBackup" | "backupExists">> = {},
+): IncompleteSnapshotRemoval {
+  const operations = { ...DEFAULT_BACKUP_SANITIZATION_OPERATIONS, ...overrides };
+  try {
+    operations.removeBackup(backupPath);
+  } catch (error) {
+    return { removed: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  if (operations.backupExists(backupPath)) {
+    return { removed: false, error: "the snapshot directory still exists after removal" };
+  }
+  return { removed: true };
 }
 
 // ── Logging ────────────────────────────────────────────────────────
@@ -587,6 +768,7 @@ function _log(msg: string): void {
 
 const VERSION_SELECTOR_RE = /^v(\d+)$/i;
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+const SAFE_DYNAMIC_STATE_DIR_RE = /^[A-Za-z0-9._-]+$/;
 
 export function validateSnapshotName(name: string): string | null {
   if (!NAME_RE.test(name)) {
@@ -622,6 +804,45 @@ function isSafeStateDirPath(dirPath: string): boolean {
   );
 }
 
+function isAllowedDiscoveredStateDir(
+  candidate: string,
+  exactDirectories: readonly string[],
+  directoryPrefixes: readonly string[],
+): boolean {
+  if (exactDirectories.includes(candidate)) return true;
+  return (
+    SAFE_DYNAMIC_STATE_DIR_RE.test(candidate) &&
+    directoryPrefixes.some((prefix) => candidate.startsWith(prefix))
+  );
+}
+
+function hasStateDirectorySources(
+  exactDirectories: readonly string[],
+  directoryPrefixes: readonly string[],
+): boolean {
+  return exactDirectories.length > 0 || directoryPrefixes.length > 0;
+}
+
+function describeStateDirDiscoveryFailure(
+  result: ReturnType<typeof spawnSync>,
+  invalidDirectories: readonly string[],
+): { log: string; unreachable: boolean; error?: string } | null {
+  if (result.status !== 0) {
+    return {
+      log: `FAILED: SSH dir check exited ${String(result.status)} — cannot determine which dirs exist`,
+      unreachable: isSshTransportFailure(result),
+    };
+  }
+  if (invalidDirectories.length > 0) {
+    return {
+      log: `SECURITY: State directory discovery returned undeclared or unsafe entries: ${invalidDirectories.map((entry) => JSON.stringify(entry)).join(", ")}`,
+      unreachable: false,
+      error: "State directory discovery returned undeclared or unsafe entries",
+    };
+  }
+  return null;
+}
+
 function isStateDirArray(value: unknown): value is string[] {
   return isStringArray(value) && value.every(isSafeStateDirPath);
 }
@@ -655,14 +876,21 @@ function normalizeStateFileSpec(spec: AgentStateFile | StateFileSpec): StateFile
   return { path: normalized, strategy: spec.strategy };
 }
 
+function normalizeStateFileSpecsPreservingDuplicates(
+  specs: readonly (AgentStateFile | StateFileSpec)[],
+): StateFileSpec[] {
+  return specs.flatMap((spec) => {
+    const normalized = normalizeStateFileSpec(spec);
+    return normalized ? [normalized] : [];
+  });
+}
+
 function normalizeStateFileSpecs(
   specs: readonly (AgentStateFile | StateFileSpec)[],
 ): StateFileSpec[] {
   const normalized: StateFileSpec[] = [];
   const seen = new Set<string>();
-  for (const spec of specs) {
-    const next = normalizeStateFileSpec(spec);
-    if (!next) continue;
+  for (const next of normalizeStateFileSpecsPreservingDuplicates(specs)) {
     const key = `${next.strategy}:${next.path}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -673,27 +901,6 @@ function normalizeStateFileSpecs(
 
 function stateFileRemotePath(dir: string, filePath: string): string {
   return `${dir.replace(/\/+$/, "")}/${filePath}`;
-}
-
-function failedDirsFromTarStderr(stderr: string, existingDirs: string[]): Set<string> {
-  const failed = new Set<string>();
-  const dirs = [...existingDirs].sort((a, b) => b.length - a.length);
-  for (const rawLine of stderr.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line.startsWith("tar: ")) continue;
-    const message = line.slice("tar: ".length);
-    for (const dirName of dirs) {
-      if (
-        message === dirName ||
-        message.startsWith(`${dirName}:`) ||
-        message.startsWith(`${dirName}/`)
-      ) {
-        failed.add(dirName);
-        break;
-      }
-    }
-  }
-  return failed;
 }
 
 const SQLITE_BACKUP_PY = [
@@ -712,25 +919,7 @@ const SQLITE_BACKUP_PY = [
   "    src_conn.close()",
 ].join("\n");
 
-const SQLITE_RESTORE_PY = [
-  "import os, sqlite3, sys",
-  "src, dst = sys.argv[1], sys.argv[2]",
-  "os.makedirs(os.path.dirname(dst), exist_ok=True)",
-  "src_conn = sqlite3.connect('file:' + src + '?mode=ro', uri=True, timeout=30)",
-  "dst_conn = sqlite3.connect(dst, timeout=30)",
-  "try:",
-  "    dst_conn.execute('PRAGMA busy_timeout=30000')",
-  "    src_conn.backup(dst_conn)",
-  "    ok = dst_conn.execute('PRAGMA quick_check').fetchone()[0]",
-  "    if ok != 'ok':",
-  "        raise SystemExit('sqlite quick_check failed: ' + str(ok))",
-  "finally:",
-  "    dst_conn.close()",
-  "    src_conn.close()",
-  "os.chmod(dst, 0o660)",
-].join("\n");
-
-function buildStateFileBackupCommand(dir: string, spec: StateFileSpec): string {
+export function buildStateFileBackupCommand(dir: string, spec: StateFileSpec): string {
   const remotePath = stateFileRemotePath(dir, spec.path);
   const quotedRemotePath = shellQuote(remotePath);
   if (spec.strategy === "sqlite_backup") {
@@ -742,8 +931,7 @@ function buildStateFileBackupCommand(dir: string, spec: StateFileSpec): string {
       '[ "${hardlink_count:-0}" = "0" ] || { echo "hard-linked sqlite state file rejected: $src" >&2; exit 11; }',
       'tmp="$(mktemp /tmp/nemoclaw-sqlite-backup.XXXXXX)"',
       "trap 'rm -f \"$tmp\"' EXIT",
-      `python3 -c ${shellQuote(SQLITE_BACKUP_PY)} "$src" "$tmp"`,
-      'cat -- "$tmp"',
+      `/usr/bin/python3 -I -S -c ${shellQuote(SQLITE_BACKUP_PY)} "$src" "$tmp" && cat -- "$tmp"`,
     ].join("; ");
   }
 
@@ -769,6 +957,90 @@ interface StateFileBackupResult {
   unreachable: boolean;
 }
 
+function capturePreservedEnvFile(
+  configFile: string,
+  sandboxName: string,
+  dir: string,
+  inventory: PreservedEnvInventory,
+): { outcome: StateFileBackupOutcome; file?: PreservedEnvFile; unreachable: boolean } {
+  const command = buildStateFileBackupCommand(dir, {
+    path: inventory.path,
+    strategy: "copy",
+  });
+  _log(`Capturing preserved environment assignments from ${inventory.path}`);
+  const result = spawnSync("ssh", [...sshArgs(configFile, sandboxName), command], {
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 30000,
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.status === 2) return { outcome: "missing", unreachable: false };
+  if (result.status !== 0 || result.error || result.signal || !result.stdout) {
+    const detail =
+      (result.stderr?.toString() || "").trim() ||
+      result.error?.message ||
+      (result.signal ? `signal ${result.signal}` : `exit ${String(result.status)}`);
+    _log(`FAILED: preserved environment capture ${inventory.path}: ${detail.substring(0, 200)}`);
+    return { outcome: "failed", unreachable: isSshTransportFailure(result) };
+  }
+  try {
+    const assignments = extractPreservedEnvAssignments(result.stdout.toString("utf8"), inventory);
+    _log(
+      `Captured ${assignments.length} preserved environment ${assignments.length === 1 ? "key" : "keys"} from ${inventory.path}`,
+    );
+    return {
+      outcome: "backed_up",
+      file: { path: inventory.path, assignments },
+      unreachable: false,
+    };
+  } catch (error) {
+    _log(
+      `FAILED: preserved environment capture ${inventory.path}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    return { outcome: "failed", unreachable: false };
+  }
+}
+
+function capturePreservedEnvFiles(
+  configFile: string,
+  sandboxName: string,
+  dir: string,
+  inventories: readonly PreservedEnvInventory[],
+): { files: PreservedEnvFile[]; failedPaths: string[]; unreachable: boolean } {
+  const files: PreservedEnvFile[] = [];
+  const failedPaths: string[] = [];
+  let unreachable = false;
+  for (const inventory of inventories) {
+    const result = capturePreservedEnvFile(configFile, sandboxName, dir, inventory);
+    if (result.outcome === "backed_up" && result.file) {
+      files.push(result.file);
+    } else if (result.outcome === "failed") {
+      failedPaths.push(inventory.path);
+      if (result.unreachable) unreachable = true;
+    }
+  }
+  return { files, failedPaths, unreachable };
+}
+
+function captureAgentPreservedEnvFiles(
+  agentName: string,
+  configFile: string,
+  sandboxName: string,
+  dir: string,
+  manifest: RebuildManifest,
+  failedFiles: string[],
+): boolean {
+  if (agentName !== "hermes") return false;
+  const preserved = capturePreservedEnvFiles(
+    configFile,
+    sandboxName,
+    dir,
+    HERMES_PRESERVED_ENV_INVENTORY,
+  );
+  manifest.preservedEnv = preserved.files;
+  failedFiles.push(...preserved.failedPaths);
+  return preserved.unreachable;
+}
+
 function backupStateFile(
   configFile: string,
   sandboxName: string,
@@ -785,11 +1057,16 @@ function backupStateFile(
   });
 
   if (result.status === 2) return { outcome: "missing", unreachable: false };
-  if (result.status !== 0 || result.error || result.signal || !result.stdout) {
+  const emptySqliteBackup = spec.strategy === "sqlite_backup" && result.stdout?.length === 0;
+  if (result.status !== 0 || result.error || result.signal || !result.stdout || emptySqliteBackup) {
     const detail =
       (result.stderr?.toString() || "").trim() ||
       result.error?.message ||
-      (result.signal ? `signal ${result.signal}` : `exit ${String(result.status)}`);
+      (result.signal
+        ? `signal ${result.signal}`
+        : emptySqliteBackup
+          ? "empty output"
+          : `exit ${String(result.status)}`);
     _log(`FAILED: state file backup ${spec.path}: ${detail.substring(0, 200)}`);
     return { outcome: "failed", unreachable: isSshTransportFailure(result) };
   }
@@ -804,143 +1081,6 @@ function backupStateFile(
   return { outcome: "backed_up", unreachable: false };
 }
 
-export function buildStateFileRestoreCommand(
-  dir: string,
-  spec: StateFileSpec,
-  refreshOpenClawConfigHash = false,
-): string {
-  const remotePath = stateFileRemotePath(dir, spec.path);
-  const quotedRemotePath = shellQuote(remotePath);
-  if (spec.strategy === "sqlite_backup") {
-    return [
-      `dst=${quotedRemotePath}`,
-      'parent="$(dirname "$dst")"',
-      '[ ! -L "$parent" ] || { echo "refusing symlinked state parent: $parent" >&2; exit 10; }',
-      '[ ! -L "$dst" ] || { echo "refusing symlinked sqlite target: $dst" >&2; exit 11; }',
-      'mkdir -p "$parent"',
-      'tmp="$(mktemp /tmp/nemoclaw-sqlite-restore.XXXXXX)"',
-      "trap 'rm -f \"$tmp\"' EXIT",
-      'cat > "$tmp"',
-      'chmod 600 "$tmp"',
-      `umask 0007; python3 -c ${shellQuote(SQLITE_RESTORE_PY)} "$tmp" "$dst"`,
-    ].join("; ");
-  }
-
-  const steps = [
-    `dst=${quotedRemotePath}`,
-    'parent="$(dirname "$dst")"',
-    '[ ! -L "$parent" ] || { echo "refusing symlinked state parent: $parent" >&2; exit 10; }',
-    '[ ! -L "$dst" ] || { echo "refusing symlinked state target: $dst" >&2; exit 11; }',
-    'mkdir -p "$parent"',
-    'tmp="$(mktemp "${parent}/.nemoclaw-restore.XXXXXX")"',
-    'trap \'rm -f "$tmp" "${anchor_tmp:-}"\' EXIT',
-    'cat > "$tmp"',
-    'chmod 640 "$tmp"',
-  ];
-
-  if (refreshOpenClawConfigHash) {
-    // OpenClaw guards openclaw.json with a `.last-good` recovery anchor: on its
-    // config-integrity check it archives any live config that differs from
-    // `.last-good` as `openclaw.json.clobbered.*` and reverts to `.last-good`.
-    // The rebuild restore writes the merged user config directly, so without
-    // refreshing the anchor OpenClaw reverts the restored config back to the
-    // freshly generated baseline captured at first boot (issue #5202). Refresh
-    // the anchor from the staged temp BEFORE swapping the live file so the
-    // integrity watcher never observes a config that disagrees with it. Stage
-    // through a temp + atomic rename and fail closed (before the live swap) so
-    // a partial/failed anchor write never leaves a stale recovery target that
-    // would let OpenClaw revert the restored config.
-    steps.push(
-      'last_good="${dst}.last-good"',
-      '[ ! -L "$last_good" ] || { echo "refusing symlinked last-good target: $last_good" >&2; exit 13; }',
-      'anchor_tmp="$(mktemp "${parent}/.nemoclaw-lastgood.XXXXXX")" || { echo "failed to stage last-good anchor" >&2; exit 14; }',
-      'cat "$tmp" > "$anchor_tmp" || { echo "failed to write last-good anchor" >&2; exit 14; }',
-      'chmod 660 "$anchor_tmp" 2>/dev/null || true',
-      'mv -f "$anchor_tmp" "$last_good" || { echo "failed to install last-good anchor" >&2; exit 14; }',
-    );
-  }
-
-  steps.push('mv -f "$tmp" "$dst"');
-
-  if (refreshOpenClawConfigHash) {
-    steps.push(
-      'hash_file="${parent}/.config-hash"',
-      '[ ! -L "$hash_file" ] || { echo "refusing symlinked config hash target: $hash_file" >&2; exit 12; }',
-      '(cd "$parent" && sha256sum "$(basename "$dst")" > .config-hash)',
-      'chmod 660 "$hash_file" 2>/dev/null || true',
-    );
-  }
-
-  return steps.join("; ");
-}
-
-function buildStateFileRestoreInput(
-  configFile: string,
-  sandboxName: string,
-  dir: string,
-  spec: StateFileSpec,
-  backupContents: Buffer,
-  mergeOpenClawConfig: boolean,
-): Buffer | null {
-  if (!mergeOpenClawConfig) return backupContents;
-
-  const result = buildOpenClawConfigRestoreInputFromSandbox({
-    backupContents,
-    dir,
-    log: _log,
-    specPath: spec.path,
-    sshArgs: sshArgs(configFile, sandboxName),
-  });
-  if (result.ok) return result.input;
-  _log(`FAILED: ${result.error}`);
-  return null;
-}
-
-function restoreStateFile(
-  configFile: string,
-  sandboxName: string,
-  agentType: string | null | undefined,
-  dir: string,
-  spec: StateFileSpec,
-  backupPath: string,
-  mergeOpenClawConfig = false,
-  stateFileRestorePolicy?: StateFileRestorePolicy,
-): boolean {
-  const localPath = path.join(backupPath, spec.path);
-  if (!existsSync(localPath)) return true;
-
-  const backupContents = readFileSync(localPath);
-  const plan = stateFileRestorePolicy?.(agentType, dir, spec, backupContents);
-  const command = plan?.command ?? buildStateFileRestoreCommand(dir, spec, mergeOpenClawConfig);
-  _log(`Restoring state file ${spec.path} (${spec.strategy})`);
-  const input =
-    plan?.input ??
-    buildStateFileRestoreInput(
-      configFile,
-      sandboxName,
-      dir,
-      spec,
-      backupContents,
-      mergeOpenClawConfig,
-    );
-  if (input === null) return false;
-
-  const result = spawnSync("ssh", [...sshArgs(configFile, sandboxName), command], {
-    input,
-    stdio: ["pipe", "pipe", "pipe"],
-    timeout: 120000,
-  });
-
-  if (result.status === 0 && !result.error && !result.signal) return true;
-
-  const detail =
-    (result.stderr?.toString() || "").trim() ||
-    result.error?.message ||
-    (result.signal ? `signal ${result.signal}` : `exit ${String(result.status)}`);
-  _log(`FAILED: state file restore ${spec.path}: ${detail.substring(0, 200)}`);
-  return false;
-}
-
 // ── Backup ─────────────────────────────────────────────────────────
 
 /**
@@ -948,21 +1088,131 @@ function restoreStateFile(
  * Uses the agent manifest to determine which directories contain state.
  */
 
+export { buildStateFileRestoreCommand } from "./state-file-restore.js";
 // isSshTransportFailure lives in ./ssh-transport now. Re-exported here for
 // backwards compatibility with callers that used to import it from this
 // module. Prefer importing directly from ./ssh-transport in new code.
 export { isSshTransportFailure };
+
+function normalizeSnapshotBackupAuthority(options: BackupOptions): {
+  readonly runtimeSnapshot?: SandboxRuntimeSnapshot;
+  readonly workload?: SandboxWorkloadReceipt;
+  readonly error?: string;
+} {
+  const runtimeSnapshot =
+    options.runtimeSnapshot === undefined
+      ? undefined
+      : cloneSandboxRuntimeSnapshot(options.runtimeSnapshot);
+  const workload =
+    options.workload === undefined ? undefined : cloneSandboxWorkloadReceipt(options.workload);
+  if (options.runtimeSnapshot !== undefined && runtimeSnapshot === undefined) {
+    return { error: "snapshot runtime state is invalid or cannot be represented" };
+  }
+  if (options.workload !== undefined && workload === undefined) {
+    return { error: "snapshot workload authority is invalid" };
+  }
+  if (workload?.kind === "managed-image" && runtimeSnapshot === undefined) {
+    return { error: "managed snapshot is missing provider runtime state" };
+  }
+  return {
+    ...(runtimeSnapshot === undefined ? {} : { runtimeSnapshot }),
+    ...(workload === undefined ? {} : { workload }),
+  };
+}
+
+function validateSnapshotPublication(
+  backupPath: string,
+  validateBeforePublish: BackupOptions["validateBeforePublish"],
+): string | null {
+  if (!validateBeforePublish) return null;
+  try {
+    validateBeforePublish();
+    return null;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    try {
+      rmSync(backupPath, { recursive: true, force: true });
+      return `Snapshot authority changed during backup: ${detail}`;
+    } catch (cleanupError) {
+      const cleanupDetail =
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+      return (
+        `Snapshot authority changed during backup: ${detail}. ` +
+        `The unpublished backup at '${backupPath}' could not be removed: ${cleanupDetail}`
+      );
+    }
+  }
+}
+
+function resolveOpenClawBackupMetadata(
+  agentName: string,
+  sandbox: SandboxEntry | null,
+  configDir: string,
+): {
+  readonly reconcileImagePluginProvenance: boolean;
+  readonly pluginInstalls?: OpenClawImagePluginInstall[];
+  readonly error?: string;
+} {
+  const reconcileImagePluginProvenance =
+    agentName === "openclaw" && Boolean(sandbox?.fromDockerfile);
+  if (
+    agentName !== "openclaw" ||
+    (!reconcileImagePluginProvenance && sandbox?.openclawImagePluginInstalls === undefined)
+  ) {
+    return { reconcileImagePluginProvenance };
+  }
+  const provenance = parseOpenClawImagePluginInstalls(
+    sandbox?.openclawImagePluginInstalls,
+    configDir,
+  );
+  if (!provenance.ok) {
+    return {
+      reconcileImagePluginProvenance,
+      error: "registered OpenClaw image plugin provenance is missing or invalid",
+    };
+  }
+  return {
+    reconcileImagePluginProvenance,
+    pluginInstalls: cloneOpenClawImagePluginInstalls(provenance.pluginInstalls),
+  };
+}
 
 export function backupSandboxState(sandboxName: string, options: BackupOptions = {}): BackupResult {
   const sb = registry.getSandbox(sandboxName);
   const agentName = sb?.agent || "openclaw";
   const agent = loadAgent(agentName);
   const dir = agent.configPaths.dir;
-  const stateDirs = agent.stateDirs;
+  const stateDirs = agent.backupStateDirs;
+  const stateDirPrefixes = agent.backupStateDirPrefixes;
+  const hasBackupDirectories = hasStateDirectorySources(stateDirs, stateDirPrefixes);
   const stateFiles = normalizeStateFileSpecs(agent.stateFiles);
   _log(
-    `backupSandboxState: agent=${agentName}, dir=${dir}, stateDirs=[${stateDirs.join(",")}], stateFiles=[${stateFiles.map((f) => f.path).join(",")}]`,
+    `backupSandboxState: agent=${agentName}, dir=${dir}, stateDirs=[${stateDirs.join(",")}], stateDirPrefixes=[${stateDirPrefixes.join(",")}], stateFiles=[${stateFiles.map((f) => f.path).join(",")}]`,
   );
+
+  const snapshotAuthority = normalizeSnapshotBackupAuthority(options);
+  if (snapshotAuthority.error) {
+    return {
+      success: false,
+      backedUpDirs: [],
+      failedDirs: [],
+      backedUpFiles: [],
+      failedFiles: [],
+      error: snapshotAuthority.error,
+    };
+  }
+
+  const openClawMetadata = resolveOpenClawBackupMetadata(agentName, sb, dir);
+  if (openClawMetadata.error) {
+    return {
+      success: false,
+      backedUpDirs: [],
+      failedDirs: [],
+      backedUpFiles: [],
+      failedFiles: [],
+      error: openClawMetadata.error,
+    };
+  }
 
   // Validate user-supplied name and check for conflicts BEFORE creating any
   // files on disk.
@@ -998,6 +1248,16 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
   }
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const backupPath = path.join(REBUILD_BACKUPS_DIR, sandboxName, timestamp);
+  if (existsSync(backupPath)) {
+    return {
+      success: false,
+      backedUpDirs: [],
+      failedDirs: [],
+      backedUpFiles: [],
+      failedFiles: [],
+      error: `Snapshot path '${backupPath}' already exists; retry the backup.`,
+    };
+  }
 
   // SECURITY: Verify backup destination ancestors are not symlinks.
   // Without this check, an attacker who plants ~/.nemoclaw/rebuild-backups
@@ -1028,24 +1288,45 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     agentType: agentName,
     agentVersion: sb?.agentVersion || null,
     expectedVersion: agent.expectedVersion,
+    ...(openClawMetadata.pluginInstalls !== undefined
+      ? { openclawImagePluginInstalls: openClawMetadata.pluginInstalls }
+      : {}),
+    ...(openClawMetadata.reconcileImagePluginProvenance
+      ? { reconcileOpenClawImagePluginProvenance: true }
+      : {}),
     stateDirs,
+    failedBackupDirs: [],
     stateFiles,
     dir,
     backupPath,
     blueprintDigest: computeBlueprintDigest(),
     policyPresets,
     customPolicies,
+    ...(agentName === "hermes" ? { preservedEnv: [] } : {}),
+    ...snapshotAuthority,
     ...(providedName !== null ? { name: providedName } : {}),
   };
 
   const backedUpDirs: string[] = [];
   const failedDirs: string[] = [];
+  const failedDirReasons: Record<string, string> = {};
   const backedUpFiles: string[] = [];
   const failedFiles: string[] = [];
   let unreachable = false;
 
-  if (stateDirs.length === 0 && stateFiles.length === 0) {
+  if (!hasBackupDirectories && stateFiles.length === 0) {
     _log("WARNING: Agent manifest declares no state_dirs or state_files — nothing to back up");
+    const publicationError = validateSnapshotPublication(backupPath, options.validateBeforePublish);
+    if (publicationError) {
+      return {
+        success: false,
+        backedUpDirs: [],
+        failedDirs: [],
+        backedUpFiles: [],
+        failedFiles: [],
+        error: publicationError,
+      };
+    }
     writeManifest(backupPath, manifest);
     return { success: true, manifest, backedUpDirs, failedDirs, backedUpFiles, failedFiles };
   }
@@ -1074,18 +1355,29 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
   const tempSshConfig = createTempSshConfig(sshConfig, "nemoclaw-state-");
   const configFile = tempSshConfig.file;
   try {
-    if (stateDirs.length > 0) {
+    if (hasBackupDirectories) {
       // Build tar command that only includes existing directories.
       // First, check which declared state dirs actually exist in the sandbox,
-      // then additionally discover per-agent `workspace-*` directories produced
-      // by multi-agent OpenClaw deployments (see issue #1260) so they get
-      // snapshotted alongside the manifest-declared dirs. `awk '!seen[$0]++'`
-      // dedupes while preserving order.
-      const existCheckCmd = stateDirs
-        .map((d) => `[ -d ${shellQuote(`${dir}/${d}`)} ] && printf '%s\\n' ${shellQuote(d)}`)
-        .join("; ");
-      const workspaceGlobCmd = `for d in ${shellQuote(dir)}/workspace-*/; do [ -d "$d" ] && basename "$d"; done 2>/dev/null`;
-      const fullCheckCmd = `{ ${existCheckCmd}; ${workspaceGlobCmd}; } 2>/dev/null | awk '!seen[$0]++'`;
+      // then discover directories matching prefixes declared by the same agent
+      // contract. Quote each literal prefix and leave only the appended `*`
+      // unquoted for expansion. Reject non-canonical basenames in the sandbox
+      // before emitting newline-delimited output, then independently validate
+      // every result on the host.
+      const discoveryCommands = [
+        ...stateDirs.map(
+          (d) => `[ -d ${shellQuote(`${dir}/${d}`)} ] && printf '%s\\n' ${shellQuote(d)}`,
+        ),
+        ...stateDirPrefixes.map(
+          (prefix) =>
+            `for d in ${shellQuote(`${dir}/${prefix}`)}*/; do [ -d "$d" ] || continue; d=\${d%/}; candidate=\${d##*/}; case "$candidate" in *[!A-Za-z0-9._-]*|'') exit 65 ;; esac; printf '%s\\n' "$candidate"; done`,
+        ),
+      ];
+      // Exact directory probes are optional and return 1 when absent. End the
+      // group with a successful no-op so an absent final declaration does not
+      // turn ordinary discovery into a transport failure. An unsafe dynamic
+      // basename still uses `exit 65`, which terminates the remote shell before
+      // this no-op can run.
+      const fullCheckCmd = `{ ${discoveryCommands.join("; ")}; :; } 2>/dev/null`;
       _log(`Checking existing dirs via SSH: ${fullCheckCmd.substring(0, 100)}...`);
       const existResult = spawnSync("ssh", [...sshArgs(configFile, sandboxName), fullCheckCmd], {
         encoding: "utf-8",
@@ -1095,28 +1387,34 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
       _log(
         `Dir check: exit=${existResult.status}, stdout=${(existResult.stdout || "").trim().substring(0, 200)}, stderr=${(existResult.stderr || "").trim().substring(0, 200)}`,
       );
-      const existingDirs = (existResult.stdout || "")
-        .trim()
-        .split("\n")
-        .filter((d) => d.length > 0);
-      _log(
-        `Existing dirs in sandbox: [${existingDirs.join(",")}] (${existingDirs.length}/${stateDirs.length})`,
+      const existingDirs = [
+        ...new Set(
+          (existResult.stdout || "")
+            .trim()
+            .split("\n")
+            .filter((d) => d.length > 0),
+        ),
+      ];
+      const invalidExistingDirs = existingDirs.filter(
+        (candidate) => !isAllowedDiscoveredStateDir(candidate, stateDirs, stateDirPrefixes),
       );
-
-      if (existResult.status !== 0) {
-        _log(
-          `FAILED: SSH dir check exited ${existResult.status} — cannot determine which dirs exist`,
-        );
+      const discoveryFailure = describeStateDirDiscoveryFailure(existResult, invalidExistingDirs);
+      if (discoveryFailure) {
+        _log(discoveryFailure.log);
         return {
           success: false,
-          unreachable: isSshTransportFailure(existResult),
+          unreachable: discoveryFailure.unreachable,
           manifest,
           backedUpDirs,
           failedDirs: [...stateDirs],
           backedUpFiles,
           failedFiles: stateFiles.map((f) => f.path),
+          error: discoveryFailure.error,
         };
       }
+      _log(
+        `Existing dirs in sandbox: [${existingDirs.join(",")}] (${existingDirs.length}/${stateDirs.length})`,
+      );
 
       if (existingDirs.length === 0) {
         _log("No state dirs found in sandbox (all empty)");
@@ -1189,7 +1487,7 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
           }
           if (whitelisted.length > 0) {
             _log(
-              `Pre-backup audit whitelisted ${whitelisted.length} entries (base-image npm symlinks): ${whitelisted.slice(0, 5).join("; ")}`,
+              `Pre-backup audit whitelisted ${whitelisted.length} entries (image npm symlinks): ${whitelisted.slice(0, 5).join("; ")}`,
             );
           }
           if (violations.length > 0) {
@@ -1216,13 +1514,42 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
         // could create symlinks to exfiltrate config contents via backup.
         const tarCmd = `tar -cf - -C ${shellQuote(dir)} -- ${existingDirs.map(shellQuote).join(" ")}`;
         _log(`Downloading via SSH+tar: ${tarCmd}`);
-        const result = spawnSync("ssh", [...sshArgs(configFile, sandboxName), tarCmd], {
-          stdio: ["ignore", "pipe", "pipe"],
-          timeout: 120000,
-          maxBuffer: 256 * 1024 * 1024,
-        });
+        let downloadedTarDir: string | undefined;
+        let downloadedTarPath: string;
+        let downloadedTarFd: number;
+        try {
+          downloadedTarDir = mkdtempSync(path.join(os.tmpdir(), "nemoclaw-state-download-"));
+          downloadedTarPath = path.join(downloadedTarDir, "archive.tar");
+          downloadedTarFd = openSync(downloadedTarPath, "wx", 0o600);
+        } catch (error) {
+          if (downloadedTarDir) {
+            rmSync(downloadedTarDir, { recursive: true, force: true });
+          }
+          const detail = error instanceof Error ? error.message : String(error);
+          _log(`FAILED: Could not create local backup archive staging file — ${detail}`);
+          return {
+            success: false,
+            manifest,
+            backedUpDirs,
+            failedDirs: [...existingDirs],
+            backedUpFiles,
+            failedFiles: stateFiles.map((f) => f.path),
+            error: `Failed to create backup archive file: ${detail}`,
+          };
+        }
+        let result: ReturnType<typeof spawnSync>;
+        try {
+          result = spawnSync("ssh", [...sshArgs(configFile, sandboxName), tarCmd], {
+            stdio: ["ignore", downloadedTarFd, "pipe"],
+            timeout: 120000,
+            maxBuffer: 256 * 1024 * 1024,
+          });
+        } finally {
+          closeSync(downloadedTarFd);
+        }
+        const downloadedBytes = statSync(downloadedTarPath).size;
         _log(
-          `SSH+tar download: exit=${result.status}, stdout=${result.stdout ? result.stdout.length + " bytes" : "null"}, stderr=${(result.stderr?.toString() || "").substring(0, 200)}`,
+          `SSH+tar download: exit=${result.status}, stdout=${downloadedBytes} bytes, stderr=${(result.stderr?.toString() || "").substring(0, 200)}`,
         );
         if (isSshTransportFailure(result)) unreachable = true;
 
@@ -1231,20 +1558,27 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
         // Accept exit 0, 1, or 2 when stdout has data — extract what tar produced
         // and determine per-dir success from tar's reported read errors.
         const tarExitedWithData =
-          result.stdout &&
-          result.stdout.length > 0 &&
+          downloadedBytes > 0 &&
           (result.status === 0 || result.status === 1 || result.status === 2);
 
-        if (result.status !== 0 && result.stdout && result.stdout.length > 0) {
+        if (result.status !== 0 && downloadedBytes > 0) {
           _log(
-            `tar exited ${result.status} but produced ${result.stdout.length} bytes — attempting partial extraction`,
+            `tar exited ${result.status} but produced ${downloadedBytes} bytes — attempting partial extraction`,
           );
         }
 
+        let extractResult: SafeExtractResult | null = null;
+        try {
+          if (tarExitedWithData) {
+            // SECURITY: Validate tar entries, extract safely, audit symlinks.
+            extractResult = safeTarExtract({ filePath: downloadedTarPath }, backupPath);
+          }
+        } finally {
+          rmSync(downloadedTarDir, { recursive: true, force: true });
+        }
+
         if (tarExitedWithData) {
-          // SECURITY: Validate tar entries, extract safely, audit symlinks
-          const extractResult = safeTarExtract(result.stdout, backupPath);
-          if (extractResult.success) {
+          if (extractResult?.success) {
             const extractedDirs = new Set(existingBackupDirs(backupPath, existingDirs));
             if (result.status === 0) {
               for (const d of existingDirs) {
@@ -1253,10 +1587,11 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
                 } else {
                   _log(`Dir ${d} missing from clean tar extraction — marking failed`);
                   failedDirs.push(d);
+                  failedDirReasons[d] = BACKUP_FAILURE_ABSENT_AFTER_EXTRACTION;
                 }
               }
             } else {
-              const tarFailedDirs = failedDirsFromTarStderr(
+              const tarFailedDirs = classifyFailedDirsFromTarStderr(
                 result.stderr?.toString() || "",
                 existingDirs,
               );
@@ -1267,19 +1602,22 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
                 failedDirs.push(...existingDirs);
               } else {
                 for (const d of existingDirs) {
-                  if (tarFailedDirs.has(d)) {
-                    _log(`Dir ${d} had tar read errors — marking failed`);
+                  const tarFailureReason = tarFailedDirs.get(d);
+                  if (tarFailureReason !== undefined) {
+                    _log(`Dir ${d} had tar read errors (${tarFailureReason}) — marking failed`);
                     failedDirs.push(d);
+                    failedDirReasons[d] = tarFailureReason;
                   } else if (!extractedDirs.has(d)) {
                     _log(`Dir ${d} missing from partial tar extraction — marking failed`);
                     failedDirs.push(d);
+                    failedDirReasons[d] = BACKUP_FAILURE_ABSENT_AFTER_EXTRACTION;
                   } else {
                     backedUpDirs.push(d);
                   }
                 }
               }
             }
-          } else {
+          } else if (extractResult) {
             _log(`SECURITY: tar extraction blocked: ${extractResult.error}`);
             failedDirs.push(...existingDirs);
           }
@@ -1301,6 +1639,16 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
         if (result.unreachable) unreachable = true;
       }
     }
+
+    unreachable =
+      captureAgentPreservedEnvFiles(
+        agentName,
+        configFile,
+        sandboxName,
+        dir,
+        manifest,
+        failedFiles,
+      ) || unreachable;
   } finally {
     try {
       tempSshConfig.cleanup();
@@ -1312,22 +1660,33 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
   // SECURITY: Strip credentials from the local backup
   sanitizeBackupDirectory(backupPath);
 
-  // Record any discovered per-agent workspace-* directories in the manifest
-  // alongside the manifest-declared state dirs, so restoreSandboxState()
-  // finds them when filtering backupPath contents. Preserve declared order
-  // and append newly-discovered workspace-* names that weren't already in
-  // stateDirs. See issue #1260.
-  const discoveredWorkspaces = backedUpDirs.filter(
-    (d) => d.startsWith("workspace-") && !stateDirs.includes(d),
+  // Record dynamically discovered directories in the manifest alongside the
+  // exact declarations so restoreSandboxState() can find them in backupPath.
+  // Preserve exact declaration order, followed by prefix-discovery order.
+  const discoveredStateDirs = backedUpDirs.filter(
+    (dirName) =>
+      !stateDirs.includes(dirName) && stateDirPrefixes.some((prefix) => dirName.startsWith(prefix)),
   );
-  if (discoveredWorkspaces.length > 0) {
-    manifest.stateDirs = [...stateDirs, ...discoveredWorkspaces];
-    _log(
-      `Manifest stateDirs extended with multi-agent workspaces: [${discoveredWorkspaces.join(",")}]`,
-    );
+  if (discoveredStateDirs.length > 0) {
+    manifest.stateDirs = [...stateDirs, ...discoveredStateDirs];
+    _log(`Manifest stateDirs extended with prefix matches: [${discoveredStateDirs.join(",")}]`);
   }
   manifest.backedUpDirs = backedUpDirs;
+  manifest.failedBackupDirs = failedDirs.filter((failedDir) =>
+    manifest.stateDirs.includes(failedDir),
+  );
 
+  const publicationError = validateSnapshotPublication(backupPath, options.validateBeforePublish);
+  if (publicationError) {
+    return {
+      success: false,
+      backedUpDirs: [],
+      failedDirs: [],
+      backedUpFiles: [],
+      failedFiles: [],
+      error: publicationError,
+    };
+  }
   writeManifest(backupPath, manifest);
   manifest.backupPath = backupPath;
 
@@ -1337,6 +1696,7 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
     manifest,
     backedUpDirs,
     failedDirs,
+    ...(Object.keys(failedDirReasons).length > 0 ? { failedDirReasons } : {}),
     backedUpFiles,
     failedFiles,
   };
@@ -1344,24 +1704,214 @@ export function backupSandboxState(sandboxName: string, options: BackupOptions =
 
 // ── Restore ────────────────────────────────────────────────────────
 
+function snapshotManifestAuthority(manifest: RebuildManifest): RebuildManifest {
+  const normalized = {
+    ...manifest,
+    backupPath: path.resolve(manifest.backupPath),
+  } as RebuildManifest & { snapshotVersion?: unknown };
+  // snapshotVersion is a list-time cursor, not persisted restore authority.
+  // Every other normalized manifest field can affect restore behavior and
+  // therefore remains bound to the operator's selected snapshot.
+  delete normalized.snapshotVersion;
+  return normalized;
+}
+
+function hashSnapshotTree(backupPath: string): string {
+  if (typeof constants.O_NOFOLLOW !== "number") {
+    throw new Error("snapshot hashing requires O_NOFOLLOW support");
+  }
+  const openFlags =
+    constants.O_RDONLY |
+    constants.O_NOFOLLOW |
+    (typeof constants.O_NONBLOCK === "number" ? constants.O_NONBLOCK : 0);
+  const hash = createHash("sha256");
+  const visit = (directory: string, relativeDirectory: string): void => {
+    const entries = readdirSync(directory, { withFileTypes: true }).sort((left, right) =>
+      left.name === right.name ? 0 : left.name < right.name ? -1 : 1,
+    );
+    for (const entry of entries) {
+      const fullPath = path.join(directory, entry.name);
+      const relativePath = path.posix.join(
+        relativeDirectory.split(path.sep).join(path.posix.sep),
+        entry.name,
+      );
+      if (entry.isDirectory()) {
+        hash.update(JSON.stringify(["directory", relativePath]), "utf8");
+        visit(fullPath, relativePath);
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        hash.update(JSON.stringify(["symlink", relativePath, readlinkSync(fullPath)]), "utf8");
+        continue;
+      }
+      if (!entry.isFile()) {
+        throw new Error(`snapshot contains unsupported entry '${relativePath}'`);
+      }
+      const descriptor = openSync(fullPath, openFlags);
+      try {
+        const opened = fstatSync(descriptor);
+        if (!opened.isFile()) {
+          throw new Error(`snapshot entry '${relativePath}' changed while it was opened`);
+        }
+        hash.update(JSON.stringify(["file", relativePath, opened.size]), "utf8");
+        const buffer = Buffer.allocUnsafe(64 * 1024);
+        for (;;) {
+          const bytesRead = readSync(descriptor, buffer, 0, buffer.byteLength, null);
+          if (bytesRead === 0) break;
+          hash.update(buffer.subarray(0, bytesRead));
+        }
+        const after = fstatSync(descriptor);
+        const pathAfter = lstatSync(fullPath);
+        if (
+          after.size !== opened.size ||
+          after.mtimeMs !== opened.mtimeMs ||
+          pathAfter.isSymbolicLink() ||
+          !pathAfter.isFile() ||
+          pathAfter.dev !== opened.dev ||
+          pathAfter.ino !== opened.ino ||
+          pathAfter.size !== opened.size ||
+          pathAfter.mtimeMs !== opened.mtimeMs
+        ) {
+          throw new Error(`snapshot entry '${relativePath}' changed while it was read`);
+        }
+      } finally {
+        closeSync(descriptor);
+      }
+    }
+  };
+  visit(backupPath, "");
+  return hash.digest("hex");
+}
+
+/**
+ * Bind a selected, validated manifest to all bytes that restore can consume.
+ * Returns null for an unsafe path, malformed manifest, selection drift, or a
+ * payload that changes while it is being hashed.
+ */
+export function captureSnapshotRestoreAuthority(
+  backupPath: string,
+  expectedManifest?: RebuildManifest,
+): SnapshotRestoreAuthority | null {
+  try {
+    const root = path.resolve(REBUILD_BACKUPS_DIR);
+    const candidate = path.resolve(backupPath);
+    if (candidate === root || !isWithinRoot(candidate, root)) return null;
+    rejectSymlinksOnPath(candidate);
+    if (!lstatSync(path.join(candidate, "rebuild-manifest.json")).isFile()) return null;
+    const manifest = readManifest(candidate);
+    if (!manifest || path.resolve(manifest.backupPath) !== candidate) return null;
+    if (
+      expectedManifest &&
+      !isDeepStrictEqual(
+        snapshotManifestAuthority(manifest),
+        snapshotManifestAuthority(expectedManifest),
+      )
+    ) {
+      return null;
+    }
+    return {
+      schemaVersion: 1,
+      backupPath: candidate,
+      contentSha256: hashSnapshotTree(candidate),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function validateSnapshotRestoreMutation(
+  backupPath: string,
+  options: Pick<InternalRestoreOptions, "authority" | "validateBeforeMutation">,
+): string | null {
+  if (options.authority) {
+    const current = captureSnapshotRestoreAuthority(backupPath);
+    if (
+      !current ||
+      current.backupPath !== options.authority.backupPath ||
+      current.contentSha256 !== options.authority.contentSha256
+    ) {
+      return "Selected snapshot content changed before filesystem mutation";
+    }
+  }
+  try {
+    options.validateBeforeMutation?.();
+    return null;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `Runtime authority changed before filesystem mutation: ${detail}`;
+  }
+}
+
 /**
  * Restore state directories into a sandbox from a prior backup.
  */
 export function restoreSandboxState(
   sandboxName: string,
   backupPath: string,
-  options: RestoreOptions = {},
+  options: SnapshotRestoreOptions = {},
 ): RestoreResult {
-  _log(`restoreSandboxState: sandbox=${sandboxName}, backupPath=${backupPath}`);
-  const manifest = readManifest(backupPath);
-  if (!manifest) {
-    _log("FAILED: Could not read rebuild-manifest.json");
+  const target = registry.getSandbox(sandboxName);
+  if (!target) {
     return {
       success: false,
       restoredDirs: [],
       failedDirs: ["manifest"],
       restoredFiles: [],
       failedFiles: [],
+      error: `Could not resolve target sandbox '${sandboxName}' for state restore`,
+    };
+  }
+  return restoreSandboxStateInternal(sandboxName, backupPath, {
+    targetAgentType: String(target.agent || "openclaw"),
+    ...(target.fromDockerfile ? { allowCustomImageWholeStateFileRestore: true } : {}),
+    ...(options.authority ? { authority: options.authority } : {}),
+    ...(options.validateBeforeMutation
+      ? { validateBeforeMutation: options.validateBeforeMutation }
+      : {}),
+  });
+}
+
+export function restoreRecreatedSandboxState(
+  sandboxName: string,
+  backupPath: string,
+  options: RecreatedSandboxRestoreOptions,
+): RestoreResult {
+  return restoreSandboxStateInternal(sandboxName, backupPath, {
+    targetAgentType: options.targetAgentType,
+    ...(options.allowCustomImageWholeStateFileRestore
+      ? { allowCustomImageWholeStateFileRestore: true }
+      : {}),
+    ...(options.targetAgentType === "openclaw" &&
+    options.freshOpenClawImagePluginInstalls === undefined
+      ? { discoverFreshOpenClawImagePluginInstalls: true }
+      : {}),
+    freshOpenClawImagePluginInstalls: options.freshOpenClawImagePluginInstalls,
+    ...(options.authority ? { authority: options.authority } : {}),
+    ...(options.validateBeforeMutation
+      ? { validateBeforeMutation: options.validateBeforeMutation }
+      : {}),
+  });
+}
+
+function restoreSandboxStateInternal(
+  sandboxName: string,
+  backupPath: string,
+  options: InternalRestoreOptions,
+): RestoreResult {
+  _log(`restoreSandboxState: sandbox=${sandboxName}, backupPath=${backupPath}`);
+  const manifest = readManifest(backupPath);
+  if (!manifest) {
+    _log("FAILED: Could not read rebuild-manifest.json");
+    const provenanceError = hasInvalidMarkedOpenClawPluginProvenance(backupPath)
+      ? OPENCLAW_IMAGE_PLUGIN_PROVENANCE_RESTORE_ERROR
+      : undefined;
+    return {
+      success: false,
+      restoredDirs: [],
+      failedDirs: ["manifest"],
+      restoredFiles: [],
+      failedFiles: [],
+      ...(provenanceError ? { error: provenanceError } : {}),
     };
   }
 
@@ -1386,7 +1936,7 @@ export function restoreSandboxState(
   // backward compatibility.
   const restorableStateDirs = manifest.backedUpDirs ?? manifest.stateDirs;
   const localDirs = existingBackupDirs(backupPath, restorableStateDirs);
-  const stateFiles = normalizeStateFileSpecs(manifest.stateFiles ?? []);
+  const stateFiles = normalizeStateFileSpecsPreservingDuplicates(manifest.stateFiles ?? []);
   const localFiles = stateFiles.filter((f) => existsSync(path.join(backupPath, f.path)));
   _log(
     `Local backup dirs: [${localDirs.join(",")}] (${localDirs.length}/${manifest.stateDirs.length})`,
@@ -1395,7 +1945,149 @@ export function restoreSandboxState(
     `Local backup files: [${localFiles.map((f) => f.path).join(",")}] (${localFiles.length}/${stateFiles.length})`,
   );
 
-  if (localDirs.length === 0 && localFiles.length === 0) {
+  const failRestoreContract = (error: string): RestoreResult => {
+    _log(`FAILED: ${error}`);
+    return {
+      success: false,
+      restoredDirs,
+      failedDirs: [...localDirs],
+      restoredFiles,
+      failedFiles: localFiles.map((file) => file.path),
+      error,
+    };
+  };
+  if (
+    manifest.workload?.kind === "managed-image" &&
+    (!options.authority || !options.validateBeforeMutation)
+  ) {
+    return failRestoreContract(MANAGED_SNAPSHOT_RESTORE_AUTHORITY_ERROR);
+  }
+  if (options.targetAgentType !== manifest.agentType) {
+    return failRestoreContract(
+      `Backup agent '${manifest.agentType}' does not match target agent '${options.targetAgentType}'`,
+    );
+  }
+  let targetAgent: ReturnType<typeof loadAgent>;
+  try {
+    targetAgent = loadAgent(options.targetAgentType);
+  } catch {
+    return failRestoreContract(
+      `Could not load target agent manifest '${options.targetAgentType}' for state restore`,
+    );
+  }
+  const normalizedBackupDir = dir.replace(/\/+$/, "");
+  const normalizedTargetDir = targetAgent.configPaths.dir.replace(/\/+$/, "");
+  if (normalizedBackupDir !== normalizedTargetDir) {
+    return failRestoreContract(
+      `Backup state directory '${normalizedBackupDir}' does not match target directory '${normalizedTargetDir}'`,
+    );
+  }
+  // The current target manifest remains authoritative for non-backup state,
+  // including legacy snapshots whose embedded manifests still list it.
+  const targetNonBackupDirs = targetAgent.nonBackupStateDirs;
+  const targetNonBackupPrefixes = targetAgent.nonBackupStateDirPrefixes;
+  const isTargetNonBackupDir = (dirName: string): boolean =>
+    isAllowedDiscoveredStateDir(dirName, targetNonBackupDirs, targetNonBackupPrefixes);
+  const targetBackupDirs = targetAgent.backupStateDirs;
+  const targetBackupPrefixes = targetAgent.backupStateDirPrefixes;
+  const isTargetBackupDir = (dirName: string): boolean =>
+    !isTargetNonBackupDir(dirName) &&
+    isAllowedDiscoveredStateDir(dirName, targetBackupDirs, targetBackupPrefixes);
+  const undeclaredSnapshotDirs = manifest.stateDirs.filter(
+    (dirName) => !isTargetBackupDir(dirName) && !isTargetNonBackupDir(dirName),
+  );
+  if (undeclaredSnapshotDirs.length > 0) {
+    return failRestoreContract(
+      `Backup state directories are not declared by target agent '${options.targetAgentType}': ${undeclaredSnapshotDirs.join(", ")}`,
+    );
+  }
+  const skippedNonBackupDirs = localDirs.filter(isTargetNonBackupDir);
+  if (skippedNonBackupDirs.length > 0) {
+    _log(`Skipping non-backup state dirs from restore: [${skippedNonBackupDirs.join(",")}]`);
+    for (const d of skippedNonBackupDirs) {
+      localDirs.splice(localDirs.indexOf(d), 1);
+    }
+  }
+  // Only manifests that distinguish failed backups from absent directories can
+  // authorize cleanup without deleting data that a failed backup did not capture.
+  // Older manifests leave this field absent, so preserve their historical restore behavior.
+  const failedBackupDirs = new Set(manifest.failedBackupDirs ?? []);
+  const localDirSet = new Set(localDirs);
+  const staleContentDirs =
+    manifest.failedBackupDirs === undefined
+      ? []
+      : manifest.stateDirs.filter(
+          (stateDir) =>
+            isTargetBackupDir(stateDir) &&
+            !isTargetNonBackupDir(stateDir) &&
+            !localDirSet.has(stateDir) &&
+            !failedBackupDirs.has(stateDir),
+        );
+  const cleanupStateDirs = [...new Set([...localDirs, ...staleContentDirs])];
+  const targetStateFiles = new Map<string, AgentStateFile>();
+  for (const targetFile of targetAgent.stateFiles) {
+    const normalized = normalizeStateFilePath(targetFile.path);
+    if (!normalized || targetStateFiles.has(normalized)) {
+      return failRestoreContract(
+        `Target agent manifest '${options.targetAgentType}' has an invalid or duplicate state file declaration`,
+      );
+    }
+    targetStateFiles.set(normalized, targetFile);
+  }
+  const seenBackupPaths = new Set<string>();
+  for (const backupFile of stateFiles) {
+    if (seenBackupPaths.has(backupFile.path)) {
+      return failRestoreContract(`Backup manifest repeats state file '${backupFile.path}'`);
+    }
+    seenBackupPaths.add(backupFile.path);
+    const targetFile = targetStateFiles.get(backupFile.path);
+    if (!targetFile) {
+      return failRestoreContract(
+        `Backup state file '${backupFile.path}' is not declared by target agent '${options.targetAgentType}'`,
+      );
+    }
+    if (targetFile.strategy !== backupFile.strategy) {
+      return failRestoreContract(
+        `Backup state file '${backupFile.path}' strategy '${backupFile.strategy}' does not match target strategy '${targetFile.strategy}'`,
+      );
+    }
+  }
+
+  let freshOpenClawImagePluginInstalls: readonly OpenClawImagePluginInstall[] | undefined;
+  if (options.freshOpenClawImagePluginInstalls !== undefined) {
+    const parsed = parseOpenClawImagePluginInstalls(
+      options.freshOpenClawImagePluginInstalls,
+      targetAgent.configPaths.dir,
+    );
+    if (!parsed.ok) {
+      return {
+        ...failRestoreContract(parsed.error),
+        failedDirs: ["extensions"],
+        failedFiles: [],
+      };
+    }
+    freshOpenClawImagePluginInstalls = parsed.pluginInstalls;
+  } else if (options.discoverFreshOpenClawImagePluginInstalls === true) {
+    const discovery = discoverFreshOpenClawImagePluginInstalls(
+      sandboxName,
+      { getSshConfig, sshArgs },
+      targetAgent.configPaths.dir,
+    );
+    if (!discovery.ok) {
+      return {
+        ...failRestoreContract(discovery.error),
+        failedDirs: ["extensions"],
+        failedFiles: [],
+      };
+    }
+    freshOpenClawImagePluginInstalls = discovery.pluginInstalls;
+  }
+
+  if (cleanupStateDirs.length === 0 && localFiles.length === 0) {
+    const mutationAuthorityError = validateSnapshotRestoreMutation(backupPath, options);
+    if (mutationAuthorityError) {
+      return failRestoreContract(mutationAuthorityError);
+    }
     _log("No dirs or files to restore");
     return { success: true, restoredDirs, failedDirs, restoredFiles, failedFiles };
   }
@@ -1407,7 +2099,7 @@ export function restoreSandboxState(
     return {
       success: false,
       restoredDirs,
-      failedDirs: [...localDirs],
+      failedDirs: [...cleanupStateDirs],
       restoredFiles,
       failedFiles: localFiles.map((f) => f.path),
     };
@@ -1415,18 +2107,59 @@ export function restoreSandboxState(
 
   const tempSshConfig = createTempSshConfig(sshConfig, "nemoclaw-state-");
   const configFile = tempSshConfig.file;
+  const previousOpenClawImagePluginInstalls =
+    freshOpenClawImagePluginInstalls !== undefined
+      ? manifest.openclawImagePluginInstalls
+      : undefined;
+  // Fresh provenance is still authoritative for preserving image-managed
+  // extension directories during recreation. Config reconciliation, however,
+  // needs a complete before/after pair. Legacy and stock-image backups do not
+  // carry the previous baseline, so preserve their historical config-merge
+  // behavior by passing neither side of the pair to openclaw.json restore.
+  const configFreshOpenClawImagePluginInstalls =
+    previousOpenClawImagePluginInstalls !== undefined
+      ? freshOpenClawImagePluginInstalls
+      : undefined;
   try {
+    const pluginRestorePlan = planOpenClawPluginRestore({
+      agentType: manifest.agentType,
+      dir,
+      localDirs: cleanupStateDirs,
+      freshImagePluginInstalls: freshOpenClawImagePluginInstalls,
+      previousImagePluginInstalls: previousOpenClawImagePluginInstalls,
+    });
+    if (!pluginRestorePlan.ok) {
+      return {
+        success: false,
+        restoredDirs,
+        failedDirs: [...cleanupStateDirs],
+        restoredFiles,
+        failedFiles: localFiles.map((f) => f.path),
+        error:
+          manifest.reconcileOpenClawImagePluginProvenance === true
+            ? OPENCLAW_IMAGE_PLUGIN_PROVENANCE_RESTORE_ERROR
+            : pluginRestorePlan.error,
+      };
+    }
+    if (
+      freshOpenClawImagePluginInstalls !== undefined &&
+      pluginRestorePlan.preservedExtensionDirs.length > 0
+    ) {
+      _log(
+        `Fresh image-managed OpenClaw extensions: [${pluginRestorePlan.freshExtensionDirs.join(",")}]`,
+      );
+      _log(
+        `Previous image-managed OpenClaw extensions: [${pluginRestorePlan.previousExtensionDirs.join(",")}]`,
+      );
+    }
+
+    let restoreTar: Buffer | undefined;
     if (localDirs.length > 0) {
       // Upload via tar pipe
       // NC-2227-04: Removed -h flag from restore as well — no symlink following.
-      const preserveManagedExtensions = shouldPreserveOpenClawManagedExtensions(
-        manifest,
-        dir,
-        localDirs,
-      );
       const tarResult = spawnSync(
         "tar",
-        buildRestoreTarArgs(backupPath, localDirs, preserveManagedExtensions),
+        buildRestoreTarArgs(backupPath, localDirs, pluginRestorePlan.archiveExcludedExtensionDirs),
         {
           stdio: ["ignore", "pipe", "pipe"],
           timeout: 60000,
@@ -1438,18 +2171,32 @@ export function restoreSandboxState(
         return {
           success: false,
           restoredDirs,
-          failedDirs: [...localDirs],
+          failedDirs: [...cleanupStateDirs],
           restoredFiles,
           failedFiles: localFiles.map((f) => f.path),
         };
       }
+      restoreTar = tarResult.stdout;
+    }
 
-      // Remove existing state dirs before extracting so stale files from later
-      // snapshots don't persist after restoring an earlier one. OpenClaw's
-      // image-managed extensions are preserved from the freshly built image and
-      // excluded from the restore tar; only user/non-managed extension entries
-      // are cleared and restored from the backup.
-      const rmCmd = buildRestoreCleanupCommand(dir, localDirs, preserveManagedExtensions);
+    const mutationAuthorityError = validateSnapshotRestoreMutation(backupPath, options);
+    if (mutationAuthorityError) {
+      return failRestoreContract(mutationAuthorityError);
+    }
+
+    // Remove existing state dirs before extracting so stale files from later
+    // snapshots don't persist after restoring an earlier one. OpenClaw's
+    // image-managed extensions are preserved from the freshly built image and
+    // excluded from the restore tar; only user/non-managed extension entries
+    // are cleared and restored from the backup.
+    if (cleanupStateDirs.length > 0) {
+      const rmCmd = buildRestoreCleanupCommand(
+        dir,
+        localDirs,
+        pluginRestorePlan.preservedExtensionDirs,
+        new Set(pluginRestorePlan.requiredFreshExtensionDirs),
+        staleContentDirs,
+      );
       _log(`Cleaning target dirs before restore: ${rmCmd}`);
       const rmResult = spawnSync("ssh", [...sshArgs(configFile, sandboxName), rmCmd], {
         stdio: ["ignore", "pipe", "pipe"],
@@ -1465,15 +2212,17 @@ export function restoreSandboxState(
         return {
           success: false,
           restoredDirs,
-          failedDirs: [...localDirs],
+          failedDirs: [...cleanupStateDirs],
           restoredFiles,
           failedFiles: localFiles.map((f) => f.path),
         };
       }
+    }
 
+    if (restoreTar !== undefined) {
       const extractCmd = `tar --no-same-owner -xf - -C ${shellQuote(dir)}`;
       const sshResult = spawnSync("ssh", [...sshArgs(configFile, sandboxName), extractCmd], {
-        input: tarResult.stdout,
+        input: restoreTar,
         stdio: ["pipe", "pipe", "pipe"],
         timeout: 120000,
       });
@@ -1534,16 +2283,19 @@ export function restoreSandboxState(
     }
 
     for (const spec of localFiles) {
+      const targetStateFile = targetStateFiles.get(spec.path);
+      if (!targetStateFile) throw new Error(`Validated target state file missing: ${spec.path}`);
       if (
         restoreStateFile(
-          configFile,
-          sandboxName,
-          manifest.agentType,
+          sshArgs(configFile, sandboxName),
           dir,
           spec,
           backupPath,
-          shouldMergeOpenClawConfigStateFile(manifest.agentType, dir, spec),
-          options.stateFileRestorePolicy,
+          targetStateFile.restore,
+          options.allowCustomImageWholeStateFileRestore === true,
+          _log,
+          configFreshOpenClawImagePluginInstalls,
+          previousOpenClawImagePluginInstalls,
         )
       ) {
         restoredFiles.push(spec.path);
@@ -1570,26 +2322,86 @@ export function restoreSandboxState(
 
 // ── Manifest ───────────────────────────────────────────────────────
 
-function writeManifest(backupPath: string, manifest: RebuildManifest): void {
+type ManifestPublishOps = {
+  write(filePath: string, contents: string, options: { mode: number; flag: "wx" }): void;
+  rename(source: string, destination: string): void;
+  remove(filePath: string, options: { force: true }): void;
+};
+
+const manifestPublishOps: ManifestPublishOps = {
+  write: (filePath, contents, options) => writeFileSync(filePath, contents, options),
+  rename: (source, destination) => renameSync(source, destination),
+  remove: (filePath, options) => rmSync(filePath, options),
+};
+
+function writeManifest(
+  backupPath: string,
+  manifest: RebuildManifest,
+  ops: ManifestPublishOps = manifestPublishOps,
+): void {
   const manifestPath = path.join(backupPath, "rebuild-manifest.json");
-  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-  chmodSync(manifestPath, 0o600);
+  const tempPath = path.join(backupPath, `.rebuild-manifest.json.tmp.${String(process.pid)}`);
+  let published = false;
+  try {
+    // A snapshot becomes recoverable only after its complete, private manifest
+    // is atomically renamed into place.
+    ops.write(tempPath, JSON.stringify(manifest, null, 2), { mode: 0o600, flag: "wx" });
+    ops.rename(tempPath, manifestPath);
+    published = true;
+  } finally {
+    if (!published) {
+      try {
+        ops.remove(tempPath, { force: true });
+      } catch {
+        // Preserve the publish failure; a same-directory temp file is never a snapshot.
+      }
+    }
+  }
 }
 
-function readManifest(backupPath: string): RebuildManifest | null {
+export const __test = { writeManifest };
+
+function readManifestPayload(backupPath: string): unknown | null {
   const manifestPath = path.join(backupPath, "rebuild-manifest.json");
   if (!existsSync(manifestPath)) return null;
   try {
-    const parsed = parseJson<unknown>(readFileSync(manifestPath, "utf-8"));
+    return parseJson<unknown>(readFileSync(manifestPath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function hasInvalidMarkedOpenClawPluginProvenance(backupPath: string): boolean {
+  const parsed = readManifestPayload(backupPath);
+  return (
+    isObjectRecord(parsed) &&
+    parsed.reconcileOpenClawImagePluginProvenance === true &&
+    !hasAuthoritativeOpenClawImagePluginProvenance(parsed)
+  );
+}
+
+function readManifest(backupPath: string): RebuildManifest | null {
+  try {
+    const parsed = readManifestPayload(backupPath);
     if (!isRebuildManifest(parsed)) return null;
     const manifest = parsed as RebuildManifest & { dir?: string; writableDir?: string };
     const dir = manifest.dir ?? manifest.writableDir;
     if (!dir) return null;
+    const runtimeSnapshot =
+      manifest.runtimeSnapshot === undefined
+        ? undefined
+        : cloneSandboxRuntimeSnapshot(manifest.runtimeSnapshot);
+    const workload =
+      manifest.workload === undefined ? undefined : cloneSandboxWorkloadReceipt(manifest.workload);
     return {
       ...manifest,
       dir,
-      stateFiles: normalizeStateFileSpecs(manifest.stateFiles ?? []),
+      // Preserve repeated normalized paths from this untrusted payload so the
+      // restore contract can reject them instead of silently de-duplicating.
+      stateFiles: normalizeStateFileSpecsPreservingDuplicates(manifest.stateFiles ?? []),
       blueprintDigest: manifest.blueprintDigest ?? null,
+      ...(runtimeSnapshot === undefined ? {} : { runtimeSnapshot }),
+      ...(workload === undefined ? {} : { workload }),
     };
   } catch {
     return null;
@@ -1601,6 +2413,32 @@ function readManifest(backupPath: string): RebuildManifest | null {
 export type RebuildRecoveryManifestValidation =
   | { ok: true; manifest: RebuildManifest }
   | { ok: false; reason: string };
+
+/**
+ * Remove one completed rebuild backup without allowing a caller-controlled
+ * path to escape the sandbox's timestamped backup directory.
+ */
+export function removeSandboxStateBackup(sandboxName: string, backupPath: string): boolean {
+  const rebuildBackupsRoot = path.resolve(REBUILD_BACKUPS_DIR);
+  const sandboxBackupRoot = path.resolve(rebuildBackupsRoot, sandboxName);
+  const candidateBackupPath = path.resolve(backupPath);
+
+  if (
+    sandboxBackupRoot === rebuildBackupsRoot ||
+    !isWithinRoot(sandboxBackupRoot, rebuildBackupsRoot) ||
+    normalizeHostPath(path.dirname(candidateBackupPath)) !== normalizeHostPath(sandboxBackupRoot)
+  ) {
+    return false;
+  }
+
+  try {
+    rejectSymlinksOnPath(candidateBackupPath);
+    rmSync(candidateBackupPath, { recursive: true, force: true });
+    return !existsSync(candidateBackupPath);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Re-read and validate a prepared rebuild backup before a destructive recovery.

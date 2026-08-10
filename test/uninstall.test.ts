@@ -12,11 +12,21 @@ const UNINSTALL_SCRIPT = path.join(import.meta.dirname, "..", "uninstall.sh");
 describe("uninstall CLI flags", () => {
   function writeFakeTools(fakeBin: string) {
     fs.mkdirSync(fakeBin);
-    for (const cmd of ["npm", "openshell", "docker", "ollama", "pgrep"]) {
+    for (const cmd of ["npm", "docker", "ollama", "pgrep"]) {
       fs.writeFileSync(path.join(fakeBin, cmd), "#!/usr/bin/env bash\nexit 0\n", {
         mode: 0o755,
       });
     }
+    fs.writeFileSync(
+      path.join(fakeBin, "openshell"),
+      `#!/usr/bin/env bash
+case "$*" in
+  "gateway list -o json") printf '[{"name":"nemoclaw"}]\\n' ;;
+esac
+exit 0
+`,
+      { mode: 0o755 },
+    );
   }
 
   function seedPreservedState(tmp: string): string {
@@ -28,7 +38,10 @@ describe("uninstall CLI flags", () => {
     );
     fs.mkdirSync(path.join(stateDir, "backups", "20260320-120000"), { recursive: true });
     fs.writeFileSync(path.join(stateDir, "backups", "20260320-120000", "USER.md"), "hello");
-    fs.writeFileSync(path.join(stateDir, "sandboxes.json"), "[]");
+    fs.writeFileSync(
+      path.join(stateDir, "sandboxes.json"),
+      JSON.stringify({ defaultSandbox: null, sandboxes: {} }),
+    );
     return stateDir;
   }
 
@@ -96,9 +109,9 @@ describe("uninstall CLI flags", () => {
     writeFakeTools(path.join(tmp, "bin"));
     try {
       const result = runUninstall(tmp, ["--yes"]);
-
-      expect(result.status).toBe(0);
       const output = `${result.stdout}${result.stderr}`;
+
+      expect(result.status, output).toBe(0);
       expect(output).toMatch(/NemoClaw/);
       expect(output).toMatch(/Claws retracted/);
     } finally {
@@ -112,8 +125,9 @@ describe("uninstall CLI flags", () => {
     const stateDir = seedPreservedState(tmp);
     try {
       const result = runUninstall(tmp, ["--yes"]);
+      const output = `${result.stdout}${result.stderr}`;
 
-      expect(result.status).toBe(0);
+      expect(result.status, output).toBe(0);
       expect(
         fs.existsSync(path.join(stateDir, "rebuild-backups", "sb1", "20260101", "manifest.json")),
       ).toBe(true);
@@ -132,11 +146,54 @@ describe("uninstall CLI flags", () => {
     const stateDir = seedPreservedState(tmp);
     try {
       const result = runUninstall(tmp, ["--yes", "--destroy-user-data"]);
-
-      expect(result.status).toBe(0);
       const output = `${result.stdout}${result.stderr}`;
+
+      expect(result.status, output).toBe(0);
       expect(output).toMatch(/--destroy-user-data set; purging user data under ~\/\.nemoclaw\//);
       expect(fs.existsSync(stateDir)).toBe(false);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("completes selected-gateway cleanup and exits 0 when the recorded sandbox is already absent (#7906)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-uninstall-absent-sandbox-"));
+    const fakeBin = path.join(tmp, "bin");
+    writeFakeTools(fakeBin);
+    fs.writeFileSync(
+      path.join(fakeBin, "openshell"),
+      `#!/usr/bin/env bash
+case "$*" in
+  "gateway list -o json") printf '[{"name":"nemoclaw"},{"name":"nemoclaw-9124"}]\\n' ;;
+  "sandbox delete my-assistant")
+    printf "Error: status: NotFound, sandbox 'my-assistant' not found\\n" >&2
+    exit 1
+    ;;
+esac
+exit 0
+`,
+      { mode: 0o755 },
+    );
+    const stateDir = path.join(tmp, ".nemoclaw");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, "sandboxes.json"),
+      JSON.stringify({
+        defaultSandbox: "my-assistant",
+        sandboxes: {
+          "my-assistant": { name: "my-assistant", gatewayName: "nemoclaw", gatewayPort: 8080 },
+          sibling: { name: "sibling", gatewayName: "nemoclaw-9124", gatewayPort: 9124 },
+        },
+      }),
+    );
+    try {
+      const result = runUninstall(tmp, ["--yes", "--destroy-user-data"]);
+      const output = `${result.stdout}${result.stderr}`;
+
+      expect(result.status, output).toBe(0);
+      expect(output).toMatch(/OpenShell sandbox 'my-assistant' already removed/);
+      expect(output).not.toMatch(/Selected gateway cleanup was incomplete/);
+      expect(output).not.toMatch(/Uninstall completed with errors/);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }

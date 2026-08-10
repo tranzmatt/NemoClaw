@@ -47,16 +47,20 @@ import errno
 import fcntl
 import hashlib
 import http.client
+import io
 import importlib.util
 import os
 import pwd
 import re
 import select
 import signal
+import socket
 import stat
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 
@@ -78,6 +82,8 @@ KILL_GRACE_SECONDS = 5.0
 RECOVERY_TIMEOUT_SECONDS = 150.0
 RECOVER_EXISTING_GRACE_SECONDS = 10.0
 POLL_SECONDS = 0.2
+PROCESS_PROOF_GRACE_SECONDS = 1.0
+PROCESS_PROOF_RETRY_SECONDS = 0.05
 NEMOCLAW_RUNTIME_DIR = "/run/nemoclaw"
 NEMOCLAW_RUNTIME_DIR_MODE = 0o711
 EXPECTED_EXIT_MARKER_NAME = "managed-gateway-expected-exit"
@@ -85,14 +91,103 @@ EXPECTED_EXIT_LOCK_NAME = "managed-gateway-expected-exit.lock"
 NONCE_RE = re.compile(r"[0-9a-f]{64}\Z")
 ENV_KEY_RE = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*\Z")
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+HERMES_MCP_STATE_RE = re.compile(
+    r"# nemoclaw-hermes-mcp-state-v1 "
+    r"intended=[0-9a-f]{64} applied=[0-9a-f]{64}\Z"
+)
+CONTROL_STAGES = frozenset(
+    {
+        "detect-agent",
+        "acquire-expected-exit-lock",
+        "discover-supervisor",
+        "initial-gateway-proof",
+        "preflight",
+        "await-existing-gateway",
+        "publish-expected-exit",
+        "terminate-gateway",
+        "await-replacement",
+        "cleanup-expected-exit",
+    }
+)
+START_LOG_PATH = "/tmp/nemoclaw-start.log"
+MAX_START_LOG_DIAGNOSTIC_BYTES = 16 * 1024
+MAX_START_LOG_DIAGNOSTIC_LINES = 6
+MAX_START_LOG_DIAGNOSTIC_LINE_CHARS = 512
+START_LOG_DIAGNOSTIC_PATTERNS = (
+    re.compile(
+        r"\[gateway\] Hermes runtime preparation refused automatic respawn; retrying in 5s"
+    ),
+    re.compile(
+        r"\[gateway\] Hermes gateway launch failed; retrying under the same supervisor"
+    ),
+    re.compile(
+        r"\[gateway\] Hermes pre-launch layout repair failed at (?:gateway state directory|runtime state directory|history file)"
+    ),
+    re.compile(
+        r"\[gateway\] Hermes auxiliary repair failed; retrying while the exact gateway remains healthy"
+    ),
+    re.compile(
+        r"\[gateway\] Hermes auxiliary repair failed; retrying while the exact gateway remains supervised"
+    ),
+    re.compile(
+        r"\[gateway\] Hermes replacement gateway failed listener or health validation; stopping the exact child"
+    ),
+    re.compile(
+        r"\[gateway\] Hermes replacement gateway lost its listener or health endpoint during auxiliary validation; stopping the exact child"
+    ),
+    re.compile(
+        r"\[gateway\] CRITICAL: Hermes gateway lost its listener or health endpoint; stopping the exact child for recovery"
+    ),
+    re.compile(
+        r"\[gateway\] Hermes gateway pid [1-9][0-9]* exited \(rc=[0-9]+; authenticated host authorization\); respawning without charging crash quarantine in 2s"
+    ),
+    re.compile(r"\[gateway\] Hermes gateway respawned \(pid [1-9][0-9]*\)"),
+    re.compile(
+        r"\[gateway\] CRITICAL: [1-9][0-9]* exits in 60s window — Hermes relaunch is quarantined until sandbox recreation; check /tmp/gateway\.log"
+    ),
+    re.compile(
+        r"\[gateway\] CRITICAL: (?:exact Hermes replacement|unhealthy Hermes gateway|initial Hermes gateway) could not be stopped; managed supervisor is quarantined without another launch"
+    ),
+    re.compile(
+        r"\[SECURITY\] Hermes automatic respawn is quarantined until MCP integrity is restored by rebuilding the sandbox"
+    ),
+    re.compile(
+        r"\[CRITICAL\] Newly launched Hermes (?:gateway|gateway-log|dashboard|dashboard-log|api-socat|dashboard-socat) pid [1-9][0-9]* failed exact role identity capture; quarantining the managed startup supervisor without signaling the unproven child"
+    ),
+    re.compile(
+        r"\[CRITICAL\] Unproven Hermes (?:gateway|gateway-log|dashboard|dashboard-log|api-socat|dashboard-socat) child exited; managed supervisor remains quarantined until sandbox recreation"
+    ),
+)
+ANSI_ESCAPE_RE = re.compile(
+    r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\)|[@-_])"
+)
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]")
 
 
 class ControlError(RuntimeError):
     """A failure whose code is part of the existing host marker contract."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, stage: str | None = None):
         super().__init__(code)
         self.code = code
+        self.stage = stage
+
+
+@contextmanager
+def _control_stage(stage: str) -> Iterator[None]:
+    """Attach one fixed lifecycle stage to health or supervisor loss."""
+
+    if stage not in CONTROL_STAGES:
+        raise AssertionError(f"unknown managed-control stage: {stage}")
+    try:
+        yield
+    except ControlError as error:
+        if (
+            error.code in ("GATEWAY_HEALTH_TIMEOUT", "SUPERVISOR_UNAVAILABLE")
+            and error.stage is None
+        ):
+            error.stage = stage
+        raise
 
 
 @dataclass(frozen=True)
@@ -129,6 +224,14 @@ class AgentSpec:
     port: int
     health_path: str = "/health"
     readiness_checks: tuple[tuple[int, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class ExpectedExitLock:
+    """Held lock for one managed gateway lifecycle operation."""
+
+    directory_fd: int
+    lock_fd: int
 
 
 @dataclass(frozen=True)
@@ -325,8 +428,18 @@ def _validate_runtime_regular(
         raise ControlError("SUPERVISOR_UNAVAILABLE")
 
 
-def _open_expected_exit_lock(directory_fd: int) -> int:
-    """Acquire the root-only lock that serializes authorization publication."""
+def _open_expected_exit_lock(
+    directory_fd: int,
+    recovery_deadline: float,
+) -> int:
+    """Acquire the root-only lock that serializes lifecycle changes.
+
+    A second host lifecycle request can arrive while the first controller is
+    still waiting for the gateway replacement. Poll the non-blocking flock
+    until the shared recovery deadline instead of turning that expected
+    overlap into an immediate ``SUPERVISOR_BUSY`` failure. The waiting process
+    has not published a marker and cannot authorize a gateway exit.
+    """
 
     base_flags = (
         os.O_RDWR
@@ -374,10 +487,19 @@ def _open_expected_exit_lock(directory_fd: int) -> int:
             metadata.st_ino,
         ):
             raise ControlError("SUPERVISOR_UNAVAILABLE")
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ControlError("SUPERVISOR_BUSY") from exc
+        while True:
+            if time.monotonic() >= recovery_deadline:
+                raise ControlError("SUPERVISOR_BUSY")
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                remaining = recovery_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ControlError("SUPERVISOR_BUSY") from exc
+                time.sleep(min(POLL_SECONDS, remaining))
+        if time.monotonic() >= recovery_deadline:
+            raise ControlError("SUPERVISOR_BUSY")
         locked = os.fstat(lock_fd)
         _validate_runtime_regular(locked, 0o600)
         if (
@@ -395,6 +517,26 @@ def _open_expected_exit_lock(directory_fd: int) -> int:
     except Exception:
         os.close(lock_fd)
         raise
+
+
+def _acquire_expected_exit_lock(
+    recovery_deadline: float,
+) -> ExpectedExitLock:
+    directory_fd = _open_managed_runtime_directory()
+    lock_fd = None
+    try:
+        lock_fd = _open_expected_exit_lock(directory_fd, recovery_deadline)
+        return ExpectedExitLock(directory_fd=directory_fd, lock_fd=lock_fd)
+    except Exception:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        os.close(directory_fd)
+        raise
+
+
+def _close_expected_exit_lock(lock: ExpectedExitLock) -> None:
+    os.close(lock.lock_fd)
+    os.close(lock.directory_fd)
 
 
 def _trusted_expected_exit_marker(
@@ -425,16 +567,18 @@ def _controller_process_identity(reader: ProcReader) -> ProcessIdentity:
 
 
 def _publish_expected_exit_lease(
+    lock: ExpectedExitLock,
     identity: ProcessIdentity,
     controller: ProcessIdentity,
+    recovery_deadline: float | None = None,
 ) -> ExpectedExitLease:
     """Authorize one exact gateway exit while this root controller is live."""
 
-    directory_fd = _open_managed_runtime_directory()
-    lock_fd = -1
+    _require_recovery_time(recovery_deadline)
+    directory_fd = lock.directory_fd
+    lock_fd = lock.lock_fd
     marker_fd = -1
     try:
-        lock_fd = _open_expected_exit_lock(directory_fd)
         existing = _trusted_expected_exit_marker(directory_fd)
         if existing is not None:
             existing_fd, metadata = existing
@@ -447,6 +591,7 @@ def _publish_expected_exit_lease(
                 )
             finally:
                 os.close(existing_fd)
+        _require_recovery_time(recovery_deadline)
 
         payload = (
             f"v1 {identity.pid} {identity.start_time} "
@@ -487,6 +632,7 @@ def _publish_expected_exit_lease(
             marker_inode,
         ):
             raise ControlError("SUPERVISOR_UNAVAILABLE")
+        _require_recovery_time(recovery_deadline)
     except Exception:
         try:
             if marker_fd >= 0:
@@ -503,9 +649,6 @@ def _publish_expected_exit_lease(
             pass
         if marker_fd >= 0:
             os.close(marker_fd)
-        if lock_fd >= 0:
-            os.close(lock_fd)
-        os.close(directory_fd)
         raise
     return ExpectedExitLease(
         directory_fd=directory_fd,
@@ -579,18 +722,24 @@ def _namespace_inode(pid_fd: int) -> int | None:
         os.close(fd)
 
 
-def _parse_stat(raw: bytes) -> tuple[str, int, str]:
+def _parse_stat(raw: bytes) -> tuple[str, int, str, int]:
     try:
         text = raw.decode("ascii")
         suffix = text.rsplit(") ", 1)[1].split()
         state = suffix[0]
         parent_pid = int(suffix[1], 10)
+        thread_count = int(suffix[17], 10)
         start_time = suffix[19]
     except (IndexError, UnicodeDecodeError, ValueError) as exc:
         raise ControlError("SUPERVISOR_UNAVAILABLE") from exc
-    if not start_time.isascii() or not start_time.isdigit() or len(state) != 1:
+    if (
+        not start_time.isascii()
+        or not start_time.isdigit()
+        or len(state) != 1
+        or thread_count < 1
+    ):
         raise ControlError("SUPERVISOR_UNAVAILABLE")
-    return state, parent_pid, start_time
+    return state, parent_pid, start_time, thread_count
 
 
 def _parse_status(raw: bytes, pid: int) -> tuple[tuple[int, int, int, int], int]:
@@ -612,9 +761,20 @@ def _parse_status(raw: bytes, pid: int) -> tuple[tuple[int, int, int, int], int]
     return uid_values, namespace_values[-1]
 
 
-def _parse_cmdline(raw: bytes) -> tuple[bytes, ...]:
+def _parse_cmdline(
+    raw: bytes, state: str, thread_count: int
+) -> tuple[bytes, ...]:
     values = tuple(value for value in raw.split(b"\0") if value)
-    if not values or sum(len(value) for value in values) > MAX_PROC_FILE_BYTES:
+    if sum(len(value) for value in values) > MAX_PROC_FILE_BYTES:
+        raise ControlError("SUPERVISOR_UNAVAILABLE")
+    if not values:
+        # Linux exposes an empty cmdline after a process becomes a zombie, but
+        # a zombie thread-group leader can retain live sibling threads. Accept
+        # only a single-thread zombie; all candidate matchers exclude state=Z
+        # while safely handling empty argv. Keep every other empty cmdline
+        # terminal so discovery remains fail closed.
+        if state == "Z" and thread_count == 1:
+            return ()
         raise ControlError("SUPERVISOR_UNAVAILABLE")
     return values
 
@@ -654,15 +814,19 @@ class ProcReader:
             before = os.fstat(pid_fd)
             first_stat = _parse_stat(_read_at(pid_fd, "stat"))
             first_status = _parse_status(_read_at(pid_fd, "status"), pid)
-            first_cmdline = _parse_cmdline(_read_at(pid_fd, "cmdline"))
+            first_cmdline = _parse_cmdline(
+                _read_at(pid_fd, "cmdline"), first_stat[0], first_stat[3]
+            )
             first_namespace = _namespace_inode(pid_fd)
             second_stat = _parse_stat(_read_at(pid_fd, "stat"))
             second_status = _parse_status(_read_at(pid_fd, "status"), pid)
-            second_cmdline = _parse_cmdline(_read_at(pid_fd, "cmdline"))
+            second_cmdline = _parse_cmdline(
+                _read_at(pid_fd, "cmdline"), second_stat[0], second_stat[3]
+            )
             second_namespace = _namespace_inode(pid_fd)
             after = os.fstat(pid_fd)
             if (
-                first_stat[1:] != second_stat[1:]
+                first_stat[1:3] != second_stat[1:3]
                 or (first_stat[0] == "Z") != (second_stat[0] == "Z")
                 or first_status != second_status
                 or first_cmdline != second_cmdline
@@ -671,7 +835,7 @@ class ProcReader:
                 or before.st_ino != after.st_ino
             ):
                 raise ControlError("SUPERVISOR_UNAVAILABLE")
-            state, parent_pid, start_time = second_stat
+            state, parent_pid, start_time, _thread_count = second_stat
             uids, namespace_pid = second_status
             return ProcessIdentity(
                 pid=pid,
@@ -707,6 +871,68 @@ class ProcReader:
             return first
         finally:
             os.close(pid_fd)
+
+
+def _recapture_exact_identity(
+    reader: ProcReader,
+    expected: ProcessIdentity,
+    *,
+    deadline: float | None = None,
+) -> ProcessIdentity:
+    """Retry only an internally inconsistent read of one already-pinned process."""
+
+    proof_deadline = (
+        time.monotonic() + PROCESS_PROOF_GRACE_SECONDS
+        if deadline is None
+        else deadline
+    )
+    while True:
+        try:
+            current = reader.capture(expected.pid)
+        except (FileNotFoundError, ProcessLookupError, PermissionError) as exc:
+            # A missing or unreadable pinned process is a conclusive loss of the
+            # proof. Only ProcReader's double-read inconsistency is retryable.
+            raise ControlError("SUPERVISOR_UNAVAILABLE") from exc
+        except ControlError as error:
+            if error.code != "SUPERVISOR_UNAVAILABLE":
+                raise
+            remaining = proof_deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(PROCESS_PROOF_RETRY_SECONDS, remaining))
+            continue
+        if current.stable_key() != expected.stable_key():
+            raise ControlError("SUPERVISOR_UNAVAILABLE")
+        return current
+
+
+def _read_stable_file_with_proof_grace(
+    reader: ProcReader,
+    identity: ProcessIdentity,
+    name: str,
+    limit: int,
+    recovery_deadline: float | None = None,
+) -> bytes:
+    """Retry an inconsistent proc read only while the pinned process is exact."""
+
+    deadline = time.monotonic() + PROCESS_PROOF_GRACE_SECONDS
+    if recovery_deadline is not None:
+        deadline = min(deadline, recovery_deadline)
+    _require_recovery_time(recovery_deadline)
+    while True:
+        try:
+            value = reader.read_stable_file(identity, name, limit)
+        except ControlError as error:
+            if error.code != "SUPERVISOR_UNAVAILABLE":
+                raise
+            _recapture_exact_identity(reader, identity, deadline=deadline)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            time.sleep(min(PROCESS_PROOF_RETRY_SECONDS, remaining))
+            continue
+        _require_recovery_time(recovery_deadline)
+        return value
 
 
 def _basename(value: bytes) -> bytes:
@@ -748,18 +974,20 @@ def _sandbox_uid() -> int:
         raise ControlError("SUPERVISOR_UNAVAILABLE") from exc
 
 
-def _discover_supervisor(reader: ProcReader) -> ProcessIdentity:
-    pid1 = reader.capture(1)
-    if not _is_openshell(pid1):
-        raise ControlError("SUPERVISOR_UNAVAILABLE")
-    sandbox_uid = _sandbox_uid()
+def _supervisor_candidates(
+    reader: ProcReader, pid1: ProcessIdentity, sandbox_uid: int
+) -> tuple[list[ProcessIdentity], bool]:
     matches: list[ProcessIdentity] = []
+    inconclusive = False
     for pid in reader.pids():
         if pid == 1:
             continue
         try:
             identity = reader.capture(pid)
-        except (ControlError, FileNotFoundError, ProcessLookupError, PermissionError):
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (ControlError, PermissionError):
+            inconclusive = True
             continue
         if (
             _is_nemoclaw_start(identity, sandbox_uid)
@@ -771,16 +999,58 @@ def _discover_supervisor(reader: ProcReader) -> ProcessIdentity:
             matches.append(identity)
             if len(matches) > 1:
                 break
+    return matches, inconclusive
+
+
+def _discover_supervisor(reader: ProcReader) -> ProcessIdentity:
+    pid1 = reader.capture(1)
+    if not _is_openshell(pid1):
+        raise ControlError("SUPERVISOR_UNAVAILABLE")
+    sandbox_uid = _sandbox_uid()
+    matches, inconclusive = _supervisor_candidates(reader, pid1, sandbox_uid)
+    if inconclusive:
+        # Busy agents can create or reap an unrelated short-lived process while
+        # /proc is being read. Retry only when one exact supervisor was already
+        # proven, and require that same pinned identity on every scan. A missing,
+        # changing, or duplicate supervisor still fails closed immediately.
+        if len(matches) != 1:
+            raise ControlError("SUPERVISOR_UNAVAILABLE")
+        expected = matches[0].stable_key()
+        deadline = time.monotonic() + PROCESS_PROOF_GRACE_SECONDS
+        while inconclusive:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ControlError("SUPERVISOR_UNAVAILABLE")
+            time.sleep(min(PROCESS_PROOF_RETRY_SECONDS, remaining))
+            _recapture_exact_identity(reader, pid1, deadline=deadline)
+            matches, inconclusive = _supervisor_candidates(reader, pid1, sandbox_uid)
+            if len(matches) != 1 or matches[0].stable_key() != expected:
+                raise ControlError("SUPERVISOR_UNAVAILABLE")
+    if len(matches) == 0:
+        # A zero-match scan is the only absence signal that may authorize the
+        # host to recreate a legacy Docker container with its managed startup
+        # command. Re-scan the complete process table and pin PID 1 around both
+        # observations so ambiguity, process churn, and supervisor startup
+        # races remain generic unavailability rather than destructive-recovery
+        # authorization.
+        between_pid1 = reader.capture(1)
+        second_matches, second_inconclusive = _supervisor_candidates(
+            reader, pid1, sandbox_uid
+        )
+        after_pid1 = reader.capture(1)
+        if (
+            between_pid1.stable_key() == pid1.stable_key()
+            and after_pid1.stable_key() == pid1.stable_key()
+            and not second_inconclusive
+            and len(second_matches) == 0
+        ):
+            raise ControlError("SUPERVISOR_NOT_RUNNING")
+        raise ControlError("SUPERVISOR_UNAVAILABLE")
     if len(matches) != 1:
         raise ControlError("SUPERVISOR_UNAVAILABLE")
-    current_pid1 = reader.capture(1)
-    current_supervisor = reader.capture(matches[0].pid)
-    if (
-        current_pid1.stable_key() != pid1.stable_key()
-        or current_supervisor.stable_key() != matches[0].stable_key()
-    ):
-        raise ControlError("SUPERVISOR_UNAVAILABLE")
-    return current_supervisor
+    deadline = time.monotonic() + PROCESS_PROOF_GRACE_SECONDS
+    _recapture_exact_identity(reader, pid1, deadline=deadline)
+    return _recapture_exact_identity(reader, matches[0], deadline=deadline)
 
 
 def _is_hermes_gateway(identity: ProcessIdentity) -> bool:
@@ -882,11 +1152,31 @@ def _gateway_matches(
     return _is_openclaw_gateway(identity, spec.port)
 
 
+def _recovery_deadline_reached(recovery_deadline: float | None) -> bool:
+    return bool(
+        recovery_deadline is not None
+        and time.monotonic() >= recovery_deadline
+    )
+
+
+def _require_recovery_time(recovery_deadline: float | None) -> None:
+    if _recovery_deadline_reached(recovery_deadline):
+        raise ControlError("GATEWAY_FAILED")
+
+
 def _gateway_candidates(
-    reader: ProcReader, supervisor: ProcessIdentity, spec: AgentSpec
+    reader: ProcReader,
+    supervisor: ProcessIdentity,
+    spec: AgentSpec,
+    recovery_deadline: float | None = None,
 ) -> list[ProcessIdentity]:
+    if _recovery_deadline_reached(recovery_deadline):
+        raise ControlError("GATEWAY_HEALTH_TIMEOUT")
     matches: list[ProcessIdentity] = []
-    for pid in reader.pids():
+    pids = reader.pids()
+    for pid in pids:
+        if _recovery_deadline_reached(recovery_deadline):
+            raise ControlError("GATEWAY_HEALTH_TIMEOUT")
         if pid in (1, supervisor.pid):
             continue
         try:
@@ -897,9 +1187,15 @@ def _gateway_candidates(
             matches.append(identity)
             if len(matches) > 1:
                 break
-    current_supervisor = reader.capture(supervisor.pid)
-    if current_supervisor.stable_key() != supervisor.stable_key():
-        raise ControlError("SUPERVISOR_UNAVAILABLE")
+    if _recovery_deadline_reached(recovery_deadline):
+        raise ControlError("GATEWAY_HEALTH_TIMEOUT")
+    _recapture_exact_identity(
+        reader,
+        supervisor,
+        deadline=recovery_deadline,
+    )
+    if _recovery_deadline_reached(recovery_deadline):
+        raise ControlError("GATEWAY_HEALTH_TIMEOUT")
     if len(matches) > 1:
         raise ControlError("SUPERVISOR_UNAVAILABLE")
     return matches
@@ -982,16 +1278,112 @@ def _owns_listener(
     return False
 
 
-def _http_healthy(port: int, path: str) -> bool:
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+def _http_remaining_time(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
+
+
+class _DeadlineSocket:
+    """Apply one deadline to each socket operation used by HTTPResponse."""
+
+    def __init__(self, transport: socket.socket, deadline: float) -> None:
+        self._transport = transport
+        self._deadline = deadline
+        self._readers = 0
+        self._close_requested = False
+
+    def _set_timeout(self) -> None:
+        self._transport.settimeout(_http_remaining_time(self._deadline))
+
+    def sendall(self, data: bytes) -> None:
+        self._set_timeout()
+        self._transport.sendall(data)
+        _http_remaining_time(self._deadline)
+
+    def recv_into(self, buffer: bytearray | memoryview) -> int:
+        self._set_timeout()
+        received = self._transport.recv_into(buffer)
+        _http_remaining_time(self._deadline)
+        return received
+
+    def makefile(self, mode: str) -> io.BufferedReader:
+        if mode != "rb":
+            raise ValueError("HTTP response reader requires binary mode")
+        self._readers += 1
+        return io.BufferedReader(_DeadlineSocketReader(self))
+
+    def _release_reader(self) -> None:
+        self._readers -= 1
+        if self._close_requested and self._readers == 0:
+            self._transport.close()
+
+    def close(self) -> None:
+        self._close_requested = True
+        if self._readers == 0:
+            self._transport.close()
+
+
+class _DeadlineSocketReader(io.RawIOBase):
+    def __init__(self, owner: _DeadlineSocket) -> None:
+        super().__init__()
+        self._owner = owner
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: bytearray | memoryview) -> int:
+        return self._owner.recv_into(buffer)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        try:
+            super().close()
+        finally:
+            self._owner._release_reader()
+
+
+def _http_healthy(
+    port: int,
+    path: str,
+    recovery_deadline: float | None = None,
+) -> bool:
+    request_deadline = time.monotonic() + 2.0
+    if recovery_deadline is not None:
+        request_deadline = min(request_deadline, recovery_deadline)
     try:
-        connection.request("GET", path)
-        response = connection.getresponse()
-        response.read(4096)
-        return response.status in (200, 401)
+        timeout_seconds = _http_remaining_time(request_deadline)
     except OSError:
         return False
+    connection = http.client.HTTPConnection(
+        "127.0.0.1",
+        port,
+        timeout=timeout_seconds,
+    )
+    response: http.client.HTTPResponse | None = None
+    try:
+        connection.connect()
+        _http_remaining_time(request_deadline)
+        if connection.sock is None:
+            return False
+        connection.sock = _DeadlineSocket(  # type: ignore[assignment]
+            connection.sock,
+            request_deadline,
+        )
+        connection.request("GET", path)
+        _http_remaining_time(request_deadline)
+        response = connection.getresponse()
+        _http_remaining_time(request_deadline)
+        response.read(4096)
+        _http_remaining_time(request_deadline)
+        return response.status in (200, 401)
+    except (OSError, http.client.HTTPException):
+        return False
     finally:
+        if response is not None:
+            response.close()
         connection.close()
 
 
@@ -1000,9 +1392,12 @@ def _http_healthy_in_gateway_namespace(
     identity: ProcessIdentity,
     port: int,
     path: str,
+    recovery_deadline: float | None = None,
 ) -> bool:
     """Probe loopback from the gateway's network namespace, then restore ours."""
 
+    if _recovery_deadline_reached(recovery_deadline):
+        return False
     setns = getattr(os, "setns", None)
     if setns is None:
         raise ControlError("PRIVILEGED_CONTROL_UNAVAILABLE")
@@ -1011,6 +1406,7 @@ def _http_healthy_in_gateway_namespace(
     pid_fd = -1
     target_namespace = -1
     switched = False
+    healthy = False
     try:
         pid_fd = _open_pid(reader.fd, identity.pid)
         pinned = os.fstat(pid_fd)
@@ -1022,9 +1418,11 @@ def _http_healthy_in_gateway_namespace(
         target_namespace = os.open("ns/net", flags, dir_fd=pid_fd)
         if reader.capture(identity.pid).stable_key() != identity.stable_key():
             return False
+        if _recovery_deadline_reached(recovery_deadline):
+            return False
         setns(target_namespace, getattr(os, "CLONE_NEWNET", 0x40000000))
         switched = True
-        return _http_healthy(port, path)
+        healthy = _http_healthy(port, path, recovery_deadline)
     except OSError as exc:
         if exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ESRCH):
             return False
@@ -1040,44 +1438,97 @@ def _http_healthy_in_gateway_namespace(
         if pid_fd >= 0:
             os.close(pid_fd)
         os.close(current_namespace)
+    return bool(
+        healthy
+        and not _recovery_deadline_reached(recovery_deadline)
+    )
 
 
 def _gateway_healthy(
-    reader: ProcReader, identity: ProcessIdentity, spec: AgentSpec
+    reader: ProcReader,
+    identity: ProcessIdentity,
+    spec: AgentSpec,
+    recovery_deadline: float | None = None,
 ) -> bool:
     return bool(
-        _owns_listener(reader, identity, spec.port)
-        and _http_healthy_in_gateway_namespace(
-            reader, identity, spec.port, spec.health_path
-        )
+        not _recovery_deadline_reached(recovery_deadline)
         and _owns_listener(reader, identity, spec.port)
+        and not _recovery_deadline_reached(recovery_deadline)
+        and _http_healthy_in_gateway_namespace(
+            reader,
+            identity,
+            spec.port,
+            spec.health_path,
+            recovery_deadline,
+        )
+        and not _recovery_deadline_reached(recovery_deadline)
+        and _owns_listener(reader, identity, spec.port)
+        and not _recovery_deadline_reached(recovery_deadline)
     )
 
 
 def _gateway_auxiliaries_healthy(
-    reader: ProcReader, identity: ProcessIdentity, spec: AgentSpec
+    reader: ProcReader,
+    identity: ProcessIdentity,
+    spec: AgentSpec,
+    recovery_deadline: float | None = None,
 ) -> bool:
     """Prove the public API relay the host probes before completing control."""
 
     for port, path in spec.readiness_checks:
-        if not _http_healthy_in_gateway_namespace(reader, identity, port, path):
+        if _recovery_deadline_reached(recovery_deadline):
+            return False
+        if not _http_healthy_in_gateway_namespace(
+            reader,
+            identity,
+            port,
+            path,
+            recovery_deadline,
+        ):
             return False
     # The public probes can take several seconds. Re-prove the exact gateway
     # after them so a replacement that exited during auxiliary repair is never
     # reported as the completed child.
-    return _gateway_healthy(reader, identity, spec)
-
-
-def _run_fixed_validator(script: str, arguments: list[str]) -> None:
-    _validate_trusted_regular(script)
-    result = subprocess.run(
-        [sys.executable, "-I", script, *arguments],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=15,
-        check=False,
+    return bool(
+        not _recovery_deadline_reached(recovery_deadline)
+        and _gateway_healthy(
+            reader,
+            identity,
+            spec,
+            recovery_deadline,
+        )
     )
+
+
+def _preflight_timeout(recovery_deadline: float | None) -> float:
+    timeout_seconds = _remaining_recovery_time(recovery_deadline, 15.0)
+    if timeout_seconds <= 0:
+        raise ControlError("GATEWAY_FAILED")
+    return timeout_seconds
+
+
+def _run_fixed_validator(
+    script: str,
+    arguments: list[str],
+    recovery_deadline: float | None = None,
+) -> None:
+    _require_recovery_time(recovery_deadline)
+    _validate_trusted_regular(script)
+    _require_recovery_time(recovery_deadline)
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", script, *arguments],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_preflight_timeout(recovery_deadline),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if recovery_deadline is not None:
+            raise ControlError("GATEWAY_FAILED") from exc
+        raise ControlError("SECRET_BOUNDARY_REFUSED") from exc
+    _require_recovery_time(recovery_deadline)
     if result.returncode != 0:
         raise ControlError("SECRET_BOUNDARY_REFUSED")
 
@@ -1137,6 +1588,29 @@ def _read_regular(path: str, limit: int) -> tuple[bytes, os.stat_result]:
         os.close(fd)
 
 
+def _parse_locked_hermes_hash(strict: bytes) -> dict[str, str]:
+    records: dict[str, str] = {}
+    mcp_state_seen = False
+    try:
+        lines = strict.decode("ascii").splitlines()
+        for line in lines:
+            if line.startswith("#"):
+                if mcp_state_seen or HERMES_MCP_STATE_RE.fullmatch(line) is None:
+                    raise ValueError("invalid Hermes MCP state metadata")
+                mcp_state_seen = True
+                continue
+            if mcp_state_seen:
+                raise ValueError("Hermes MCP state metadata must be terminal")
+            digest, pathname = line.split(maxsplit=1)
+            canonical_path = pathname.strip()
+            if canonical_path in records:
+                raise ValueError("duplicate Hermes config hash path")
+            records[canonical_path] = digest.lower()
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ControlError("GATEWAY_CONFIG_HASH_MISMATCH") from exc
+    return records
+
+
 def _verify_locked_hermes_hash() -> None:
     config_path = _system_path("/sandbox/.hermes/config.yaml")
     env_path = _system_path("/sandbox/.hermes/.env")
@@ -1158,13 +1632,7 @@ def _verify_locked_hermes_hash() -> None:
     strict, strict_stat = _read_regular(hash_path, MAX_HASH_BYTES)
     if strict_stat.st_uid != 0 or stat.S_IMODE(strict_stat.st_mode) & 0o022:
         raise ControlError("GATEWAY_UNSAFE_CONFIG_PATH")
-    try:
-        records = {}
-        for line in strict.decode("ascii").splitlines():
-            digest, pathname = line.split(maxsplit=1)
-            records[pathname.strip()] = digest.lower()
-    except (UnicodeDecodeError, ValueError) as exc:
-        raise ControlError("GATEWAY_CONFIG_HASH_MISMATCH") from exc
+    records = _parse_locked_hermes_hash(strict)
     expected_paths = {
         "/sandbox/.hermes/config.yaml": hashlib.sha256(config).hexdigest(),
         "/sandbox/.hermes/.env": hashlib.sha256(environment).hexdigest(),
@@ -1177,51 +1645,77 @@ def _verify_locked_hermes_hash() -> None:
         raise ControlError("GATEWAY_CONFIG_HASH_MISMATCH")
 
 
-def _hermes_preflight(reader: ProcReader, supervisor: ProcessIdentity) -> None:
+def _hermes_preflight(
+    reader: ProcReader,
+    supervisor: ProcessIdentity,
+    recovery_deadline: float | None = None,
+) -> None:
+    _require_recovery_time(recovery_deadline)
     validator = _system_path(HERMES_BOUNDARY_PATH)
     if not os.path.exists(validator):
         raise ControlError("SECRET_BOUNDARY_VALIDATOR_MISSING")
     _run_fixed_validator(
         validator,
         ["env-file", _system_path("/sandbox/.hermes/.env")],
+        recovery_deadline,
     )
-    raw_environment = reader.read_stable_file(supervisor, "environ", MAX_ENV_BYTES)
+    raw_environment = _read_stable_file_with_proof_grace(
+        reader,
+        supervisor,
+        "environ",
+        MAX_ENV_BYTES,
+        recovery_deadline,
+    )
     _validate_runtime_environment(validator, _parse_environment(raw_environment))
+    _require_recovery_time(recovery_deadline)
     _verify_locked_hermes_hash()
+    _require_recovery_time(recovery_deadline)
 
 
-def _openclaw_preflight() -> None:
+def _openclaw_preflight(recovery_deadline: float | None = None) -> None:
+    _require_recovery_time(recovery_deadline)
     guard = _system_path(OPENCLAW_GUARD_PATH)
     _validate_trusted_regular(guard)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-I",
-            guard,
-            "preflight-restart",
-            "--config-dir",
-            _system_path("/sandbox/.openclaw"),
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=15,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                guard,
+                "preflight-restart",
+                "--config-dir",
+                _system_path("/sandbox/.openclaw"),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_preflight_timeout(recovery_deadline),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if recovery_deadline is not None:
+            raise ControlError("GATEWAY_FAILED") from exc
+        raise ControlError("GATEWAY_UNSAFE_CONFIG_PATH") from exc
+    _require_recovery_time(recovery_deadline)
     if result.returncode != 0:
         raise ControlError("GATEWAY_UNSAFE_CONFIG_PATH")
 
 
 def _preflight(
-    spec: AgentSpec, reader: ProcReader, supervisor: ProcessIdentity
+    spec: AgentSpec,
+    reader: ProcReader,
+    supervisor: ProcessIdentity,
+    recovery_deadline: float | None = None,
 ) -> None:
+    _require_recovery_time(recovery_deadline)
     if spec.name == "hermes":
-        _hermes_preflight(reader, supervisor)
+        _hermes_preflight(reader, supervisor, recovery_deadline)
     else:
-        _openclaw_preflight()
+        _openclaw_preflight(recovery_deadline)
+    _require_recovery_time(recovery_deadline)
 
 
-def _pidfd_open(pid: int) -> int:
+def _pidfd_open(pid: int) -> int | None:
     opener = getattr(os, "pidfd_open", None)
     sender = getattr(signal, "pidfd_send_signal", None)
     if opener is None or sender is None:
@@ -1229,6 +1723,8 @@ def _pidfd_open(pid: int) -> int:
     try:
         return opener(pid, 0)
     except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return None
         raise ControlError("SUPERVISOR_UNAVAILABLE") from exc
 
 
@@ -1238,30 +1734,81 @@ def _pidfd_exited(pidfd: int, timeout_seconds: float) -> bool:
     return bool(poller.poll(max(0, int(timeout_seconds * 1000))))
 
 
-def _send_pidfd(pidfd: int, signum: signal.Signals) -> None:
+def _send_pidfd(pidfd: int, signum: signal.Signals) -> bool:
     sender = getattr(signal, "pidfd_send_signal", None)
     if sender is None:
         raise ControlError("PRIVILEGED_CONTROL_UNAVAILABLE")
     try:
         sender(pidfd, signum, None, 0)
     except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
         raise ControlError("GATEWAY_FAILED") from exc
+    return True
 
 
-def _terminate_gateway(reader: ProcReader, identity: ProcessIdentity) -> None:
+def _remaining_recovery_time(
+    recovery_deadline: float | None,
+    maximum: float,
+) -> float:
+    if recovery_deadline is None:
+        return maximum
+    return min(
+        maximum,
+        max(0.0, recovery_deadline - time.monotonic()),
+    )
+
+
+def _terminate_gateway(
+    reader: ProcReader,
+    identity: ProcessIdentity,
+    recovery_deadline: float | None = None,
+) -> None:
     pidfd = _pidfd_open(identity.pid)
+    if pidfd is None:
+        return
     try:
-        current = reader.capture(identity.pid)
-        if current.stable_key() != identity.stable_key():
-            raise ControlError("SUPERVISOR_UNAVAILABLE")
-        _send_pidfd(pidfd, signal.SIGTERM)
-        if _pidfd_exited(pidfd, STOP_GRACE_SECONDS):
+        _require_recovery_time(recovery_deadline)
+        try:
+            _recapture_exact_identity(
+                reader,
+                identity,
+                deadline=recovery_deadline,
+            )
+        except ControlError:
+            # The pidfd is readable only when the exact process opened above has
+            # exited. Accept that race without ever falling back to a PID signal.
+            if _pidfd_exited(pidfd, 0):
+                return
+            _require_recovery_time(recovery_deadline)
+            raise
+        _require_recovery_time(recovery_deadline)
+        if not _send_pidfd(pidfd, signal.SIGTERM):
             return
-        current = reader.capture(identity.pid)
-        if current.stable_key() != identity.stable_key():
-            raise ControlError("SUPERVISOR_UNAVAILABLE")
-        _send_pidfd(pidfd, signal.SIGKILL)
-        if not _pidfd_exited(pidfd, KILL_GRACE_SECONDS):
+        if _pidfd_exited(
+            pidfd,
+            _remaining_recovery_time(
+                recovery_deadline,
+                STOP_GRACE_SECONDS,
+            ),
+        ):
+            return
+        if _recovery_deadline_reached(recovery_deadline):
+            if _pidfd_exited(pidfd, 0):
+                return
+            raise ControlError("GATEWAY_FAILED")
+        # The pidfd already pins the proven gateway across exit and PID reuse.
+        # Re-reading /proc here races with the normal live-to-zombie transition
+        # and adds no signal-target safety.
+        if not _send_pidfd(pidfd, signal.SIGKILL):
+            return
+        if not _pidfd_exited(
+            pidfd,
+            _remaining_recovery_time(
+                recovery_deadline,
+                KILL_GRACE_SECONDS,
+            ),
+        ):
             raise ControlError("GATEWAY_FAILED")
     finally:
         os.close(pidfd)
@@ -1274,11 +1821,19 @@ def _wait_for_healthy_gateway(
     old_identity: ProcessIdentity | None,
     timeout_seconds: float = RECOVERY_TIMEOUT_SECONDS,
     require_auxiliary_health: bool = False,
+    recovery_deadline: float | None = None,
 ) -> ProcessIdentity:
     deadline = time.monotonic() + timeout_seconds
+    if recovery_deadline is not None:
+        deadline = min(deadline, recovery_deadline)
     while time.monotonic() < deadline:
         try:
-            candidates = _gateway_candidates(reader, supervisor, spec)
+            candidates = _gateway_candidates(
+                reader,
+                supervisor,
+                spec,
+                deadline,
+            )
         except (FileNotFoundError, ProcessLookupError, PermissionError):
             raise ControlError("SUPERVISOR_UNAVAILABLE")
         for candidate in candidates:
@@ -1288,17 +1843,31 @@ def _wait_for_healthy_gateway(
             ) == (old_identity.pid, old_identity.start_time):
                 continue
             try:
-                if _gateway_healthy(reader, candidate, spec) and (
+                if _gateway_healthy(
+                    reader,
+                    candidate,
+                    spec,
+                    deadline,
+                ) and (
                     not require_auxiliary_health
-                    or _gateway_auxiliaries_healthy(reader, candidate, spec)
+                    or _gateway_auxiliaries_healthy(
+                        reader,
+                        candidate,
+                        spec,
+                        deadline,
+                    )
                 ):
-                    return candidate
+                    if time.monotonic() < deadline:
+                        return candidate
             except (FileNotFoundError, ProcessLookupError):
                 continue
             except ControlError as error:
                 if error.code != "SUPERVISOR_UNAVAILABLE":
                     raise
-        time.sleep(POLL_SECONDS)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(POLL_SECONDS, remaining))
     raise ControlError("GATEWAY_HEALTH_TIMEOUT")
 
 
@@ -1307,8 +1876,9 @@ def _wait_for_recovery_candidate(
     supervisor: ProcessIdentity,
     spec: AgentSpec,
     initial_identity: ProcessIdentity,
+    recovery_deadline: float | None = None,
 ) -> tuple[ProcessIdentity | None, ProcessIdentity | None]:
-    """Give the observed candidate, and at most one successor, a full grace."""
+    """Give the observed candidate and at most one successor bounded grace."""
 
     observed = initial_identity
     for _attempt in range(2):
@@ -1318,14 +1888,23 @@ def _wait_for_recovery_candidate(
                 supervisor,
                 spec,
                 None,
-                RECOVER_EXISTING_GRACE_SECONDS,
+                _remaining_recovery_time(
+                    recovery_deadline,
+                    RECOVER_EXISTING_GRACE_SECONDS,
+                ),
+                recovery_deadline=recovery_deadline,
             )
             return healthy, None
         except ControlError as error:
             if error.code != "GATEWAY_HEALTH_TIMEOUT":
                 raise
 
-        candidates = _gateway_candidates(reader, supervisor, spec)
+        candidates = _gateway_candidates(
+            reader,
+            supervisor,
+            spec,
+            recovery_deadline,
+        )
         current = candidates[0] if candidates else None
         if current is None:
             return None, None
@@ -1337,80 +1916,282 @@ def _wait_for_recovery_candidate(
 
 
 def _control(action: str, nonce: str) -> tuple[str, int, int]:
-    agent = _detect_agent()
-    with ProcReader() as reader:
-        supervisor = _discover_supervisor(reader)
-        spec = _agent_spec(agent, reader, supervisor)
-        candidates = _gateway_candidates(reader, supervisor, spec)
-        old_identity = candidates[0] if candidates else None
+    recovery_deadline = (
+        None
+        if action == "probe"
+        else time.monotonic() + RECOVERY_TIMEOUT_SECONDS
+    )
+    expected_exit_lock = None
+    expected_exit_lease = None
+    try:
+        if recovery_deadline is not None:
+            with _control_stage("acquire-expected-exit-lock"):
+                expected_exit_lock = _acquire_expected_exit_lock(
+                    recovery_deadline
+                )
 
-        _preflight(spec, reader, supervisor)
-
-        if action == "probe":
-            if old_identity is None:
-                raise ControlError("GATEWAY_HEALTH_TIMEOUT")
-            if not _gateway_healthy(reader, old_identity, spec):
-                raise ControlError("GATEWAY_HEALTH_TIMEOUT")
-            if not _gateway_auxiliaries_healthy(reader, old_identity, spec):
-                raise ControlError("GATEWAY_HEALTH_TIMEOUT")
-            healthy = reader.capture(old_identity.pid)
-            if healthy.stable_key() != old_identity.stable_key():
-                raise ControlError("GATEWAY_HEALTH_TIMEOUT")
-            return "already-running", old_identity.pid, healthy.pid
-
-        if action == "recover" and old_identity is not None:
-            # PID 1 continuously supervises the managed gateway. A host
-            # recovery request can arrive after PID 1 has launched a
-            # replacement but before its listener is healthy. Give that proven
-            # child a short grace period. If its identity changes during that
-            # grace, give the one successor its own bounded grace before any
-            # signal so recovery cannot churn a newly launched replacement.
-            original_identity = old_identity
-            existing, old_identity = _wait_for_recovery_candidate(
-                reader,
-                supervisor,
-                spec,
-                original_identity,
-            )
-            if existing is not None:
-                completed = _wait_for_healthy_gateway(
+        with _control_stage("detect-agent"):
+            agent = _detect_agent()
+        with ProcReader() as reader:
+            with _control_stage("discover-supervisor"):
+                supervisor = _discover_supervisor(reader)
+            with _control_stage("initial-gateway-proof"):
+                spec = _agent_spec(agent, reader, supervisor)
+                candidates = _gateway_candidates(
                     reader,
                     supervisor,
                     spec,
-                    None,
-                    RECOVERY_TIMEOUT_SECONDS,
-                    True,
+                    recovery_deadline,
                 )
-                return "already-running", original_identity.pid, completed.pid
+                old_identity = candidates[0] if candidates else None
 
-        expected_exit_lease = None
-        try:
-            if old_identity is not None and spec.name == "hermes":
-                # The nonroot entrypoint owns the child and its crash budget.
-                # Publish an exact root-owned authorization before the pidfd
-                # signal. The marker names this live root controller so a
-                # delayed reap remains authorized without trusting wall time,
-                # while an orphaned marker fails closed as an ordinary crash.
-                controller_identity = _controller_process_identity(reader)
-                expected_exit_lease = _publish_expected_exit_lease(
+            with _control_stage("preflight"):
+                _preflight(
+                    spec,
+                    reader,
+                    supervisor,
+                    recovery_deadline,
+                )
+
+            if action == "probe":
+                if old_identity is None:
+                    raise ControlError("GATEWAY_HEALTH_TIMEOUT")
+                if not _gateway_healthy(reader, old_identity, spec):
+                    raise ControlError("GATEWAY_HEALTH_TIMEOUT")
+                if not _gateway_auxiliaries_healthy(
+                    reader,
                     old_identity,
-                    controller_identity,
-                )
-            if old_identity is not None:
-                _terminate_gateway(reader, old_identity)
+                    spec,
+                ):
+                    raise ControlError("GATEWAY_HEALTH_TIMEOUT")
+                healthy = reader.capture(old_identity.pid)
+                if healthy.stable_key() != old_identity.stable_key():
+                    raise ControlError("GATEWAY_HEALTH_TIMEOUT")
+                return "already-running", old_identity.pid, healthy.pid
 
-            replacement = _wait_for_healthy_gateway(
-                reader,
-                supervisor,
-                spec,
-                old_identity,
-                RECOVERY_TIMEOUT_SECONDS,
-                True,
-            )
+            assert recovery_deadline is not None
+            assert expected_exit_lock is not None
+            if action == "recover" and old_identity is not None:
+                # PID 1 continuously supervises the managed gateway. A host
+                # recovery request can arrive after PID 1 has launched a
+                # replacement but before its listener is healthy. Give that
+                # proven child a short grace period. If its identity changes
+                # during that grace, give the one successor its own bounded
+                # grace before any signal so recovery cannot churn a newly
+                # launched replacement.
+                original_identity = old_identity
+                with _control_stage("await-existing-gateway"):
+                    existing, old_identity = _wait_for_recovery_candidate(
+                        reader,
+                        supervisor,
+                        spec,
+                        original_identity,
+                        recovery_deadline,
+                    )
+                if existing is not None:
+                    with _control_stage("await-existing-gateway"):
+                        completed = _wait_for_healthy_gateway(
+                            reader,
+                            supervisor,
+                            spec,
+                            None,
+                            _remaining_recovery_time(
+                                recovery_deadline,
+                                RECOVERY_TIMEOUT_SECONDS,
+                            ),
+                            True,
+                            recovery_deadline=recovery_deadline,
+                        )
+                    return (
+                        "already-running",
+                        original_identity.pid,
+                        completed.pid,
+                    )
+
+            if old_identity is not None:
+                # The nonroot entrypoint owns the child and its crash budget,
+                # and SIGTERM is indistinguishable from a self-requested
+                # shutdown once the child has exited: openclaw exits 0 on
+                # SIGTERM, which nemoclaw-start reads as an intentional stop
+                # and therefore does not respawn. Publish an exact root-owned
+                # authorization before the pidfd signal so the entrypoint
+                # relaunches the gateway this controller is about to wait for.
+                # The marker names this live root controller so a delayed reap
+                # remains authorized without trusting wall time, while an
+                # orphaned marker fails closed as an ordinary crash.
+                with _control_stage("publish-expected-exit"):
+                    controller_identity = _controller_process_identity(reader)
+                    expected_exit_lease = _publish_expected_exit_lease(
+                        expected_exit_lock,
+                        old_identity,
+                        controller_identity,
+                        recovery_deadline,
+                    )
+                    expected_exit_lock = None
+            if old_identity is not None:
+                with _control_stage("terminate-gateway"):
+                    _terminate_gateway(
+                        reader,
+                        old_identity,
+                        recovery_deadline,
+                    )
+
+            with _control_stage("await-replacement"):
+                replacement = _wait_for_healthy_gateway(
+                    reader,
+                    supervisor,
+                    spec,
+                    old_identity,
+                    _remaining_recovery_time(
+                        recovery_deadline,
+                        RECOVERY_TIMEOUT_SECONDS,
+                    ),
+                    True,
+                    recovery_deadline=recovery_deadline,
+                )
             return "ok", old_identity.pid if old_identity else 0, replacement.pid
-        finally:
-            if expected_exit_lease is not None:
+    finally:
+        if expected_exit_lease is not None:
+            with _control_stage("cleanup-expected-exit"):
                 _clear_expected_exit_lease(expected_exit_lease)
+        elif expected_exit_lock is not None:
+            _close_expected_exit_lock(expected_exit_lock)
+
+
+def _sanitize_start_log_diagnostic_line(line: str) -> str | None:
+    # Do not normalize attacker-controlled text into an accepted event. The
+    # exact supervisor UID is shared with the sandbox agent in managed
+    # OpenShell, so these lines remain non-authoritative operator evidence.
+    if (
+        len(line) > MAX_START_LOG_DIAGNOSTIC_LINE_CHARS
+        or ANSI_ESCAPE_RE.search(line)
+        or CONTROL_CHAR_RE.search(line)
+    ):
+        return None
+    if not any(
+        pattern.fullmatch(line) for pattern in START_LOG_DIAGNOSTIC_PATTERNS
+    ):
+        return None
+    return line
+
+
+def _start_log_metadata_is_allowed(
+    metadata: os.stat_result, supervisor_uid: int
+) -> bool:
+    return bool(
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == supervisor_uid
+        and metadata.st_nlink == 1
+        and stat.S_IMODE(metadata.st_mode) == 0o600
+    )
+
+
+def _start_log_metadata_snapshot(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_start_log_diagnostic_excerpt(
+    reader: ProcReader, supervisor: ProcessIdentity
+) -> tuple[str, ...]:
+    """Read a stable bounded tail owned by the exact managed supervisor UID."""
+
+    path = _system_path(START_LOG_PATH)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = -1
+    try:
+        _recapture_exact_identity(reader, supervisor)
+        if len(set(supervisor.uids)) != 1:
+            return ()
+        supervisor_uid = supervisor.uids[0]
+        fd = os.open(path, flags)
+        before = os.fstat(fd)
+        if not _start_log_metadata_is_allowed(before, supervisor_uid):
+            return ()
+        offset = max(0, before.st_size - MAX_START_LOG_DIAGNOSTIC_BYTES)
+        os.lseek(fd, offset, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = before.st_size - offset
+        while remaining > 0:
+            chunk = os.read(fd, min(4096, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(fd)
+        _recapture_exact_identity(reader, supervisor)
+        if _start_log_metadata_snapshot(before) != _start_log_metadata_snapshot(
+            after
+        ):
+            return ()
+    except (ControlError, OSError, PermissionError, ProcessLookupError):
+        return ()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    raw = b"".join(chunks)
+    if offset > 0:
+        _, separator, raw = raw.partition(b"\n")
+        if not separator:
+            return ()
+    lines = (
+        _sanitize_start_log_diagnostic_line(line)
+        for line in raw.decode("utf-8", errors="replace").splitlines()
+    )
+    return tuple(line for line in lines if line)[-MAX_START_LOG_DIAGNOSTIC_LINES:]
+
+
+def _managed_failure_diagnostics() -> tuple[str, ...]:
+    """Return bounded, non-authoritative evidence for an operator."""
+
+    supervisor_pid = "unavailable"
+    gateway_pid = "unavailable"
+    start_log_excerpt: tuple[str, ...] = ()
+    try:
+        agent = _detect_agent()
+        with ProcReader() as reader:
+            supervisor = _discover_supervisor(reader)
+            supervisor_pid = str(supervisor.pid)
+            spec = _agent_spec(agent, reader, supervisor)
+            candidates = _gateway_candidates(reader, supervisor, spec)
+            if candidates:
+                current_gateway = _recapture_exact_identity(reader, candidates[0])
+                gateway_pid = str(current_gateway.pid)
+            else:
+                gateway_pid = "0"
+            if agent == "hermes":
+                start_log_excerpt = _read_start_log_diagnostic_excerpt(
+                    reader, supervisor
+                )
+    except (ControlError, OSError, PermissionError, ProcessLookupError):
+        # Diagnostics are best effort; keep fail-closed defaults when process
+        # state cannot be re-proven.
+        pass
+
+    diagnostics = [
+        f"NEMOCLAW_SUPERVISOR_PID={supervisor_pid}",
+        f"NEMOCLAW_GATEWAY_PID={gateway_pid}",
+    ]
+    diagnostics.extend(
+        f"NEMOCLAW_START_LOG={line}"
+        for line in start_log_excerpt
+    )
+    return tuple(diagnostics)
 
 
 def _validate_request(argv: list[str]) -> tuple[str, str]:
@@ -1435,6 +2216,15 @@ def main(argv: list[str]) -> int:
         return 0
     except ControlError as error:
         print(error.code, file=sys.stderr)
+        if error.stage is not None:
+            print(f"NEMOCLAW_CONTROL_STAGE={error.stage}", file=sys.stderr)
+            if error.code in ("GATEWAY_HEALTH_TIMEOUT", "SUPERVISOR_UNAVAILABLE"):
+                try:
+                    diagnostics = _managed_failure_diagnostics()
+                except Exception:  # diagnostics must not hide the original failure
+                    diagnostics = ()
+                for diagnostic in diagnostics:
+                    print(diagnostic, file=sys.stderr)
         return 1
     except (OSError, subprocess.SubprocessError):
         print("GATEWAY_FAILED", file=sys.stderr)

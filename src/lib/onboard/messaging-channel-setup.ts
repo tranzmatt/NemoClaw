@@ -18,7 +18,9 @@ import {
   type SandboxMessagingPlan,
   toMessagingAgentId,
 } from "../messaging";
+import type { GooglechatTunnelRuntimeDeps } from "../messaging/channels/googlechat/hooks/tunnel-runtime";
 import * as registry from "../state/registry";
+import type { RegistryMessagingAuthority } from "../messaging/plan-authority";
 
 export { MessagingHostStateApplier };
 
@@ -38,6 +40,9 @@ export interface SetupSelectedMessagingChannelsOptions {
   readonly agent?: { readonly name?: string } | null;
   readonly sandboxName?: string | null;
   readonly interactive?: boolean;
+  readonly googlechatTunnelRuntime?: Omit<GooglechatTunnelRuntimeDeps, "sandboxName">;
+  /** Reuse already-answered config fields while reacquiring process-only credentials. */
+  readonly configurationCompleted?: boolean;
 }
 
 export interface SetupMessagingChannelsDeps {
@@ -45,6 +50,36 @@ export interface SetupMessagingChannelsDeps {
   readonly note?: (message: string) => void;
   readonly isNonInteractive?: () => boolean;
   readonly sandboxName?: string | null;
+  readonly googlechatTunnelRuntime?: Omit<GooglechatTunnelRuntimeDeps, "sandboxName">;
+  /** The channel selection is durable; do not reopen the selector on resume. */
+  readonly selectionCompleted?: boolean;
+}
+
+export interface CreateSetupMessagingChannelsDeps {
+  readonly step: NonNullable<SetupMessagingChannelsDeps["step"]>;
+  readonly note: NonNullable<SetupMessagingChannelsDeps["note"]>;
+  readonly isNonInteractive: NonNullable<SetupMessagingChannelsDeps["isNonInteractive"]>;
+  readonly prompt: NonNullable<GooglechatTunnelRuntimeDeps["prompt"]>;
+  readonly googlechatTunnelRuntime?: Omit<GooglechatTunnelRuntimeDeps, "prompt" | "sandboxName">;
+}
+
+export function createSetupMessagingChannels(deps: CreateSetupMessagingChannelsDeps) {
+  return (
+    agent: AgentDefinition | null = null,
+    existingChannels: string[] | null = null,
+    sandboxName: string | null = null,
+    options: { readonly selectionCompleted?: boolean } = {},
+  ): Promise<string[]> =>
+    setupMessagingChannels(agent, existingChannels, {
+      step: deps.step,
+      note: deps.note,
+      isNonInteractive: deps.isNonInteractive,
+      sandboxName,
+      selectionCompleted: options.selectionCompleted,
+      googlechatTunnelRuntime: deps.googlechatTunnelRuntime
+        ? { ...deps.googlechatTunnelRuntime, prompt: deps.prompt }
+        : undefined,
+    });
 }
 
 const getMessagingToken = (envKey: string): string | null =>
@@ -87,6 +122,10 @@ export async function setupMessagingChannels(
   deps: SetupMessagingChannelsDeps = {},
 ): Promise<string[]> {
   deps.step?.(5, 8, "Messaging channels");
+  const note = deps.note ?? console.log;
+  const isNonInteractive =
+    deps.isNonInteractive ?? (() => process.env.NEMOCLAW_NON_INTERACTIVE === "1");
+  const nonInteractive = isNonInteractive() || process.env.NEMOCLAW_NON_INTERACTIVE === "1";
 
   const invalidConfigEnvValues = detectInvalidMessagingChannelConfigEnvValues();
   for (const { key, rawValue, validValues } of invalidConfigEnvValues) {
@@ -98,9 +137,16 @@ export async function setupMessagingChannels(
   }
   if (invalidConfigEnvValues.length > 0) process.exit(1);
 
-  const note = deps.note ?? console.log;
-  const isNonInteractive =
-    deps.isNonInteractive ?? (() => process.env.NEMOCLAW_NON_INTERACTIVE === "1");
+  if (deps.selectionCompleted) {
+    if (nonInteractive) {
+      const message =
+        "A completed messaging selection is missing required credentials. Export the missing messaging credential environment variables, then run nemoclaw onboard --resume again.";
+      note(`  [resume] ${message}`);
+      throw new Error(message);
+    }
+    note("  [resume] Reusing messaging channel selection; requesting missing credentials only.");
+  }
+
   const manifestRegistry = createBuiltInChannelManifestRegistry();
   const availabilityContext = getMessagingManifestAvailabilityContext(
     agent,
@@ -114,7 +160,7 @@ export async function setupMessagingChannels(
       includeAllExisting,
     });
 
-  if (isNonInteractive() || process.env.NEMOCLAW_NON_INTERACTIVE === "1") {
+  if (nonInteractive) {
     const enabled = new Set(seedFromState(false));
     const found = Array.from(enabled);
     if (found.length > 0) {
@@ -123,6 +169,7 @@ export async function setupMessagingChannels(
         agent,
         interactive: false,
         sandboxName: deps.sandboxName,
+        googlechatTunnelRuntime: deps.googlechatTunnelRuntime,
       });
     } else {
       MessagingSetupApplier.clearPlanEnv();
@@ -131,13 +178,19 @@ export async function setupMessagingChannels(
     return Array.from(enabled);
   }
 
-  const enabled = new Set(seedFromState(true));
+  const enabled = new Set(
+    deps.selectionCompleted
+      ? (existingChannels ?? []).filter((channelId) =>
+          availableChannels.some((manifest) => manifest.id === channelId),
+        )
+      : seedFromState(true),
+  );
   const input = process.stdin as MessagingSelectorInput;
   const output = process.stderr as MessagingSelectorOutput;
   const statusForChannel = (manifest: ChannelManifest): string =>
     hasManifestConfiguredInputs(manifest) ? " (configured)" : "";
 
-  if (availableChannels.length > 0) {
+  if (!deps.selectionCompleted && availableChannels.length > 0) {
     if (!input.isTTY || !output.isTTY || typeof input.setRawMode !== "function") {
       await promptMessagingChannelLineSelection(availableChannels, enabled, statusForChannel);
     } else {
@@ -169,10 +222,45 @@ export async function setupMessagingChannels(
   await setupSelectedMessagingChannels(selected, enabled, availableChannels, {
     agent,
     sandboxName: deps.sandboxName,
+    configurationCompleted: deps.selectionCompleted,
+    googlechatTunnelRuntime: deps.googlechatTunnelRuntime,
   });
   console.log("");
 
   return Array.from(enabled);
+}
+
+function completedConfigurationEnv(
+  sandboxName: string,
+  agent: ReturnType<typeof toMessagingAgentId>,
+  selectedChannels: readonly string[],
+): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  const persistedPlan = MessagingSetupApplier.readPlanFromEnv();
+  if (
+    !persistedPlan ||
+    persistedPlan.sandboxName !== sandboxName ||
+    persistedPlan.agent !== agent
+  ) {
+    return env;
+  }
+
+  const selected = new Set(selectedChannels);
+  for (const channel of persistedPlan.channels) {
+    if (!selected.has(channel.channelId)) continue;
+    for (const input of channel.inputs) {
+      if (
+        input.kind !== "config" ||
+        !input.sourceEnv ||
+        typeof input.value !== "string" ||
+        resolveMessagingChannelConfigEnvValue(input.sourceEnv, process.env).value
+      ) {
+        continue;
+      }
+      env[input.sourceEnv] = input.value;
+    }
+  }
+  return env;
 }
 
 /**
@@ -199,9 +287,27 @@ export async function setupSelectedMessagingChannels(
 
   const agent = toMessagingAgentId(options.agent, registry.list());
   const sandboxName = resolveMessagingSetupSandboxName(options);
+  const googlechatHooks = {
+    tunnelRuntime: { ...options.googlechatTunnelRuntime, sandboxName },
+  };
+  const hooks = options.configurationCompleted
+    ? createBuiltInMessagingHookRegistry({
+        common: {
+          // Completed optional/default config prompts are represented by their
+          // persisted values or absence. Seed only non-secret values into an
+          // isolated hook environment so reacquiring a raw token neither asks
+          // those questions again nor resets a prior answer to its default.
+          configPrompt: {
+            env: completedConfigurationEnv(sandboxName, agent, selectedChannels),
+            prompt: async () => "",
+          },
+        },
+        googlechat: googlechatHooks,
+      })
+    : createBuiltInMessagingHookRegistry({ googlechat: googlechatHooks });
   const planner = new MessagingWorkflowPlanner(
     registry,
-    createBuiltInMessagingHookRegistry(),
+    hooks,
     createBuiltInRenderTemplateResolver(),
   );
 
@@ -312,8 +418,17 @@ export function clearPlanEnv(): void {
   MessagingSetupApplier.clearPlanEnv();
 }
 
-export function getRegistrySandboxMessagingPlan(sandboxName: string): SandboxMessagingPlan | null {
-  return registry.getHydratedMessagingPlanFromEntry(registry.getSandbox(sandboxName));
+export function getRegistrySandboxMessagingAuthority(
+  sandboxName: string,
+): RegistryMessagingAuthority {
+  const entry = registry.getSandbox(sandboxName);
+  if (!entry || entry.pendingRouteReservation === true) {
+    return { authoritative: false, plan: null };
+  }
+  return {
+    authoritative: true,
+    plan: registry.getHydratedMessagingPlanFromEntry(entry),
+  };
 }
 
 function resolveMessagingSetupSandboxName(options: SetupSelectedMessagingChannelsOptions): string {

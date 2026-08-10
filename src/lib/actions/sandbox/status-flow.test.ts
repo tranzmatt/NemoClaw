@@ -24,6 +24,99 @@ describe("showSandboxStatus flow", () => {
     resetStatusFlowModuleCache();
   });
 
+  it("warns when the live gateway route differs from the sandbox's recorded route (#6315)", async () => {
+    const harness = createStatusFlowHarness({
+      currentProvider: "nvidia",
+      currentModel: "nvidia/nemotron",
+      routeDrift: {
+        live: { provider: "openai", model: "gpt-5.2" },
+        recorded: { provider: "nvidia", model: "nvidia/nemotron" },
+        canConnect: true,
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain(
+      "Warning: gateway inference route (openai/gpt-5.2) differs from the recorded route for this sandbox (nvidia/nvidia/nemotron).",
+    );
+    expect(output).toContain(
+      "nemoclaw 'alpha' connect realigns the gateway to nvidia/nvidia/nemotron",
+    );
+    expect(output).toContain(
+      "inference set --provider 'openai' --model 'gpt-5.2' --sandbox 'alpha'",
+    );
+    expect(output).toContain("Model:    nvidia/nemotron");
+    expect(output).toContain("Provider: nvidia");
+  });
+
+  it("shell-quotes hostile route values in drift recovery commands (#6315)", async () => {
+    const sandboxName = "alpha's box";
+    const harness = createStatusFlowHarness({
+      currentProvider: "openai; touch /tmp/pwn",
+      currentModel: "$(id) model",
+      routeDrift: {
+        live: { provider: "openai; touch /tmp/pwn", model: "$(id) model" },
+        recorded: { provider: "nvidia", model: "nvidia/nemotron" },
+        canConnect: true,
+      },
+      sandboxEntry: { name: sandboxName },
+    });
+
+    await expect(harness.showSandboxStatus(sandboxName)).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("nemoclaw 'alpha'\\''s box' connect realigns the gateway");
+    expect(output).toContain(
+      "nemoclaw inference set --provider 'openai; touch /tmp/pwn' --model '$(id) model' --sandbox 'alpha'\\''s box'",
+    );
+  });
+
+  it("does not recommend connect when provider-global identity makes it fail (#6315)", async () => {
+    const harness = createStatusFlowHarness({
+      routeDrift: {
+        live: { provider: "compatible-endpoint", model: "live/model" },
+        recorded: { provider: "compatible-endpoint", model: "recorded/model" },
+        canConnect: false,
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("cannot be restored with nemoclaw connect");
+    expect(output).not.toContain("connect realigns the gateway");
+  });
+
+  it("prints no route drift warning when the live route matches the recorded route (#6315)", async () => {
+    const harness = createStatusFlowHarness();
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).not.toContain("differs from the recorded route");
+  });
+
+  it.each([
+    ["high", "high"],
+    [null, "endpoint-default"],
+  ] as const)("reports the effective compatible-endpoint reasoning effort (%s) (#7659)", async (stored, expected) => {
+    const harness = createStatusFlowHarness({
+      currentProvider: "compatible-endpoint",
+      sandboxEntry: {
+        provider: "compatible-endpoint",
+        preferredInferenceApi: "openai-completions",
+        compatibleEndpointReasoningEffort: stored,
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain(`Reasoning effort: ${expected}`);
+  });
+
   it("prints the live sandbox, inference, runtime, session, version, and recovery signals", async () => {
     const harness = createStatusFlowHarness();
 
@@ -32,14 +125,15 @@ describe("showSandboxStatus flow", () => {
     const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
     expect(output).toContain("Sandbox-scoped status for 'alpha'");
     expect(output).toContain("Sandbox: alpha");
-    expect(output).toContain("Model:    nvidia/nemotron-live");
-    expect(output).toContain("Inference: healthy");
-    expect(output).toContain("Inference (gateway):");
+    expect(output).toContain("Model:    nvidia/nemotron");
+    expect(output).toContain("Inference: reachable");
+    expect(output).toContain("Inference (ollama backend):");
+    expect(output).toContain("Serving process (openclaw gateway):");
+    expect(output).toContain("not checked");
     expect(output).toContain("Host GPU: yes");
     expect(output).toContain("last CUDA proof failed: cuInit");
     expect(output).toContain("CUDA initialization failed");
-    expect(output).toContain("Connected:");
-    expect(output).toContain("2 sessions");
+    expect(output).toContain("SSH sessions: 2");
     expect(output).toContain("Permissions: mutable default");
     expect(output).toContain("Update:");
     expect(output).toContain("Recovered NemoClaw gateway runtime via gateway reattach.");
@@ -54,11 +148,224 @@ describe("showSandboxStatus flow", () => {
     expect(exitSpy).not.toHaveBeenCalled();
   });
 
+  it("reports zero SSH sessions as 'none' without connection-negative language (#7805)", async () => {
+    const harness = createStatusFlowHarness();
+    harness.getActiveSandboxSessionsSpy.mockReturnValue({ detected: true, sessions: [] });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("SSH sessions: none");
+    expect(output).not.toMatch(/^\s*Connected:/m);
+  });
+
+  it("omits SSH sessions when the active-session probe is unavailable (#7805)", async () => {
+    const harness = createStatusFlowHarness();
+    harness.getActiveSandboxSessionsSpy.mockReturnValue({ detected: false, sessions: [] });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).not.toMatch(/^\s*(?:Connected|SSH sessions):/m);
+  });
+
+  it("reports active baseline exclusions and their support impact (#7178)", async () => {
+    const harness = createStatusFlowHarness({
+      sandboxEntry: {
+        baselineExclusions: [
+          { version: 1, agent: "openclaw", key: "nous_research", digest: "digest" },
+        ],
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Baseline exclusions: nous_research");
+    expect(output).toContain("Support impact:");
+    expect(output).toContain("unsupported");
+    expect(output).toContain("policy restore <key>");
+  });
+
+  it("warns when a recorded exclusion is still present in the live policy (#7178)", async () => {
+    const harness = createStatusFlowHarness({
+      baselineExclusionStatus: "live-policy-mismatch",
+      sandboxEntry: {
+        baselineExclusions: [{ version: 1, agent: "openclaw", key: "pypi", digest: "digest" }],
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("pypi: excluded key is present in live policy");
+  });
+
+  it("reports interrupted baseline policy repair and the exact reconciliation command (#7178)", async () => {
+    const harness = createStatusFlowHarness({
+      sandboxEntry: {
+        baselineExclusionTransition: {
+          id: "tx-1",
+          operation: "restore",
+          exclusion: {
+            version: 1,
+            agent: "openclaw",
+            key: "nous_research",
+            digest: "digest",
+          },
+          targetLiveDigest: "current-digest",
+          startedAt: "2026-07-19T00:00:00.000Z",
+        },
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Baseline policy repair required: interrupted restore");
+    expect(output).toContain("rebuild blocked");
+    expect(output).toContain("nemoclaw alpha policy restore nous_research");
+  });
+
+  it("omits serving-process status when the gateway is unavailable (#7003)", async () => {
+    const harness = createStatusFlowHarness({
+      lookupState: "missing",
+      servingProcessHealth: null,
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).rejects.toThrow("process.exit(1)");
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).not.toContain("Serving process");
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it.each([
+    { label: "unreachable" as const, detail: "inference.local is unreachable" },
+    { label: "unhealthy" as const, detail: "inference.local returned HTTP 503" },
+  ])("reports an $label inference.local route and exits nonzero (#6192)", async (testCase) => {
+    const harness = createStatusFlowHarness({
+      inferenceHealth: {
+        ok: false,
+        probed: true,
+        providerLabel: "Inference route",
+        endpoint: "https://inference.local/v1/models",
+        detail: testCase.detail,
+        failureLabel: testCase.label,
+        subprobes: [
+          {
+            ok: true,
+            probed: true,
+            providerLabel: "NVIDIA Endpoints",
+            endpoint: "https://integrate.api.nvidia.com/v1/models",
+            detail: "upstream reachable",
+            probeLabel: "upstream",
+          },
+        ],
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).not.toContain("Inference: healthy");
+    expect(output).toContain("Inference: ");
+    expect(output).toContain(testCase.label);
+    expect(output).toContain("Inference (upstream):");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("reports an unavailable inference.local probe and exits nonzero (#6192)", async () => {
+    const harness = createStatusFlowHarness({
+      inferenceHealth: {
+        ok: false,
+        probed: false,
+        providerLabel: "Inference route",
+        endpoint: "https://inference.local/v1/models",
+        detail: "Could not probe the route from inside the sandbox.",
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Inference: ");
+    expect(output).toContain("not probed");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("keeps a failed upstream diagnostic non-authoritative in text status (#6192)", async () => {
+    const harness = createStatusFlowHarness({
+      inferenceHealth: {
+        ok: true,
+        probed: true,
+        providerLabel: "Inference route",
+        endpoint: "https://inference.local/v1/models",
+        detail: "route reachable",
+        subprobes: [
+          {
+            ok: false,
+            probed: true,
+            providerLabel: "NVIDIA Endpoints",
+            endpoint: "https://integrate.api.nvidia.com/v1/models",
+            detail: "host-side upstream probe failed",
+            failureLabel: "unreachable",
+            probeLabel: "upstream",
+          },
+        ],
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Inference: healthy");
+    expect(output).toContain("Inference (upstream):");
+    expect(output).toContain("unreachable");
+    expect(process.exitCode).toBeUndefined();
+  });
+
+  it("distinguishes route reachability from model-invocation health in the rendered labels (#6846)", async () => {
+    const harness = createStatusFlowHarness({
+      inferenceHealth: {
+        ok: true,
+        probed: true,
+        providerLabel: "Inference route",
+        endpoint: "https://inference.local/v1/models",
+        detail: "route reachable",
+        okLabel: "reachable",
+        subprobes: [
+          {
+            ok: true,
+            probed: true,
+            providerLabel: "NVIDIA Endpoints",
+            endpoint: "https://integrate.api.nvidia.com/v1/chat/completions",
+            detail: "model invocation probe succeeded",
+            probeLabel: "upstream",
+          },
+        ],
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    // The route probe only proves network-path reachability (#6192); the
+    // upstream subprobe is what proves the configured model is invocable
+    // (#6846). Rendering the same word for both would re-introduce the
+    // false-positive this PR fixes.
+    expect(output).toContain("Inference: reachable");
+    expect(output).not.toContain("Inference: healthy");
+    expect(output).toContain("Inference (upstream): healthy");
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("probes terminal runtime agent version when cached metadata is missing", async () => {
     const harness = createStatusFlowHarness({
       sandboxEntry: {
         agent: "langchain-deepagents-code",
         agentVersion: null,
+        dcodeAutoApprovalMode: "thread-opt-in",
       },
     });
 
@@ -66,6 +373,7 @@ describe("showSandboxStatus flow", () => {
 
     const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
     expect(output).toContain("Harness:  LangChain Deep Agents Code (terminal)");
+    expect(output).toContain("DCode auto-approval capability: thread-opt-in");
     expect(output).toContain("Agent:    LangChain Deep Agents Code v0.1.0");
     expect(output).toContain("Update:");
     expect(output).toContain("Run `nemoclaw alpha rebuild` to upgrade");
@@ -202,8 +510,106 @@ describe("showSandboxStatus flow", () => {
     expect(output).toContain("Retry `openshell gateway start --name nemoclaw`");
     expect(output).toContain("If the gateway never becomes healthy");
     expect(harness.collectSandboxStatusSnapshotSpy).toHaveBeenCalledWith("alpha", {
-      suppressInferenceProbe: true,
+      preflight: {
+        failure: null,
+        failureLayer: "docker_unreachable",
+        suppressInferenceProbe: true,
+        exitCode: 1,
+      },
     });
+  });
+
+  it("renders the refreshed preflight after Docker recovery", async () => {
+    const preflight = {
+      failure: {
+        layer: "sandbox_container_stopped" as const,
+        dockerUnreachable: false,
+      },
+      failureLayer: "sandbox_container_stopped" as const,
+      suppressInferenceProbe: true,
+      exitCode: 1 as const,
+    };
+    const harness = createStatusFlowHarness({
+      preflight,
+      postRecoveryPreflight: {
+        failure: null,
+        failureLayer: null,
+        suppressInferenceProbe: false,
+        exitCode: 0,
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).not.toContain("Failure layer: sandbox_container_stopped");
+    expect(process.exitCode).toBeUndefined();
+    expect(harness.collectSandboxStatusSnapshotSpy).toHaveBeenCalledWith("alpha", {
+      preflight,
+    });
+  });
+
+  it("does not erase a dashboard-port conflict during Docker recovery", async () => {
+    const conflict = {
+      failure: {
+        layer: "sandbox_dashboard_port_conflict" as const,
+        dockerUnreachable: false,
+      },
+      failureLayer: "sandbox_dashboard_port_conflict" as const,
+      suppressInferenceProbe: true,
+      exitCode: 1 as const,
+    };
+    const harness = createStatusFlowHarness({
+      preflight: conflict,
+      postRecoveryPreflight: conflict,
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Failure layer: sandbox_dashboard_port_conflict");
+    expect(process.exitCode).toBe(1);
+  });
+
+  it("renders an agent delivery recovery failure as actionable and nonzero", async () => {
+    const harness = createStatusFlowHarness({
+      inferenceHealth: null,
+      lookup: {
+        state: "sandbox_recovery_failed",
+        output:
+          "  Sandbox 'alpha' is present, but its agent delivery chain could not be proven " +
+          "(forward-recovery: OpenShell forward state unavailable).",
+        recoveredSandbox: true,
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).rejects.toThrow("process.exit(1)");
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("restored from Docker");
+    expect(output).toContain("agent delivery chain could not be proven");
+    expect(output).toContain("forward-recovery: OpenShell forward state unavailable");
+    expect(output).toContain("Retry `nemoclaw alpha recover`");
+    expect(output).not.toContain("Could not verify against live gateway");
+  });
+
+  it("does not claim Docker restoration when a visible sandbox fails delivery recovery", async () => {
+    const harness = createStatusFlowHarness({
+      inferenceHealth: null,
+      lookup: {
+        state: "sandbox_recovery_failed",
+        output:
+          "  Sandbox 'alpha' is present, but its agent delivery chain could not be proven " +
+          "(gateway-recovery: the managed agent gateway could not be restarted).",
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).rejects.toThrow("process.exit(1)");
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Sandbox 'alpha' is present");
+    expect(output).toContain("agent delivery chain could not be proven");
+    expect(output).not.toContain("restored from Docker");
   });
 
   it("renders missing gateway metadata after restart without claiming recovery", async () => {
@@ -267,6 +673,83 @@ describe("showSandboxStatus flow", () => {
     expect(output).toContain("Could not verify sandbox 'alpha'");
     expect(output).toContain("verify the active gateway");
     expect(output).not.toContain("Recovered NemoClaw gateway runtime");
+  });
+
+  it("points SSH operators to dashboard-url for remote-access instructions when the gateway is running (#8465)", async () => {
+    vi.stubEnv("SSH_CONNECTION", "203.0.113.9 51000 198.51.100.2 22");
+    const harness = createStatusFlowHarness({ gatewayRunning: true });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("OpenClaw: ");
+    expect(output).toContain("running");
+    expect(output).toContain(
+      "Remote access: run `nemoclaw 'alpha' dashboard-url` for SSH port forward instructions.",
+    );
+  });
+
+  it("shell-quotes the sandbox name in SSH dashboard guidance (#8465)", async () => {
+    vi.stubEnv("SSH_CONNECTION", "203.0.113.9 51000 198.51.100.2 22");
+    const sandboxName = "alpha's box";
+    const harness = createStatusFlowHarness({
+      gatewayRunning: true,
+      sandboxEntry: { name: sandboxName },
+    });
+
+    await expect(harness.showSandboxStatus(sandboxName)).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain(
+      "Remote access: run `nemoclaw 'alpha'\\''s box' dashboard-url` for SSH port forward instructions.",
+    );
+  });
+
+  it.each([
+    {
+      caseLabel: "a routable dashboard URL",
+      chatUiUrl: "https://dashboard.example.test",
+      sandboxEntry: {},
+    },
+    {
+      caseLabel: "a prepared remote bind",
+      chatUiUrl: "",
+      sandboxEntry: { dashboardRemoteBindPrepared: true },
+    },
+  ])("omits port forward guidance for $caseLabel (#8465)", async ({ chatUiUrl, sandboxEntry }) => {
+    vi.stubEnv("SSH_CONNECTION", "203.0.113.9 51000 198.51.100.2 22");
+    vi.stubEnv("CHAT_UI_URL", chatUiUrl);
+    const harness = createStatusFlowHarness({ gatewayRunning: true, sandboxEntry });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("running");
+    expect(output).not.toContain("Remote access: run");
+  });
+
+  it("omits dashboard guidance over SSH when the gateway is stopped (#8465)", async () => {
+    vi.stubEnv("SSH_CONNECTION", "203.0.113.9 51000 198.51.100.2 22");
+    const harness = createStatusFlowHarness({ gatewayRunning: false });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("not running");
+    expect(output).not.toContain("Remote access: run");
+  });
+
+  it("omits the remote-access pointer when the session is not over SSH (#8465)", async () => {
+    vi.stubEnv("SSH_CONNECTION", "");
+    vi.stubEnv("SSH_CLIENT", "");
+    vi.stubEnv("SSH_TTY", "");
+    const harness = createStatusFlowHarness({ gatewayRunning: true });
+
+    await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(output).toContain("running");
+    expect(output).not.toContain("Remote access: run");
   });
 
   it("renders gateway-level handshake failures without removing registry state", async () => {

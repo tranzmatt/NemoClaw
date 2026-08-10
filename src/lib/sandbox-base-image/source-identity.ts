@@ -7,7 +7,20 @@ import path from "node:path";
 
 import { ROOT } from "../runner";
 
-export const BASE_IMAGE_INPUT_PATHS = ["Dockerfile.base", "nemoclaw-blueprint/blueprint.yaml"];
+export const BASE_IMAGE_INPUT_PATHS = [
+  "Dockerfile.base",
+  "nemoclaw-blueprint/blueprint.yaml",
+  "scripts/lib/sandbox-rlimits.sh",
+  "agents/openclaw/mcporter-runtime/package.json",
+  "agents/openclaw/mcporter-runtime/package-lock.json",
+  "scripts/security/build-perl-security-packages.sh",
+  "scripts/lib/openclaw-npm-remediation.mts",
+  "scripts/lib/reviewed-npm-archive.mts",
+  "scripts/patch-bundled-npm-brace-expansion.mts",
+  "scripts/lib/patch-bundled-npm-ip-address.mts",
+  "scripts/patch-bundled-npm-tar.mts",
+  "scripts/upgrade-bundled-npm.mts",
+];
 
 export function normalizeBaseImageInputPaths(rootDir: string, paths: string[] = []): string[] {
   const absoluteRootDir = path.resolve(rootDir);
@@ -47,6 +60,31 @@ export function getSourceShortShaTags(
   };
 
   push(env.GITHUB_SHA);
+  if (!fs.existsSync(path.join(rootDir, ".git"))) return Array.from(new Set(values));
+  const git = spawnSync("git", ["-C", rootDir, "rev-parse", "HEAD"], {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 5_000,
+  });
+  if (git.status === 0) push(git.stdout);
+
+  return Array.from(new Set(values));
+}
+
+export function getSourceRevisionIds(
+  rootDir = ROOT,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const values: string[] = [];
+  const push = (value: string | null | undefined) => {
+    const normalized = String(value || "")
+      .trim()
+      .toLowerCase();
+    if (/^[0-9a-f]{40,64}$/.test(normalized)) values.push(normalized);
+  };
+
+  push(env.GITHUB_SHA);
+  if (!fs.existsSync(path.join(rootDir, ".git"))) return Array.from(new Set(values));
   const git = spawnSync("git", ["-C", rootDir, "rev-parse", "HEAD"], {
     encoding: "utf-8",
     stdio: ["ignore", "pipe", "ignore"],
@@ -77,6 +115,101 @@ function gitExactVersionTag(rootDir: string, env: NodeJS.ProcessEnv): string | n
   return git.status === 0 ? normalizeVersionTag(git.stdout) : null;
 }
 
+function gitNearestVersionTag(rootDir: string, env: NodeJS.ProcessEnv): string | null {
+  const git = spawnSync(
+    "git",
+    ["-C", rootDir, "describe", "--tags", "--abbrev=0", "--match", "v*"],
+    { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000, env },
+  );
+  return git.status === 0 ? normalizeVersionTag(git.stdout) : null;
+}
+
+type VersionTagParts = {
+  core: number[];
+  prerelease: Array<number | string>;
+};
+
+function parseVersionTag(tag: string): VersionTagParts {
+  const rawParts = tag.slice(1).split(/[.-]/);
+  const core: number[] = [];
+  let index = 0;
+  for (; index < rawParts.length; index += 1) {
+    const part = rawParts[index];
+    if (!/^[0-9]+$/.test(part)) break;
+    core.push(Number(part));
+  }
+  return {
+    core,
+    prerelease: rawParts.slice(index).map((part) => (/^[0-9]+$/.test(part) ? Number(part) : part)),
+  };
+}
+
+function comparePrereleasePartsDesc(
+  left: Array<number | string>,
+  right: Array<number | string>,
+): number {
+  if (left.length === 0 || right.length === 0) {
+    if (left.length === right.length) return 0;
+    return left.length === 0 ? -1 : 1;
+  }
+
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const leftPart = left[index];
+    const rightPart = right[index];
+    if (leftPart === rightPart) continue;
+    if (leftPart === undefined) return 1;
+    if (rightPart === undefined) return -1;
+    if (typeof leftPart === "number" && typeof rightPart === "number") {
+      return rightPart - leftPart;
+    }
+    if (typeof leftPart === "number") return 1;
+    if (typeof rightPart === "number") return -1;
+    return String(rightPart).localeCompare(String(leftPart));
+  }
+  return 0;
+}
+
+function compareVersionTagsDesc(a: string, b: string): number {
+  const left = parseVersionTag(a);
+  const right = parseVersionTag(b);
+  for (let index = 0; index < Math.max(left.core.length, right.core.length); index += 1) {
+    const leftPart = left.core[index] ?? 0;
+    const rightPart = right.core[index] ?? 0;
+    if (leftPart === rightPart) continue;
+    return rightPart - leftPart;
+  }
+  return comparePrereleasePartsDesc(left.prerelease, right.prerelease);
+}
+
+function gitRemoteReachableVersionTag(rootDir: string, env: NodeJS.ProcessEnv): string | null {
+  const git = spawnSync("git", ["-C", rootDir, "ls-remote", "--tags", "origin", "v*"], {
+    encoding: "utf-8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 5_000,
+    env: { ...env, GIT_TERMINAL_PROMPT: "0" },
+  });
+  if (git.status !== 0) return null;
+
+  const tags = new Map<string, string>();
+  for (const line of git.stdout.split("\n")) {
+    const match = line.match(/^([0-9a-f]{40})\s+refs\/tags\/(.+?)(\^\{\})?$/);
+    if (!match) continue;
+    const tag = normalizeVersionTag(match[2]);
+    if (!tag) continue;
+    const commit = match[1];
+    const peeled = match[3] === "^{}";
+    if (peeled || !tags.has(tag)) tags.set(tag, commit);
+  }
+
+  const candidates = [...tags].sort(([left], [right]) => compareVersionTagsDesc(left, right));
+  for (const [tag, commit] of candidates) {
+    if (gitStatus(rootDir, ["merge-base", "--is-ancestor", commit, "HEAD"], env) === 0) {
+      return tag;
+    }
+  }
+  return null;
+}
+
 function versionFileTag(rootDir: string): string | null {
   try {
     return normalizeVersionTag(fs.readFileSync(path.join(rootDir, ".version"), "utf-8"));
@@ -100,6 +233,14 @@ export function getVersionedBaseImageTags(
   return Array.from(
     new Set(values.map((value) => normalizeVersionTag(value)).filter(Boolean)),
   ) as string[];
+}
+
+export function getNearestVersionedBaseImageTags(
+  rootDir = ROOT,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const tag = gitRemoteReachableVersionTag(rootDir, env) || gitNearestVersionTag(rootDir, env);
+  return tag ? [tag] : [];
 }
 
 function gitStatus(rootDir: string, args: string[], env: NodeJS.ProcessEnv): number | null {

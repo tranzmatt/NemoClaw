@@ -28,7 +28,7 @@
 #   bash scripts/brev-launchable-ci-cpu.sh --print-openshell-version  # resolve only
 #
 # Environment overrides:
-#   OPENSHELL_VERSION          — OpenShell CLI release tag (default: v0.0.72)
+#   OPENSHELL_VERSION          — OpenShell CLI release tag (default: stable selector below)
 #   NEMOCLAW_OPENSHELL_CHANNEL — Release channel (stable/dev/auto)
 #   NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL — Required opt-in for the unverified dev channel
 #   NEMOCLAW_REF               — NemoClaw git ref to clone (default: main)
@@ -73,7 +73,7 @@ assert_openshell_version() {
 if [ -z "$OPENSHELL_VERSION" ]; then
   case "${NEMOCLAW_OPENSHELL_CHANNEL:-stable}" in
     dev) OPENSHELL_VERSION="dev" ;;
-    stable | auto) OPENSHELL_VERSION="v0.0.72" ;;
+    stable | auto) OPENSHELL_VERSION="v0.0.101" ;;
     *) fail "NEMOCLAW_OPENSHELL_CHANNEL must be one of: stable, dev, auto" ;;
   esac
 fi
@@ -148,11 +148,11 @@ openshell_cli_asset_for_arch() {
 openshell_cli_pinned_sha256() {
   local release_tag="$1" asset="$2"
   case "${release_tag}:${asset}" in
-    v0.0.72:openshell-x86_64-unknown-linux-musl.tar.gz)
-      printf '%s\n' "37836c3b50383e03249c5e16512c1806e591fba8451408a84fb2f628ddb318c4"
+    v0.0.101:openshell-x86_64-unknown-linux-musl.tar.gz)
+      printf '%s\n' "7d49ab2a5ff0b826bd2bdca5e0244010f832dfc6901c808ea8c8467004c26913"
       ;;
-    v0.0.72:openshell-aarch64-unknown-linux-musl.tar.gz)
-      printf '%s\n' "a5ff01a3240d73c72ec1700eda6cc6c752a86cf50c5dd1b5bdc459f544d03045"
+    v0.0.101:openshell-aarch64-unknown-linux-musl.tar.gz)
+      printf '%s\n' "b553d3bfc08e9354b990a10fb8abd976e039afeec2d3947f8a112018be40d296"
       ;;
     *)
       return 1
@@ -163,6 +163,18 @@ openshell_cli_pinned_sha256() {
 openshell_checksum_line() {
   local checksum_file="$1" asset="$2"
   awk -v asset="$asset" '$2 == asset { print; found=1; exit } END { if (!found) exit 1 }' "$checksum_file"
+}
+
+validate_openshell_archive() {
+  local archive="$1" expected_member="$2" members verbose
+  members="$(LC_ALL=C tar -tzf "$archive")" \
+    || fail "Unable to list OpenShell archive $(basename "$archive")"
+  [ "$members" = "$expected_member" ] \
+    || fail "Unsafe OpenShell archive $(basename "$archive"): expected exactly one member named $expected_member"
+  verbose="$(LC_ALL=C tar -tvzf "$archive")" \
+    || fail "Unable to inspect OpenShell archive $(basename "$archive")"
+  [[ "$verbose" != *$'\n'* && "${verbose:0:1}" = "-" && "${verbose##* }" = "$expected_member" ]] \
+    || fail "Unsafe OpenShell archive $(basename "$archive"): $expected_member must be one regular file"
 }
 
 verify_openshell_cli_asset() {
@@ -201,6 +213,7 @@ install_openshell_cli_release() {
   if [[ "$OPENSHELL_VERSION" != "dev" ]]; then
     verify_openshell_cli_asset "$tmpdir" "$asset"
   fi
+  validate_openshell_archive "$tmpdir/$asset" openshell
   tar xzf "$tmpdir/$asset" -C "$tmpdir"
   sudo install -m 755 "$tmpdir/openshell" /usr/local/bin/openshell
   rm -rf "$tmpdir"

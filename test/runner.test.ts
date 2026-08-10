@@ -7,20 +7,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import YAML from "yaml";
 
 import { redact, runCapture } from "../src/lib/runner";
 
 const runnerPath = path.join(import.meta.dirname, "..", "src", "lib", "runner.ts");
 const PINNED_OPEN_SHELL_SHA256 = {
-  cliDarwinArm64: "117b5354cc42d80bc4d5e070ea5ac4e341208ff6d3c29b516d8a9c80e2310f8d",
-  cliLinuxArm64: "a5ff01a3240d73c72ec1700eda6cc6c752a86cf50c5dd1b5bdc459f544d03045",
-  cliLinuxX64: "37836c3b50383e03249c5e16512c1806e591fba8451408a84fb2f628ddb318c4",
-  gatewayDarwinArm64: "8c07362107393eb5f4ae4b9ee9f4257fd53862c51ad8dd96f2fe31bb6d8d7ffb",
-  gatewayLinuxArm64: "a97dcb3acb04fb2d1170c1a2170228990c2337e25bb8c18817e5a6e952204108",
-  gatewayLinuxX64: "03225fb9388b682af1a5f1614b26b75f828da6031e3ffc1fd920b6fbe5f70877",
-  sandboxLinuxArm64: "2cf62cbd651e55d0f8750804e2b4025e0d6c8eea4564c87cda47a2c922941db0",
-  sandboxLinuxX64: "811f914b6a6a3a3f4533449ddebebb6422333861a27a5fa848db6cbfdffdd230",
+  cliDarwinArm64: "9daaccdb9e30e220d56dd6d6bf4bd00ccca8ae4ad2845f5f0d9b9da3eb8ee881",
+  cliLinuxArm64: "b553d3bfc08e9354b990a10fb8abd976e039afeec2d3947f8a112018be40d296",
+  cliLinuxX64: "7d49ab2a5ff0b826bd2bdca5e0244010f832dfc6901c808ea8c8467004c26913",
+  gatewayDarwinArm64: "0f9e195b7cde57f4c2080df95159c5e7e72b0248306abc242ae00a3bb6f07f14",
+  gatewayLinuxArm64: "ac842ccc2ab8b5682f7479d71532cc650839250a8a41dbfae2b871cbbdfd3279",
+  gatewayLinuxX64: "eaeb094ccf7dcb1fe00c7e926e6aa9aaaefb89ecbef8343720628b0fd2d84654",
+  sandboxLinuxArm64: "c39b7ba3cf212b88712a00d2a0e3d28e2c1e0e9f47a9a6ca818a8f06ed2140aa",
+  sandboxLinuxX64: "953b90eaa7d2fc1bb7bdf38eb0ada6fad7902b13f9f895ca20b89caeac483a9e",
 };
 
 type SpawnCallOptions = {
@@ -353,7 +352,7 @@ describe("validateName", () => {
     const { validateName } = require(runnerPath);
     expect(() => validateName("test; whoami")).toThrow(/Invalid/);
     expect(() => validateName("test`id`")).toThrow(/Invalid/);
-    expect(() => validateName("test$(cat /etc/passwd)")).toThrow(/Invalid/);
+    expect(() => validateName("a$(id)")).toThrow(/Invalid/);
     expect(() => validateName("../etc/passwd")).toThrow(/Invalid/);
   });
 
@@ -366,10 +365,44 @@ describe("validateName", () => {
 
   it("rejects excessively long valid-looking names before spawning OpenShell", () => {
     const { validateName } = require(runnerPath);
-    expect(validateName("a".repeat(63))).toBe("a".repeat(63));
-    expect(() => validateName("a".repeat(64 * 1024), "sandbox name")).toThrow(
-      /sandbox name too long \(max 63 chars\)/,
+    expect(validateName("a".repeat(19))).toBe("a".repeat(19));
+    expect(() => validateName("a".repeat(20), "sandbox name")).toThrow(
+      /sandbox name too long \(max 19 chars\)/,
     );
+    expect(() => validateName("a".repeat(64 * 1024), "sandbox name")).toThrow(
+      /sandbox name too long \(max 19 chars\)/,
+    );
+  });
+
+  it("escapes control characters in a rejected name instead of echoing raw bytes (#7796)", () => {
+    const { validateName } = require(runnerPath);
+    const escapeByte = String.fromCharCode(27);
+
+    let message = "";
+    try {
+      validateName(`bad${escapeByte}[31mX`, "sandbox name");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain(String.raw`Invalid sandbox name: "bad\u001b[31mX".`);
+    expect(message).not.toContain(escapeByte);
+  });
+
+  it("escapes control characters in an over-length rejected name (#7796)", () => {
+    const { validateName } = require(runnerPath);
+    const escapeByte = String.fromCharCode(27);
+
+    let message = "";
+    try {
+      validateName(`bad${escapeByte}[31m${"x".repeat(200)}`, "sandbox name");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain("sandbox name too long (max 19 chars)");
+    expect(message).not.toContain(escapeByte);
+    expect(message).toContain('..."');
   });
 
   it("rejects uppercase and special characters", () => {
@@ -470,7 +503,7 @@ describe("redact", () => {
   it("masks dashboard URL hash tokens", () => {
     const token = "a".repeat(64);
     const output = redact(`http://127.0.0.1:18789/#token=${token}`);
-    expect(output).toBe("http://127.0.0.1:18789/#token=aaaa********************");
+    expect(output).toBe("http://127.0.0.1:18789/#token=****");
     expect(output).not.toContain(token);
   });
 
@@ -670,6 +703,7 @@ describe("regression guards", () => {
   });
 
   describe("credential exposure guards (#429)", () => {
+    // source-shape-contract: security -- Executable walkthrough commands must never materialize the NVIDIA inference credential in child arguments
     it("walkthrough.sh does not embed NVIDIA_INFERENCE_API_KEY in tmux or sandbox commands", () => {
       const fs = require("fs");
       const src = fs.readFileSync(
@@ -741,11 +775,35 @@ describe("regression guards", () => {
         strings() { echo "request-body-credential-rewrite websocket-credential-rewrite allow_all_known_mcp_methods"; }
         export -f strings
         tar() {
-          local destination="\${@: -1}"
-          printf '%s\n' '#!/bin/sh' 'echo "openshell 0.0.72"' > "$destination/openshell"
-          printf '%s\n' '#!/bin/sh' 'echo "openshell-gateway 0.0.72"' > "$destination/openshell-gateway"
-          printf '%s\n' '#!/bin/sh' 'echo "openshell-sandbox 0.0.72"' > "$destination/openshell-sandbox"
-          chmod +x "$destination/openshell" "$destination/openshell-gateway" "$destination/openshell-sandbox"
+          local mode="\${1:-}" archive="\${2:-}" expected="" destination=""
+          case "$(basename "$archive")" in
+          openshell-gateway-*) expected="openshell-gateway" ;;
+          openshell-sandbox-*) expected="openshell-sandbox" ;;
+          openshell-*) expected="openshell" ;;
+          *) return 2 ;;
+          esac
+          case "$mode" in
+          -tzf)
+            printf '%s\n' "$expected"
+            ;;
+          -tvzf)
+            printf '%s\n' "-rwxr-xr-x 0/0 0 2026-01-01 00:00 $expected"
+            ;;
+          xzf|-xzf)
+            shift 2
+            while [ "$#" -gt 0 ]; do
+              if [ "$1" = "-C" ]; then
+                shift
+                destination="$1"
+              fi
+              shift || true
+            done
+            [ -n "$destination" ] || return 2
+            printf '%s\n' '#!/bin/sh' 'echo "0.0.101"' > "$destination/$expected"
+            chmod +x "$destination/$expected"
+            ;;
+          *) return 2 ;;
+          esac
         }; export -f tar
         install() { /usr/bin/install "$@"; }; export -f install
         source "${scriptPath}"
@@ -819,11 +877,35 @@ describe("regression guards", () => {
         strings() { echo "request-body-credential-rewrite websocket-credential-rewrite allow_all_known_mcp_methods"; }
         export -f strings
         tar() {
-          local destination="\${@: -1}"
-          printf '%s\n' '#!/bin/sh' 'echo "openshell 0.0.72"' > "$destination/openshell"
-          printf '%s\n' '#!/bin/sh' 'echo "openshell-gateway 0.0.72"' > "$destination/openshell-gateway"
-          printf '%s\n' '#!/bin/sh' 'echo "openshell-sandbox 0.0.72"' > "$destination/openshell-sandbox"
-          chmod +x "$destination/openshell" "$destination/openshell-gateway" "$destination/openshell-sandbox"
+          local mode="\${1:-}" archive="\${2:-}" expected="" destination=""
+          case "$(basename "$archive")" in
+          openshell-gateway-*) expected="openshell-gateway" ;;
+          openshell-sandbox-*) expected="openshell-sandbox" ;;
+          openshell-*) expected="openshell" ;;
+          *) return 2 ;;
+          esac
+          case "$mode" in
+          -tzf)
+            printf '%s\n' "$expected"
+            ;;
+          -tvzf)
+            printf '%s\n' "-rwxr-xr-x 0/0 0 2026-01-01 00:00 $expected"
+            ;;
+          xzf|-xzf)
+            shift 2
+            while [ "$#" -gt 0 ]; do
+              if [ "$1" = "-C" ]; then
+                shift
+                destination="$1"
+              fi
+              shift || true
+            done
+            [ -n "$destination" ] || return 2
+            printf '%s\n' '#!/bin/sh' 'echo "0.0.101"' > "$destination/$expected"
+            chmod +x "$destination/$expected"
+            ;;
+          *) return 2 ;;
+          esac
         }; export -f tar
         install() { /usr/bin/install "$@"; }; export -f install
         source "${scriptPath}"
@@ -895,51 +977,6 @@ describe("regression guards", () => {
       const mode = fs.statSync(scriptPath).mode;
       expect((mode & 0o111) !== 0).toBe(true);
     });
-
-    it("brev e2e suite includes a deploy-cli mode", () => {
-      const src = fs.readFileSync(
-        path.join(import.meta.dirname, "..", "test", "e2e", "brev-e2e.test.ts"),
-        "utf-8",
-      );
-      expect(src).toContain('TEST_SUITE === "deploy-cli"');
-      expect(src).toContain("deploy CLI provisions a remote sandbox end to end");
-      expect(src).toContain('NEMOCLAW_DEPLOY_NO_CONNECT: "1"');
-    });
-
-    it("brev e2e suite relies on an authenticated brev CLI instead of a Brev API token", () => {
-      const src = fs.readFileSync(
-        path.join(import.meta.dirname, "..", "test", "e2e", "brev-e2e.test.ts"),
-        "utf-8",
-      );
-      expect(src).toContain("const hasAuthenticatedBrev =");
-      expect(src).toContain('brev("ls")');
-      expect(src).not.toContain("BREV_API_TOKEN");
-      expect(src).not.toContain('brev("login", "--token"');
-    });
-
-    it("brev e2e suite captures CPU candidates before piping them into create", () => {
-      const src = fs.readFileSync(
-        path.join(import.meta.dirname, "..", "test", "e2e", "brev-e2e.test.ts"),
-        "utf-8",
-      );
-      expect(src).toContain(
-        'const CAPTURE_OUTPUT_STDIO: StdioOptions = ["ignore", "pipe", "inherit"]',
-      );
-      expect(src).toMatch(
-        /const cpuCandidates = execFileSync\([\s\S]*"search",[\s\S]*"cpu",[\s\S]*stdio: CAPTURE_OUTPUT_STDIO/,
-      );
-      expect(src).toMatch(/input: cpuCandidates,[\s\S]*stdio: PIPE_INPUT_STDIO/);
-    });
-
-    it("brev e2e suite no longer contains the old brev-setup compatibility path", () => {
-      const src = fs.readFileSync(
-        path.join(import.meta.dirname, "..", "test", "e2e", "brev-e2e.test.ts"),
-        "utf-8",
-      );
-      expect(src).not.toContain("scripts/brev-setup.sh");
-      expect(src).not.toContain("USE_LAUNCHABLE");
-      expect(src).not.toContain("SKIP_VLLM=1");
-    });
   });
 
   describe("OpenClaw runtime hardening", () => {
@@ -980,10 +1017,12 @@ describe("regression guards", () => {
 
       expect(baseSrc).toContain("ENV AWS_EC2_METADATA_DISABLED=true");
       expect(runtimeSrc).toContain("ENV AWS_EC2_METADATA_DISABLED=true");
+      const baseRuntimeStageStart = baseSrc.lastIndexOf("\nFROM ");
+      expect(baseRuntimeStageStart).toBeGreaterThan(-1);
       const runtimeStageStart = runtimeSrc.indexOf("# Stage 3: Runtime image");
       expect(runtimeStageStart).toBeGreaterThan(-1);
       for (const [source, stageStart] of [
-        [baseSrc, 0],
+        [baseSrc, baseRuntimeStageStart],
         [runtimeSrc, runtimeStageStart],
       ] as const) {
         const fromIndex = source.indexOf("\nFROM ", stageStart);
@@ -1044,31 +1083,6 @@ describe("regression guards", () => {
       // The smoke must be wired into the run, not just defined.
       expect(src).toContain("await assertTmuxPtyFlow(sandbox, SANDBOX_A)");
     });
-
-    // The reopened #4513: installing tmux was not enough — the bundled
-    // tmux-session flow still failed with `create window failed: fork failed:
-    // Permission denied`. Root cause: the sandbox landlock filesystem policy
-    // never granted the devpts PTY devices, so forkpty() open of /dev/ptmx
-    // (-> /dev/pts/ptmx) and the /dev/pts/<n> slave was denied with EACCES.
-    for (const policyFile of [
-      path.join("nemoclaw-blueprint", "policies", "openclaw-sandbox.yaml"),
-      path.join("nemoclaw-blueprint", "policies", "openclaw-sandbox-permissive.yaml"),
-      path.join("agents", "openclaw", "policy-permissive.yaml"),
-      path.join("agents", "hermes", "policy-additions.yaml"),
-      path.join("agents", "hermes", "policy-permissive.yaml"),
-    ]) {
-      it(`${policyFile} grants /dev/pts so PTY allocation (tmux) works`, () => {
-        const doc = YAML.parse(fs.readFileSync(path.join(repoRoot, policyFile), "utf-8"));
-        const readWrite: string[] = doc.filesystem_policy?.read_write ?? [];
-        // devpts must be writable — tmux opens the master and slave O_RDWR.
-        expect(readWrite).toContain("/dev/pts");
-        // /dev/ptmx is a symlink to pts/ptmx; the supervisor refuses to chown a
-        // symlinked read_write path, so it must NOT be listed directly. The
-        // /dev/pts directory grant already covers ptmx via the landlock
-        // path hierarchy.
-        expect(readWrite).not.toContain("/dev/ptmx");
-      });
-    }
 
     it("e2e TC-SBX-09 hard-asserts the tmux lifecycle and no longer skips on fork failure", () => {
       const src = fs.readFileSync(

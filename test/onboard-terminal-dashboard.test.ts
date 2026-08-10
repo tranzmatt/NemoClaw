@@ -38,6 +38,9 @@ function runTerminalDashboardScenario(scenario: "create" | "reuse") {
   const registryPath = JSON.stringify(path.join(repoRoot, "src", "lib", "state", "registry.ts"));
   const agentDefsPath = JSON.stringify(path.join(repoRoot, "src", "lib", "agent", "defs.ts"));
   const agentOnboardPath = JSON.stringify(path.join(repoRoot, "src", "lib", "agent", "onboard.ts"));
+  const dockerGpuSandboxCreatePath = JSON.stringify(
+    path.join(repoRoot, "src", "lib", "onboard", "docker-gpu-sandbox-create.ts"),
+  );
 
   fs.mkdirSync(fakeBin, { recursive: true });
   writeExecutable(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n");
@@ -50,6 +53,7 @@ const runner = require(${runnerPath});
 const registry = require(${registryPath});
 const agentDefs = require(${agentDefsPath});
 const agentOnboard = require(${agentOnboardPath});
+const dockerGpuSandboxCreate = require(${dockerGpuSandboxCreatePath});
 const childProcess = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const scenario = ${JSON.stringify(scenario)};
@@ -60,10 +64,27 @@ const updateCalls = [];
 const keepAlive = setInterval(() => {}, 1000);
 const _n = (c) => (Array.isArray(c) ? c.join(" ") : String(c)).replace(/'/g, "");
 
+dockerGpuSandboxCreate.createDockerGpuSandboxCreatePatch = () => ({
+  maybeApplyDuringCreate: () => {},
+  createFailureMessage: () => null,
+  exitOnPatchError: async () => {},
+  attachManagedBootstrapCutover: () => {},
+  rollbackManagedStartupAfterCreateFailure: async () => {},
+  ensureApplied: async () => {},
+  waitForSupervisorReconnectIfNeeded: () => {},
+  commitAfterReady: async () => {},
+  selectedMode: () => null,
+  printReadinessFailureIfEnabled: () => {},
+  verifyGpuOrExit: async (verify) => verify(sandboxName),
+});
+
 agentOnboard.createAgentSandbox = () => {
   const buildCtx = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-terminal-agent-"));
   const stagedDockerfile = path.join(buildCtx, "Dockerfile");
-  fs.writeFileSync(stagedDockerfile, "FROM scratch\nCMD [\"/bin/sh\"]\n");
+  fs.writeFileSync(
+    stagedDockerfile,
+    "FROM scratch\nARG NEMOCLAW_DCODE_AUTO_APPROVAL=disabled\nCMD [\"/bin/sh\"]\n",
+  );
   return { buildCtx, stagedDockerfile };
 };
 
@@ -86,8 +107,10 @@ runner.runCapture = (command) => {
       "Endpoint: https://inference.local/v1",
     ].join("\n");
   }
-  if (normalized.includes("sandbox get " + sandboxName)) {
-    return scenario === "reuse" ? sandboxName : "";
+  if (normalized.includes("sandbox get") && normalized.includes(sandboxName)) {
+    return scenario === "reuse"
+      ? [sandboxName, "Id: sbx-4f2a91c0d7"].join(String.fromCharCode(10))
+      : "";
   }
   if (normalized.includes("sandbox list")) return sandboxName + " Ready";
   if (normalized.includes("forward list")) return sandboxName + " 127.0.0.1 18789 12345 running";
@@ -157,6 +180,7 @@ const agent = agentDefs.loadAgent("langchain-deepagents-code");
       HOME: tmpDir,
       PATH: `${fakeBin}:${process.env.PATH || ""}`,
       NEMOCLAW_NON_INTERACTIVE: "1",
+      NEMOCLAW_TEST_MANAGED_IMAGE_FALLBACK: "1",
       OPENSHELL_DRIVERS: scenario === "create" ? "vm" : "docker",
     },
     timeout: 15000,

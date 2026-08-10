@@ -6,7 +6,8 @@ import {
   configureDcodeSession,
   expectNoDcodeMutation,
   makeDcodeSandboxEntry,
-} from "../../../../test/helpers/rebuild-dcode-flow-support";
+} from "../../../../test/helpers/rebuild-dcode-flow-helpers";
+import { expectNoSandboxDelete } from "../../../../test/helpers/rebuild-delete-assertions";
 import {
   createRebuildFlowHarness,
   resetRebuildFlowTestEnvironment,
@@ -40,12 +41,14 @@ describe("rebuildSandbox DCode flow: pre-delete drift", () => {
           credentialEnv: "COMPATIBLE_API_KEY",
           preferredInferenceApi: "openai-completions",
           compatibleEndpointReasoning: "false",
+          compatibleEndpointReasoningEffort: null,
           nimContainer: null,
           pinEndpoint: true,
           registryInferenceRoute: null,
           ambient: { presentVars: [], agentMismatch: null },
         },
         toolDisclosure: "direct",
+        dcodeAutoApprovalMode: "disabled",
         skipLiveRoute: true,
         gatewayPort: 8080,
         log: vi.fn(),
@@ -57,6 +60,7 @@ describe("rebuildSandbox DCode flow: pre-delete drift", () => {
           buildContext: {} as never,
           gatewayName: "nemoclaw",
           toolDisclosure: "progressive",
+          dcodeAutoApprovalMode: "disabled",
           verify,
           dispose,
         },
@@ -68,6 +72,57 @@ describe("rebuildSandbox DCode flow: pre-delete drift", () => {
     expect(dispose).not.toHaveBeenCalled();
   });
 
+  it("rejects prepared-image DCode auto-approval drift before gateway or mutation work (#6478)", async () => {
+    const checkGatewaySchema = vi.fn(() => true);
+    const verify = vi.fn(() => true);
+
+    await expect(
+      revalidateDcodeReplacementAtMutationEdge({
+        sandboxName: "alpha",
+        entry: {
+          name: "alpha",
+          agent: "langchain-deepagents-code",
+          gatewayName: "nemoclaw",
+          gatewayPort: 8080,
+        },
+        resumeConfig: {
+          agent: "langchain-deepagents-code",
+          provider: "compatible-endpoint",
+          model: "nvidia/nemotron-3-super-120b-a12b",
+          endpointUrl: "https://inference-api.nvidia.com/v1",
+          credentialEnv: "COMPATIBLE_API_KEY",
+          preferredInferenceApi: "openai-completions",
+          compatibleEndpointReasoning: "false",
+          compatibleEndpointReasoningEffort: null,
+          nimContainer: null,
+          pinEndpoint: true,
+          registryInferenceRoute: null,
+          ambient: { presentVars: [], agentMismatch: null },
+        },
+        toolDisclosure: "progressive",
+        dcodeAutoApprovalMode: "thread-opt-in",
+        skipLiveRoute: true,
+        gatewayPort: 8080,
+        log: vi.fn(),
+        bail: (message): never => {
+          throw new Error(message);
+        },
+        checkGatewaySchema,
+        replacement: {
+          buildContext: {} as never,
+          gatewayName: "nemoclaw",
+          toolDisclosure: "progressive",
+          dcodeAutoApprovalMode: "disabled",
+          verify,
+          dispose: vi.fn(() => true),
+        },
+      }),
+    ).rejects.toThrow("prepared DCode auto-approval mode changed before deletion");
+
+    expect(checkGatewaySchema).not.toHaveBeenCalled();
+    expect(verify).not.toHaveBeenCalled();
+  });
+
   it("rejects registry drift during the final DCode preflight before shields and backup (#6195)", async () => {
     const originalEntry = makeDcodeSandboxEntry();
     const driftedEntry = { ...originalEntry, model: "nvidia/changed-during-preflight" };
@@ -76,8 +131,9 @@ describe("rebuildSandbox DCode flow: pre-delete drift", () => {
       sandboxEntry: originalEntry,
       sandboxEntryReads: [
         originalEntry, // Initial rebuild target.
-        originalEntry, // Messaging-conflict gateway selection (#5954).
-        originalEntry, // Prepared DCode target capture.
+        originalEntry, // Exact post-confirmation lock guard.
+        originalEntry, // Messaging config hydration.
+        originalEntry, // Messaging-conflict gateway lookup (#5954).
         driftedEntry, // Final pre-backup target verification.
       ],
       dcodeRouteResults: [{ ok: true }, { ok: true }],
@@ -125,10 +181,10 @@ describe("rebuildSandbox DCode flow: pre-delete drift", () => {
       sandboxEntry: originalEntry,
       sandboxEntryReads: [
         originalEntry, // Initial rebuild target.
-        originalEntry, // Messaging-conflict gateway selection (#5954).
-        originalEntry, // Prepared DCode target capture.
+        originalEntry, // Exact post-confirmation lock guard.
+        originalEntry, // Messaging config hydration.
+        originalEntry, // Messaging-conflict gateway lookup (#5954).
         originalEntry, // Final pre-backup target verification.
-        originalEntry, // Delete-edge target verification input.
         driftedEntry, // Registry reread at the destructive boundary.
       ],
       dcodeRouteResults: [{ ok: true }, { ok: true }, { ok: true }],
@@ -141,10 +197,7 @@ describe("rebuildSandbox DCode flow: pre-delete drift", () => {
 
     expect(harness.openShieldsSpy).toHaveBeenCalledOnce();
     expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
     expect(harness.removeSandboxRegistryEntrySpy).not.toHaveBeenCalled();
     expect(harness.onboardSpy).not.toHaveBeenCalled();
     expect(harness.relockSpy).toHaveBeenCalledWith("alpha", expect.any(Object), true, "nemoclaw");
@@ -171,10 +224,7 @@ describe("rebuildSandbox DCode flow: pre-delete drift", () => {
     expect(harness.preflightDcodeRouteSpy).toHaveBeenCalledTimes(3);
     expect(harness.openShieldsSpy).toHaveBeenCalledOnce();
     expect(harness.backupSandboxStateSpy).toHaveBeenCalledOnce();
-    expect(harness.runOpenshellSpy).not.toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
-      expect.anything(),
-    );
+    expectNoSandboxDelete(harness.runOpenshellSpy);
     expect(harness.removeSandboxRegistryEntrySpy).not.toHaveBeenCalled();
     expect(harness.onboardSpy).not.toHaveBeenCalled();
     expect(harness.relockSpy).toHaveBeenCalledWith("alpha", expect.any(Object), true, "nemoclaw");

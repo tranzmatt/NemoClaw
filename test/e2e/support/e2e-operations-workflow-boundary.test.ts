@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +13,7 @@ import {
   validateE2eOperationsWorkflow,
   validateE2eOperationsWorkflowBoundary,
 } from "../../../tools/e2e/operations-workflow-boundary.mts";
+import { validateE2eWorkflow } from "../../../tools/e2e/workflow-boundary.mts";
 
 const AsyncFunction = Object.getPrototypeOf(async () => undefined).constructor as new (
   ...parameters: string[]
@@ -25,17 +27,9 @@ function workflowScript(jobName: string, stepName: string): string {
 }
 
 describe("E2E operations workflow boundary", () => {
-  it("keeps Actions reporting and scorecards aggregated over the report job set", () => {
+  it("accepts the checked-in workflow and rejects aggregation, permission, and secret-scope drift", () => {
     expect(validateE2eOperationsWorkflowBoundary()).toEqual([]);
 
-    const workflow = readE2eOperationsWorkflow();
-    const reportNeeds = workflow.jobs["report-to-pr"].needs as string[];
-    expect(workflow.jobs["notify-on-failure"]).toBeUndefined();
-    expect(workflow.jobs["report-to-pr"].permissions).toEqual({ "pull-requests": "write" });
-    expect(workflow.jobs.scorecard.needs).toEqual(reportNeeds);
-  });
-
-  it("rejects aggregation, permission, and secret-scope drift", () => {
     const workflow = readE2eOperationsWorkflow();
     workflow.jobs.scorecard.needs = [...(workflow.jobs.scorecard.needs as string[])];
     (workflow.jobs.scorecard.needs as string[]).pop();
@@ -53,6 +47,434 @@ describe("E2E operations workflow boundary", () => {
         "scorecard needs must exactly match report-to-pr needs",
         "scorecard permissions must be actions: read and contents: read",
         "scorecard must not expose credentials at job scope",
+      ]),
+    );
+  });
+
+  it("keeps PR reporting and scorecards disabled for PR E2E runs", () => {
+    const workflow = readE2eOperationsWorkflow();
+    workflow.jobs["report-to-pr"].if =
+      "${{ always() && github.event_name == 'workflow_dispatch' }}";
+    workflow.jobs.scorecard.if =
+      "${{ always() && (github.event_name == 'workflow_dispatch' && inputs.checkout_sha == '') }}";
+
+    expect(validateE2eOperationsWorkflow(workflow)).toEqual(
+      expect.arrayContaining([
+        "report-to-pr must run only for manual workflow dispatches",
+        "scorecard must run after push and direct-main manual E2E executions",
+      ]),
+    );
+  });
+
+  it("rejects missing NEEDS_JSON environment data (#6952)", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const report = workflow.jobs["report-to-pr"].steps!.find(
+      (step) => step.name === "Post E2E target results to PR",
+    )!;
+    delete report.env?.NEEDS_JSON;
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "report-to-pr must pass needs as environment data without script interpolation",
+    );
+  });
+
+  it("rejects malformed NEEDS_JSON environment data (#6952)", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const scorecard = workflow.jobs.scorecard.steps!.find(
+      (step) => step.name === "Generate E2E scorecard",
+    )!;
+    scorecard.env!.NEEDS_JSON = "${{ toJSON(needs.generate-matrix) }}";
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "scorecard generator must pass needs as environment data without script interpolation",
+    );
+  });
+
+  it("rejects needs interpolation in GitHub Script source (#6952)", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const report = workflow.jobs["report-to-pr"].steps!.find(
+      (step) => step.name === "Post E2E target results to PR",
+    )!;
+    report.with!.script = `${String(report.with!.script)}
+const interpolatedNeeds = \${{   toJSON ( needs )   }};
+`;
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "report-to-pr must pass needs as environment data without script interpolation",
+    );
+  });
+
+  it("rejects a commented NEEDS_JSON assignment (#6952)", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const report = workflow.jobs["report-to-pr"].steps!.find(
+      (step) => step.name === "Post E2E target results to PR",
+    )!;
+    report.with!.script = String(report.with!.script).replace(
+      "const needs = JSON.parse(process.env.NEEDS_JSON || '{}');",
+      "// const needs = JSON.parse(process.env.NEEDS_JSON || '{}');\nconst needs = {};",
+    );
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "report-to-pr must pass needs as environment data without script interpolation",
+    );
+  });
+
+  it("rejects NEEDS_JSON parsing assigned to an unrelated variable (#6952)", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const scorecard = workflow.jobs.scorecard.steps!.find(
+      (step) => step.name === "Generate E2E scorecard",
+    )!;
+    scorecard.with!.script = String(scorecard.with!.script).replace(
+      "const needs = JSON.parse(process.env.NEEDS_JSON || '{}');",
+      "const scorecardNeeds = JSON.parse(process.env.NEEDS_JSON || '{}');",
+    );
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "scorecard generator must pass needs as environment data without script interpolation",
+    );
+  });
+
+  it("rejects a lookalike NEEDS_JSON variable (#6952)", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const report = workflow.jobs["report-to-pr"].steps!.find(
+      (step) => step.name === "Post E2E target results to PR",
+    )!;
+    report.with!.script = String(report.with!.script).replace(
+      "process.env.NEEDS_JSON",
+      "process.env.NEEDS_JSON_BAD",
+    );
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "report-to-pr must pass needs as environment data without script interpolation",
+    );
+  });
+
+  it("pins the scorecard's current-run progress artifact action", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const download = workflow.jobs.scorecard.steps!.find(
+      (step) => step.name === "Download E2E progress artifacts",
+    )!;
+    download.uses = "actions/download-artifact@0000000000000000000000000000000000000000";
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "scorecard must download this run's E2E artifacts into the runtime audit directory",
+    );
+  });
+
+  it("limits the scorecard artifact download to E2E progress sources", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const download = workflow.jobs.scorecard.steps!.find(
+      (step) => step.name === "Download E2E progress artifacts",
+    )!;
+    download.with!.pattern = "*";
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "scorecard must download this run's E2E artifacts into the runtime audit directory",
+    );
+  });
+
+  it("rejects manual PR authorization and checkout validation drift", () => {
+    const workflow = readE2eOperationsWorkflow();
+    delete workflow.on?.workflow_dispatch?.inputs?.review_reason;
+    const authentication = workflow.jobs["generate-matrix"].steps!.find(
+      (step) => step.name === "Authenticate manual PR dispatch",
+    )!;
+    authentication.run = "echo unchecked";
+    const validation = workflow.jobs["generate-matrix"].steps!.find(
+      (step) => step.name === "Validate manual PR checkout",
+    )!;
+    validation.run = "echo unchecked";
+
+    expect(validateE2eOperationsWorkflow(workflow)).toEqual(
+      expect.arrayContaining([
+        "workflow_dispatch review_reason must be an optional string with an empty default",
+        'Manual PR authentication must retain "$WORKFLOW_EVENT" == "workflow_dispatch"',
+        'Manual PR authentication must retain "$CHECKOUT_SHA" =~ ^[a-f0-9]{40}$',
+        'Manual PR checkout validation must retain "$(git rev-parse --verify HEAD)" == "$CHECKOUT_SHA"',
+      ]),
+    );
+  });
+
+  it("does not activate generic GPU risk reporting for an automatic main push", () => {
+    const workflow = readE2eOperationsWorkflow();
+    workflow.jobs["llama-cpp-generic-gpu"]!.env!.NEMOCLAW_E2E_EXPECTED_SHA =
+      "${{ inputs.checkout_sha || github.sha }}";
+
+    expect(validateE2eWorkflow(workflow)).toContain(
+      "llama-cpp-generic-gpu job must set NEMOCLAW_E2E_EXPECTED_SHA to ${{ inputs.checkout_sha }}",
+    );
+  });
+
+  it("retains generic GPU candidate identity for main and manual PR runs", () => {
+    const workflow = readE2eOperationsWorkflow();
+    workflow.jobs["llama-cpp-generic-gpu"]!.env!.NEMOCLAW_LLAMA_CPP_QUALIFICATION_HEAD_SHA =
+      "${{ inputs.checkout_sha }}";
+
+    expect(validateE2eWorkflow(workflow)).toContain(
+      "llama-cpp-generic-gpu job must set NEMOCLAW_LLAMA_CPP_QUALIFICATION_HEAD_SHA to ${{ inputs.checkout_sha || github.sha }}",
+    );
+  });
+
+  it("rejects drift from the manual PR risk-signal identity inputs", () => {
+    const workflow = readE2eOperationsWorkflow();
+    workflow.env!.NEMOCLAW_E2E_EXPECTED_SHA = "${{ inputs.checkout_sha || github.sha }}";
+    workflow.env!.NEMOCLAW_E2E_CORRELATION_ID = "";
+
+    expect(validateE2eOperationsWorkflow(workflow)).toEqual(
+      expect.arrayContaining([
+        "E2E workflow must bind NEMOCLAW_E2E_EXPECTED_SHA",
+        "E2E workflow must bind NEMOCLAW_E2E_CORRELATION_ID",
+      ]),
+    );
+  });
+
+  it("limits manual PR runs to empty selectors or protected managed-runtime qualification", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const authentication = workflow.jobs["generate-matrix"].steps!.find(
+      (step) => step.name === "Authenticate manual PR dispatch",
+    )!;
+    authentication.run = authentication.run!.replace(
+      "Manual PR E2E accepts only empty selectors or managed-image-protected-runtime",
+      "Manual PR E2E accepts arbitrary selectors",
+    );
+
+    expect(validateE2eOperationsWorkflow(workflow)).toContain(
+      "Manual PR authentication must retain Manual PR E2E accepts only empty selectors or managed-image-protected-runtime",
+    );
+  });
+
+  it.each([
+    ["maintain", "", 0, ""],
+    ["maintain", "managed-image-protected-runtime", 0, ""],
+    ["maintain", "gpu-e2e", 1, "accepts only empty selectors or managed-image-protected-runtime"],
+    ["write", "", 1, "requires a repository maintainer or administrator"],
+  ])("requires a maintainer role and bounded selector before manual PR E2E for %s with %s", (role, jobs, expectedStatus, expectedStderr) => {
+    const workflow = readE2eOperationsWorkflow();
+    const authentication = workflow.jobs["generate-matrix"].steps!.find(
+      (step) => step.name === "Authenticate manual PR dispatch",
+    )!;
+    const headSha = "a".repeat(40);
+    const baseSha = "b".repeat(40);
+    const workflowSha = "c".repeat(40);
+    const prefix = [
+      "curl() {",
+      '  case "${@: -1}" in',
+      `    *collaborators*) printf '%s' '{"role_name":"${role}"}' ;;`,
+      `    *pulls/42) printf '%s' '{"state":"open","head":{"repo":{"full_name":"contributor/NemoClaw"},"sha":"${headSha}"},"base":{"sha":"${baseSha}"}}' ;;`,
+      "    *) return 1 ;;",
+      "  esac",
+      "}",
+    ].join("\n");
+    const result = spawnSync(
+      "bash",
+      ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", `${prefix}\n${authentication.run}`],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ACTOR: "maintainer",
+          BASE_SHA: baseSha,
+          CHECKOUT_REPOSITORY: "contributor/NemoClaw",
+          CHECKOUT_SHA: headSha,
+          EXPECTED_WORKFLOW_SHA: workflowSha,
+          GITHUB_REPOSITORY: "NVIDIA/NemoClaw",
+          GITHUB_TOKEN: "token",
+          INCLUDE_LAUNCHABLE: "false",
+          JOBS: jobs,
+          PR_NUMBER: "42",
+          REVIEW_REASON: "Reviewed PR head revision",
+          RUN_ATTEMPT: "1",
+          TARGETS: "",
+          TRIGGERING_ACTOR: "maintainer",
+          WORKFLOW_EVENT: "workflow_dispatch",
+          WORKFLOW_REF: "refs/heads/main",
+          WORKFLOW_SHA: workflowSha,
+        },
+      },
+    );
+
+    expect(result.status, result.stderr).toBe(expectedStatus);
+    expect(result.stderr).toContain(expectedStderr);
+  });
+
+  it("uses central maintainer authorization for protected managed-image qualification", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const guards = [
+      ["managed-image-multiarch-startup", "Validate protected exact-head dispatch"],
+      ["managed-image-protected-runtime", "Validate protected runtime exact-head dispatch"],
+    ].map(
+      ([jobName, stepName]) =>
+        workflow.jobs[jobName].steps!.find((step) => step.name === stepName)!,
+    );
+
+    for (const guard of guards) {
+      expect(guard.env).not.toHaveProperty("ACTOR");
+      expect(guard.run).not.toContain("github-actions[bot]");
+      expect(guard.run).toContain('"$WORKFLOW_SHA" == "$EXPECTED_WORKFLOW_SHA"');
+      expect(guard.run).toContain('"$CHECKOUT_SHA" =~ ^[a-f0-9]{40}$');
+    }
+  });
+
+  it("accepts the controller target matrix for the current PR head", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const generateMatrix = workflow.jobs["generate-matrix"];
+    const controller = generateMatrix.steps!.find(
+      (step) => step.name === "Build trusted controller target matrix",
+    )!;
+    const planner = generateMatrix.steps!.find(
+      (step) => step.name === "Generate E2E target matrix",
+    )!;
+    const directory = mkdtempSync(join(tmpdir(), "nemoclaw-manual-pr-matrix-"));
+    const output = join(directory, "output");
+    const summary = join(directory, "summary");
+
+    try {
+      writeFileSync(output, "");
+      writeFileSync(summary, "");
+      const controllerResult = spawnSync(
+        "bash",
+        ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", controller.run!],
+        {
+          encoding: "utf8",
+          env: { ...process.env, GITHUB_OUTPUT: output, JOBS: "", TARGETS: "" },
+        },
+      );
+      expect(controllerResult.status, controllerResult.stderr).toBe(0);
+      const controllerOutput = readFileSync(output, "utf8").split("\n");
+      const controllerMatrix = controllerOutput
+        .find((line) => line.startsWith("matrix="))!
+        .slice("matrix=".length);
+      const controllerTestMatrix = controllerOutput
+        .find((line) => line.startsWith("test_matrix="))!
+        .slice("test_matrix=".length);
+
+      writeFileSync(output, "");
+      const plannerResult = spawnSync(
+        "bash",
+        ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", planner.run!],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CHECKOUT_SHA: "a".repeat(40),
+            CONTROLLER_MATRIX: controllerMatrix,
+            CONTROLLER_TEST_MATRIX: controllerTestMatrix,
+            GITHUB_OUTPUT: output,
+            GITHUB_STEP_SUMMARY: summary,
+            INFERENCE_MODE: "mock",
+            JOBS: "",
+            TARGETS: "",
+          },
+        },
+      );
+      expect(plannerResult.status, plannerResult.stderr).toBe(0);
+      const matrixLine = readFileSync(output, "utf8")
+        .split("\n")
+        .find((line) => line.startsWith("matrix="))!;
+      const actualMatrix = JSON.parse(matrixLine.slice("matrix=".length));
+      expect(
+        actualMatrix.map(({ id, runner }: { id: string; runner: string }) => ({ id, runner })),
+      ).toEqual(JSON.parse(controllerMatrix));
+      expect(actualMatrix).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: "ubuntu-policy-custom-missing-presets-negative" }),
+          expect.objectContaining({ id: "ubuntu-repo-cloud-openclaw" }),
+        ]),
+      );
+      const testMatrixLine = readFileSync(output, "utf8")
+        .split("\n")
+        .find((line) => line.startsWith("test_matrix="))!;
+      expect(JSON.parse(testMatrixLine.slice("test_matrix=".length))).toEqual(
+        JSON.parse(controllerTestMatrix),
+      );
+      expect(
+        (generateMatrix as unknown as { outputs: Record<string, string> }).outputs.matrix,
+      ).toBe("${{ steps.matrix.outputs.matrix }}");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("selects no shared targets for protected managed-runtime qualification", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const controller = workflow.jobs["generate-matrix"].steps!.find(
+      (step) => step.name === "Build trusted controller target matrix",
+    )!;
+    const planner = workflow.jobs["generate-matrix"].steps!.find(
+      (step) => step.name === "Generate E2E target matrix",
+    )!;
+    const directory = mkdtempSync(join(tmpdir(), "nemoclaw-protected-matrix-"));
+    const output = join(directory, "output");
+    const summary = join(directory, "summary");
+
+    try {
+      writeFileSync(output, "");
+      writeFileSync(summary, "");
+      const result = spawnSync(
+        "bash",
+        ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", controller.run!],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            GITHUB_OUTPUT: output,
+            JOBS: "managed-image-protected-runtime",
+            TARGETS: "",
+          },
+        },
+      );
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(readFileSync(output, "utf8")).toBe("matrix=[]\ntest_matrix=[]\n");
+
+      writeFileSync(output, "");
+      const plannerResult = spawnSync(
+        "bash",
+        ["--noprofile", "--norc", "-e", "-o", "pipefail", "-c", planner.run!],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            CHECKOUT_SHA: "a".repeat(40),
+            CONTROLLER_MATRIX: "[]",
+            CONTROLLER_TEST_MATRIX: "[]",
+            GITHUB_OUTPUT: output,
+            GITHUB_STEP_SUMMARY: summary,
+            INFERENCE_MODE: "mock",
+            JOBS: "managed-image-protected-runtime",
+            TARGETS: "",
+          },
+        },
+      );
+      expect(plannerResult.status, plannerResult.stderr).toBe(0);
+      expect(readFileSync(output, "utf8")).toContain("matrix=[]\n");
+      expect(readFileSync(output, "utf8")).toContain("test_matrix=[]\n");
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps every planned job wired to bound evidence", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const job = workflow.jobs["cloud-onboard"];
+    job.env!.E2E_TARGET_ID = "different-job";
+    const run = job.steps!.find((step) =>
+      String(step.run ?? "").includes("tools/e2e/live-vitest-invocation.mts run --test-path"),
+    )!;
+    run.run = run.run!.replace(
+      "tools/e2e/live-vitest-invocation.mts run --test-path",
+      "tools/e2e/live-vitest-invocation.mts runx --test-path",
+    );
+    const upload = job.steps!.find((step) =>
+      step.uses?.startsWith("NVIDIA/NemoClaw/.github/actions/upload-e2e-artifacts@"),
+    )!;
+    upload.if = "success()";
+
+    expect(validateE2eOperationsWorkflow(workflow)).toEqual(
+      expect.arrayContaining([
+        "cloud-onboard must expose matching E2E job identity",
+        "cloud-onboard must attach the risk-signal reporter to every Vitest invocation",
+        "cloud-onboard must always upload one evidence artifact",
       ]),
     );
   });
@@ -87,9 +509,9 @@ describe("E2E operations workflow boundary", () => {
         "cloud-onboard must not hold issues: write",
         "cloud-onboard must not hold pull-requests: write",
         "report-to-pr must not hold issues: write",
-        "report-to-pr must hold only pull-requests: write",
+        "report-to-pr must hold only actions: read, contents: read, and pull-requests: write",
         "report-to-pr must run only for manual workflow dispatches",
-        "report-to-pr must contain only its PR-comment step",
+        "report-to-pr must first check out the trusted workflow revision, then post its PR comment",
         "report-to-pr must not use issue mutations or generic GitHub write surfaces",
       ]),
     );
@@ -114,6 +536,29 @@ describe("E2E operations workflow boundary", () => {
       expect.arrayContaining([
         "report-to-pr must limit issue mutation to one validated PR-scoped createComment call",
         "report-to-pr must not use issue mutations or generic GitHub write surfaces",
+      ]),
+    );
+  });
+
+  it("requires prNumber and report to originate from the trusted resolveReportPr and renderE2eReport calls", () => {
+    const workflow = readE2eOperationsWorkflow();
+    const report = workflow.jobs["report-to-pr"].steps!.find(
+      (step) => step.name === "Post E2E target results to PR",
+    )!;
+    report.with!.script = String(report.with!.script)
+      .replace(
+        "const prNumber = await resolveReportPr({ github, context, core, env: process.env });",
+        "const prNumber = 5093;",
+      )
+      .replace(
+        /const report = renderE2eReport\([^;]*\);/,
+        "const report = { body: 'fake', warnings: [] };",
+      );
+
+    expect(validateE2eOperationsWorkflow(workflow)).toEqual(
+      expect.arrayContaining([
+        "report-to-pr must derive prNumber from the trusted resolveReportPr call",
+        "report-to-pr must derive report from the trusted renderE2eReport call",
       ]),
     );
   });
@@ -222,10 +667,7 @@ describe("E2E operations workflow boundary", () => {
   });
 
   it("executes the scorecard workflow body and emits advisory budget warnings", async () => {
-    const script = workflowScript("scorecard", "Generate E2E scorecard").replace(
-      "${{ toJSON(needs) }}",
-      JSON.stringify({ "generate-matrix": { result: "success" } }),
-    );
+    const script = workflowScript("scorecard", "Generate E2E scorecard");
     const warning = vi.fn();
     const setOutput = vi.fn();
     const summary = {
@@ -246,29 +688,39 @@ describe("E2E operations workflow boundary", () => {
       }),
     };
     const scorecardJobs = {
-      isSelectiveDispatch: vi.fn().mockReturnValue(false),
       loadWorkflowRunJobs: vi.fn().mockResolvedValue([]),
-      summarizeJobs: vi.fn().mockReturnValue({
-        cancelled: 0,
-        failedJobs: [],
-        failure: 0,
-        ran: 1,
-        skipped: 0,
-        success: 1,
-        total: 1,
+    };
+    const coordinator = {
+      buildScorecard: vi.fn().mockReturnValue({
+        scorecardData: { ran: 0, runMode: "Main push", total: 0 },
+        slackData: { channel: "daily", payload: { attachments: [], text: "scorecard fallback" } },
+        summaryMarkdown: "## 🌅 NemoClaw E2E Scorecard\n\n### Onboard Performance Budget",
       }),
     };
-    const slackBlocks = {
-      buildBlocks: vi.fn().mockReturnValue([]),
-      buildFallbackText: vi.fn().mockReturnValue("scorecard fallback"),
-      getSlackChannel: vi.fn().mockReturnValue("daily"),
-      getStatusColor: vi.fn().mockReturnValue("good"),
+    const runtimeAudit = {
+      auditTestRuntime: vi.fn().mockReturnValue([{ target: "full-e2e" }]),
+      collectRuntimeHistorySamples: vi.fn().mockReturnValue([{ target: "full-e2e" }]),
+      formatRuntimeAuditSummary: vi
+        .fn()
+        .mockReturnValue("## E2E Test Phase Runtime\n\n| Target | Slowest observed phase |"),
+    };
+    const runtimeHistory = {
+      buildRuntimeHistory: vi
+        .fn()
+        .mockResolvedValue("## E2E Push Runtime Trend\n\n| Target | Prior median |"),
+      loadPriorPushSummaries: vi.fn(),
+    };
+    const firstTurnLatency = {
+      readCurrentFirstTurnLatencySample: vi.fn().mockReturnValue(null),
     };
     const runtimeModules = new Map<string, unknown>([
       ["path", { join: (...parts: string[]) => parts.join("/") }],
-      ["/workspace/scripts/scorecard/analyze-trace-timing.ts", traceTiming],
-      ["/workspace/scripts/scorecard/summarize-jobs.ts", scorecardJobs],
-      ["/workspace/scripts/scorecard/build-slack-blocks.ts", slackBlocks],
+      ["/workspace/scripts/audit-test-runtime.mts", runtimeAudit],
+      ["/workspace/scripts/scorecard/analyze-first-turn-latency.mts", firstTurnLatency],
+      ["/workspace/scripts/scorecard/analyze-runtime-history.mts", runtimeHistory],
+      ["/workspace/scripts/scorecard/coordinate-scorecard.mts", coordinator],
+      ["/workspace/scripts/scorecard/analyze-trace-timing.mts", traceTiming],
+      ["/workspace/scripts/scorecard/summarize-jobs.mts", scorecardJobs],
     ]);
     const runtimeRequire = (specifier: string) => {
       const runtimeModule = runtimeModules.get(specifier);
@@ -280,12 +732,15 @@ describe("E2E operations workflow boundary", () => {
         EXPLICIT_ONLY_JOBS: "",
         GITHUB_WORKSPACE: "/workspace",
         JOBS: "",
+        NEEDS_JSON: JSON.stringify({ "generate-matrix": { result: "success" } }),
+        RUNTIME_ARTIFACTS: "/runner/e2e-runtime-audit",
+        RUNTIME_SUMMARY_FILE: "/runner/e2e-runtime-summary.json",
         TARGETS: "",
       },
     };
     const context = {
       actor: "scorecard-test",
-      eventName: "schedule",
+      eventName: "push",
       repo: { owner: "NVIDIA", repo: "NemoClaw" },
       runId: 123,
       serverUrl: "https://github.com",
@@ -301,9 +756,140 @@ describe("E2E operations workflow boundary", () => {
     );
 
     expect(traceTiming.buildTraceTimingResult).toHaveBeenCalledWith({ github: {}, context, core });
+    expect(runtimeAudit.auditTestRuntime).toHaveBeenCalledWith(["/runner/e2e-runtime-audit"]);
+    expect(runtimeAudit.collectRuntimeHistorySamples).toHaveBeenCalledWith([
+      "/runner/e2e-runtime-audit",
+    ]);
+    expect(runtimeHistory.buildRuntimeHistory).toHaveBeenCalledWith(
+      { github: {}, context, core },
+      [{ target: "full-e2e" }],
+      "/runner/e2e-runtime-summary.json",
+      {
+        currentFirstTurnLatency: null,
+        loadPriorPushSummaries: runtimeHistory.loadPriorPushSummaries,
+      },
+    );
+    expect(firstTurnLatency.readCurrentFirstTurnLatencySample).toHaveBeenCalledWith(
+      "/runner/e2e-runtime-audit",
+    );
+    expect(runtimeAudit.auditTestRuntime.mock.invocationCallOrder[0]).toBeLessThan(
+      traceTiming.buildTraceTimingResult.mock.invocationCallOrder[0],
+    );
     expect(warning).toHaveBeenCalledWith("Cloud onboard advisory performance budget exceeded");
+    expect(coordinator.buildScorecard).toHaveBeenCalledWith(
+      expect.objectContaining({
+        apiJobs: [],
+        eventName: "push",
+        needs: { "generate-matrix": { result: "success" } },
+        rawExplicitOnly: "",
+        rawJobs: "",
+        rawTargets: "",
+        trace: expect.objectContaining({
+          traceSummaryLines: expect.arrayContaining(["### Onboard Performance Budget"]),
+        }),
+      }),
+    );
     expect(summary.addRaw).toHaveBeenCalledWith(
-      expect.stringContaining("### Onboard Performance Budget"),
+      expect.stringMatching(
+        /### Onboard Performance Budget[\s\S]*## E2E Test Phase Runtime[\s\S]*## E2E Push Runtime Trend/u,
+      ),
+    );
+    expect(summary.write).toHaveBeenCalledOnce();
+    expect(setOutput).toHaveBeenCalledWith("scorecardData", expect.any(String));
+    expect(setOutput).toHaveBeenCalledWith("slackData", expect.any(String));
+  });
+
+  it("keeps scorecard outputs available when a progress artifact is invalid", async () => {
+    const script = workflowScript("scorecard", "Generate E2E scorecard");
+    const warning = vi.fn();
+    const setOutput = vi.fn();
+    const summary = {
+      addRaw: vi.fn(),
+      write: vi.fn().mockResolvedValue(undefined),
+    };
+    summary.addRaw.mockReturnValue(summary);
+    const runtimeAudit = {
+      auditTestRuntime: vi.fn(() => {
+        throw new Error("invalid progress artifact");
+      }),
+      collectRuntimeHistorySamples: vi.fn(),
+      formatRuntimeAuditSummary: vi.fn(),
+    };
+    const runtimeHistory = { buildRuntimeHistory: vi.fn() };
+    const firstTurnLatency = { readCurrentFirstTurnLatencySample: vi.fn() };
+    const runtimeModules = new Map<string, unknown>([
+      ["path", { join: (...parts: string[]) => parts.join("/") }],
+      ["/workspace/scripts/audit-test-runtime.mts", runtimeAudit],
+      ["/workspace/scripts/scorecard/analyze-first-turn-latency.mts", firstTurnLatency],
+      ["/workspace/scripts/scorecard/analyze-runtime-history.mts", runtimeHistory],
+      [
+        "/workspace/scripts/scorecard/coordinate-scorecard.mts",
+        {
+          buildScorecard: vi.fn().mockReturnValue({
+            scorecardData: { ran: 0, runMode: "Main push", total: 0 },
+            slackData: { channel: "daily", payload: { attachments: [], text: "scorecard" } },
+            summaryMarkdown: "## 🌅 NemoClaw E2E Scorecard",
+          }),
+        },
+      ],
+      [
+        "/workspace/scripts/scorecard/analyze-trace-timing.mts",
+        {
+          buildTraceTimingResult: vi.fn().mockResolvedValue({
+            budgetWarningMessage: undefined,
+            traceSummaryLines: [],
+            traceTimingLine: "Trace: unavailable",
+          }),
+        },
+      ],
+      [
+        "/workspace/scripts/scorecard/summarize-jobs.mts",
+        { loadWorkflowRunJobs: vi.fn().mockResolvedValue([]) },
+      ],
+    ]);
+    const runtimeRequire = (specifier: string) => {
+      const runtimeModule = runtimeModules.get(specifier);
+      expect(runtimeModule, `Unexpected scorecard require: ${specifier}`).toBeDefined();
+      return runtimeModule;
+    };
+    const processMock = {
+      env: {
+        EXPLICIT_ONLY_JOBS: "",
+        GITHUB_WORKSPACE: "/workspace",
+        JOBS: "",
+        NEEDS_JSON: JSON.stringify({ "generate-matrix": { result: "success" } }),
+        RUNTIME_ARTIFACTS: "/runner/e2e-runtime-audit",
+        RUNTIME_SUMMARY_FILE: "/runner/e2e-runtime-summary.json",
+        TARGETS: "",
+      },
+    };
+    const context = {
+      actor: "scorecard-test",
+      eventName: "push",
+      repo: { owner: "NVIDIA", repo: "NemoClaw" },
+      runId: 123,
+      serverUrl: "https://github.com",
+    };
+
+    await new AsyncFunction("require", "process", "github", "context", "core", script)(
+      runtimeRequire,
+      processMock,
+      {},
+      context,
+      { setOutput, summary, warning },
+    );
+
+    expect(warning).toHaveBeenCalledWith(
+      "E2E test phase runtime summary unavailable: invalid progress artifact",
+    );
+    expect(runtimeAudit.formatRuntimeAuditSummary).not.toHaveBeenCalled();
+    expect(runtimeAudit.collectRuntimeHistorySamples).not.toHaveBeenCalled();
+    expect(firstTurnLatency.readCurrentFirstTurnLatencySample).not.toHaveBeenCalled();
+    expect(runtimeHistory.buildRuntimeHistory).not.toHaveBeenCalled();
+    expect(summary.addRaw).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /The summary is unavailable because a `test-progress.json` artifact was invalid\.[\s\S]*The trend is unavailable because a `test-progress.json` artifact was invalid\./u,
+      ),
     );
     expect(summary.write).toHaveBeenCalledOnce();
     expect(setOutput).toHaveBeenCalledWith("scorecardData", expect.any(String));
@@ -316,7 +902,13 @@ describe("E2E operations workflow boundary", () => {
     const fetchMock = vi.fn();
     vi.stubEnv(
       "SLACK_DATA",
-      JSON.stringify({ channel: "preview", payload: { text: "safe precomputed payload" } }),
+      JSON.stringify({
+        channel: "preview",
+        payload: {
+          text: "safe precomputed payload",
+          attachments: [{ color: "#76b900", blocks: [] }],
+        },
+      }),
     );
     vi.stubEnv("POST_TO_SLACK", "false");
     try {
@@ -332,7 +924,37 @@ describe("E2E operations workflow boundary", () => {
     }
   });
 
-  it("rejects raw trace upload ordering and advisor auto-dispatch restoration", () => {
+  it.each([
+    ["empty payload", { channel: "daily", payload: {} }],
+    [
+      "missing text",
+      { channel: "daily", payload: { attachments: [{ color: "#76b900", blocks: [] }] } },
+    ],
+    ["non-array attachments", { channel: "daily", payload: { text: "hi", attachments: {} } }],
+    [
+      "malformed attachment",
+      { channel: "daily", payload: { text: "hi", attachments: [{ blocks: [] }] } },
+    ],
+  ])("rejects a precomputed Slack payload with %s before calling fetch", async (_label, data) => {
+    const script = workflowScript("scorecard", "Post scorecard to Slack");
+    const setFailed = vi.fn();
+    const fetchMock = vi.fn();
+    vi.stubEnv("SLACK_DATA", JSON.stringify(data));
+    vi.stubEnv("POST_TO_SLACK", "true");
+    try {
+      await new AsyncFunction("process", "core", "fetch", script)(
+        process,
+        { info: vi.fn(), setFailed },
+        fetchMock,
+      );
+      expect(setFailed).toHaveBeenCalledWith("Invalid precomputed Slack payload");
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("rejects raw trace upload ordering and unified advisor auto-dispatch", () => {
     const workflow = readE2eOperationsWorkflow();
     const cloudSteps = workflow.jobs["cloud-onboard"].steps!;
     const sanitize = cloudSteps.find(
@@ -345,7 +967,7 @@ describe("E2E operations workflow boundary", () => {
     try {
       writeFileSync(advisorPath, "permissions: write-all\njobs:\n  advisor:\n    steps: []\n");
       expect(validateE2eOperationsWorkflow(workflow, advisorPath)).toContain(
-        "E2E advisor must not hold actions: write",
+        "Unified advisor must not hold actions: write",
       );
 
       writeFileSync(
@@ -355,8 +977,8 @@ describe("E2E operations workflow boundary", () => {
       expect(validateE2eOperationsWorkflow(workflow, advisorPath)).toEqual(
         expect.arrayContaining([
           "cloud-onboard trace sanitizer must retain scripts/e2e/sanitize-trace-timing.py",
-          "E2E advisor must not hold actions: write",
-          "E2E advisor must not auto-dispatch workflows",
+          "Unified advisor must not hold actions: write",
+          "Unified advisor must not auto-dispatch workflows",
         ]),
       );
     } finally {

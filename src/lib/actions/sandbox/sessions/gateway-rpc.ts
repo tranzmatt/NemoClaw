@@ -3,8 +3,9 @@
 
 import { Buffer } from "node:buffer";
 import { captureOpenshell } from "../../../adapters/openshell/runtime";
-import { CLI_NAME } from "../../../cli/branding";
+import { CLI_NAME, getAgentBranding } from "../../../cli/branding";
 import { redactFull } from "../../../security/redact";
+import * as registry from "../../../state/registry";
 import { runSandboxAutoPairApprovalPass } from "../auto-pair-approval";
 import { buildTrustedProxyEnvSourceShell } from "../trusted-proxy-env";
 import { type GatewayCallPayload, parseGatewayCallPayload } from "./gateway-rpc-envelope";
@@ -27,7 +28,20 @@ export interface GatewayCallResult<T extends GatewayCallPayload = GatewayCallPay
 
 const SUPPORTED_GATEWAY_ADMIN_METHODS = new Set<string>(["sessions.reset", "sessions.delete"]);
 
+const OPENCLAW_AGENT_ID = "openclaw";
+
 const RETRYABLE_PAIRING_FAILURE = /scope upgrade pending|pairing required|device is not approved/i;
+
+/**
+ * Return whether the host registry assigns the sandbox to Hermes.
+ *
+ * A missing entry or agent keeps the historical OpenClaw command path. The
+ * gateway call validates that default more strictly before using OpenClaw
+ * credentials.
+ */
+export function sandboxUsesHermesAgent(sandboxName: string): boolean {
+  return registry.getSandbox(sandboxName)?.agent === "hermes";
+}
 
 // Source-boundary note for this SDK-backed admin RPC wrapper:
 // - Invalid state: `openclaw gateway call` currently acts like a sandbox-origin
@@ -123,27 +137,69 @@ process.stdout.write(JSON.stringify(result));
 process.stdout.write("\\n");
 `.trim();
 
-const GATEWAY_ADMIN_RPC_LOADER = `await import("data:text/javascript;base64," + process.argv[1]);`;
-const GATEWAY_ADMIN_RPC_SCRIPT_B64 = Buffer.from(GATEWAY_ADMIN_RPC_SCRIPT, "utf8").toString(
-  "base64",
-);
-
 export function buildGatewayAdminRpcShell(proxyEnvPath = "/tmp/nemoclaw-proxy-env.sh"): string {
   return `
 set -e
 ${buildTrustedProxyEnvSourceShell(proxyEnvPath)}
-export NEMOCLAW_GATEWAY_RPC_METHOD="$3"
-export NEMOCLAW_GATEWAY_RPC_PARAMS_B64="$4"
-exec node --input-type=module --eval "$1" "$2"
+export NEMOCLAW_GATEWAY_RPC_METHOD="$2"
+export NEMOCLAW_GATEWAY_RPC_PARAMS_B64="$3"
+exec node --input-type=module --eval "$1"
 `.trim();
 }
 
 const GATEWAY_ADMIN_RPC_SHELL = buildGatewayAdminRpcShell();
-const GATEWAY_ADMIN_RPC_SHELL_B64 = Buffer.from(GATEWAY_ADMIN_RPC_SHELL, "utf8").toString("base64");
-const GATEWAY_ADMIN_RPC_SHELL_WRAPPER = `printf '%s' '${GATEWAY_ADMIN_RPC_SHELL_B64}' | base64 -d | bash -s -- "$1" "$2" "$3" "$4"`;
 
 function isSupportedGatewayAdminMethod(method: string): method is GatewayAdminMethod {
   return SUPPORTED_GATEWAY_ADMIN_METHODS.has(method);
+}
+
+/**
+ * Resolve the agent registered for the sandbox.
+ *
+ * Trust boundary: `registry.getSandbox()` reads the host-side, user-owned
+ * `~/.nemoclaw/sandboxes.json` registry. Sandbox processes cannot reach the
+ * host filesystem to change this selection. Only an existing legacy entry
+ * whose agent field is absent or null keeps the historical OpenClaw default.
+ * A missing entry is rejected, and registry read errors propagate, because an
+ * unknown agent identity cannot authorize an OpenClaw admin RPC.
+ */
+function resolveSandboxAgent(sandboxName: string, method: GatewayAdminMethod): string {
+  const sandbox = registry.getSandbox(sandboxName);
+  if (!sandbox) {
+    console.error(
+      `  Refusing to invoke '${method}' for sandbox '${sandboxName}': it has no registry entry, so NemoClaw cannot confirm that it uses the OpenClaw agent.`,
+    );
+    process.exit(1);
+  }
+  return sandbox.agent === undefined || sandbox.agent === null ? OPENCLAW_AGENT_ID : sandbox.agent;
+}
+
+/**
+ * Report that the sandbox agent has no gateway admin RPCs and stop.
+ *
+ * These RPCs run an OpenClaw plugin-SDK script inside the sandbox against the
+ * OpenClaw gateway token. Other agents ship neither the OpenClaw binary nor
+ * that token, so the call used to surface an in-sandbox "token is required"
+ * stack trace that reads as a NemoClaw wiring gap. State the agent mismatch
+ * instead, and point Hermes users at the session commands they do have.
+ */
+function refuseUnsupportedSandboxAgent(
+  sandboxName: string,
+  agent: string,
+  method: GatewayAdminMethod,
+): never {
+  console.error(
+    `  Refusing to invoke '${method}' for sandbox '${sandboxName}': it uses the '${agent}' agent, which does not expose the OpenClaw gateway admin RPCs. These commands only support the OpenClaw agent.`,
+  );
+  if (agent === "hermes") {
+    const cliName = getAgentBranding().cli;
+    console.error(`  List Hermes sessions with: ${cliName} ${sandboxName} sessions list`);
+    console.error(
+      `  Export a Hermes session with: ${cliName} ${sandboxName} sessions export <keys...>`,
+    );
+    console.error(`  Delete a Hermes session with: ${cliName} ${sandboxName} sessions delete <id>`);
+  }
+  process.exit(1);
 }
 
 function redactedGatewayOutput(output: string): string {
@@ -172,10 +228,9 @@ function captureGatewayCall(opts: GatewayCallOptions) {
       "--",
       "bash",
       "-lc",
-      GATEWAY_ADMIN_RPC_SHELL_WRAPPER,
+      GATEWAY_ADMIN_RPC_SHELL,
       "nemoclaw-sessions-admin-rpc",
-      GATEWAY_ADMIN_RPC_LOADER,
-      GATEWAY_ADMIN_RPC_SCRIPT_B64,
+      GATEWAY_ADMIN_RPC_SCRIPT,
       opts.method,
       params,
     ],
@@ -191,6 +246,11 @@ export function callOpenclawGateway<T extends GatewayCallPayload = GatewayCallPa
       `  Refusing unsupported OpenClaw gateway admin RPC method '${opts.method}' for sandbox '${opts.sandboxName}'.`,
     );
     process.exit(1);
+  }
+
+  const agent = resolveSandboxAgent(opts.sandboxName, opts.method);
+  if (agent !== OPENCLAW_AGENT_ID) {
+    refuseUnsupportedSandboxAgent(opts.sandboxName, agent, opts.method);
   }
 
   // Drain allowlisted CLI/webchat pairing or scope-upgrade requests before

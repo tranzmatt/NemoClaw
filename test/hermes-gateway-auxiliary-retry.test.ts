@@ -29,6 +29,7 @@ describe("Hermes gateway auxiliary retry", () => {
       'hermes_tracked_role_is_current() { trace "identity:$2"; return 0; }',
       'hermes_gateway_healthy() { trace "health:$1"; return 0; }',
       'ensure_hermes_supervised_auxiliaries() { auxiliary_calls=$((auxiliary_calls + 1)); trace "auxiliary:$auxiliary_calls"; [ "$auxiliary_calls" -ge 3 ]; }',
+      "finalize_tirith_marker_retry() { trace tirith-finalize; }",
       "commit_hermes_mcp_applied_if_pending() { trace commit-applied; return 0; }",
       "refresh_hermes_supervised_child_pids() { trace refresh; }",
       'hermes_stop_tracked_role() { trace "unexpected-stop:$2"; return 1; }',
@@ -60,6 +61,7 @@ describe("Hermes gateway auxiliary retry", () => {
       "auxiliary:3",
       "identity:6001",
       "health:6001",
+      "tirith-finalize",
       "commit-applied",
       "refresh",
       "launch-count:1",
@@ -104,6 +106,12 @@ describe("Hermes gateway auxiliary retry", () => {
       "failure:1",
     ]);
     expect(result.stdout).not.toContain("unexpected-success");
+    expect(result.stderr).toContain(
+      "[gateway] Hermes auxiliary repair failed; retrying while the exact gateway remains healthy",
+    );
+    expect(result.stderr).toContain(
+      "[gateway] Hermes replacement gateway lost its listener or health endpoint during auxiliary validation; stopping the exact child",
+    );
   });
 });
 
@@ -198,6 +206,7 @@ describe("Hermes gateway relay convergence", () => {
         'hermes_stop_tracked_role() { trace "unexpected-stop:$2"; return 1; }',
         'start_socat_forwarder() { trace "unexpected-start:$*"; return 1; }',
         "hermes_dashboard_healthy() { return 0; }",
+        "ensure_dashboard_log_stream() { trace dashboard-log; }",
         "ensure_gateway_log_stream() { trace gateway-log; }",
         extractShellFunction(source, "hermes_api_socat_bridge_healthy"),
         extractShellFunction(source, "ensure_hermes_supervised_auxiliaries"),

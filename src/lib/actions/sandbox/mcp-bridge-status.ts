@@ -31,6 +31,11 @@ import {
   getSandboxAgent,
   getSandboxOrThrow,
 } from "./mcp-bridge-state";
+import { discoverMcpTools } from "./mcp-bridge-tool-discovery";
+import {
+  inspectMcpRecordedTargetPins,
+  type McpBridgeRecordedPinStatus,
+} from "./mcp-bridge-url-validation";
 import {
   assertAuthenticatedBridgeEntry,
   normalizeMcpServerUrl,
@@ -52,12 +57,15 @@ export interface McpBridgeJsonSummary {
 // from another inspected route attributed to the same adapter runtime.
 // sourceBoundary: OpenShell owns provider attachment and HTTP rewrite binding;
 // NemoClaw owns the generated least-privilege route and operator diagnostics.
-// whyNotSourceFix: v0.0.72 has no endpoint-exclusive provider attachment or
-// enforceable Host, scheme, and query binding that NemoClaw can request.
+// whyNotSourceFix: v0.0.99 injects provider placeholders at sandbox scope. Its
+// network policy enforces the generated route's host, port, path, methods, and
+// allowed IPs, but placeholder resolution has no endpoint-exclusive attachment
+// or credential-specific scheme and query binding that NemoClaw can request.
 // regressionTest: mcp-bridge-status-boundaries.test.ts pins this warning and the
 // generated policy tests pin unique keys, explicit methods, and allowed IPs.
 // removalCondition: remove only when OpenShell exposes and NemoClaw requires
-// endpoint-exclusive credential binding plus Host, scheme, and query enforcement.
+// endpoint-exclusive credential binding with credential-specific host, scheme,
+// and query enforcement.
 const SANDBOX_SCOPED_PROVIDER_WARNING =
   "OpenShell currently attaches this credential provider at sandbox scope, not exclusively to this MCP endpoint. Keep other inspected routes for the same adapter binary at least as restrictive until OpenShell supports endpoint-exclusive credential binding plus Host, scheme, and query enforcement.";
 const UNSUPPORTED_STORED_URL_WARNING =
@@ -67,7 +75,9 @@ const UNSUPPORTED_STORED_CREDENTIAL_WARNING =
 
 function storedUrlWarning(entry: McpBridgeEntry): string | undefined {
   try {
-    return normalizeMcpServerUrl(entry.url) === entry.url
+    return normalizeMcpServerUrl(entry.url, {
+      trustedPrivateHosts: entry.trustedPrivateHost ? [entry.trustedPrivateHost] : undefined,
+    }) === entry.url
       ? undefined
       : UNSUPPORTED_STORED_URL_WARNING;
   } catch {
@@ -128,6 +138,11 @@ export interface McpBridgeStatusOptions {
    * the dispatch layer enables it only where the operator asked for it.
    */
   probeCredentialResolution?: boolean;
+  /**
+   * Enumerate names advertised by one managed MCP endpoint. The dispatch
+   * layer restricts this live operation to an explicitly named server.
+   */
+  discoverTools?: boolean;
 }
 
 export async function statusMcpBridge(
@@ -168,6 +183,17 @@ export async function statusMcpBridge(
         },
         policy: { registryPresent: false, gatewayPresent: false },
         adapter: { registered: null },
+        ...(options.discoverTools
+          ? {
+              toolDiscovery: {
+                ok: false,
+                count: 0,
+                tools: [],
+                truncated: false,
+                detail: "tool discovery skipped: MCP server is not registered",
+              },
+            }
+          : {}),
       },
     ];
   }
@@ -183,6 +209,21 @@ export async function statusMcpBridge(
       `Hermes MCP runtime does not match the persisted managed intent for sandbox '${sandboxName}': ${hermesReconciliation.detail}.`,
     );
   }
+
+  const privatePinStatusByServer = new Map<string, McpBridgeRecordedPinStatus>();
+  await Promise.all(
+    entries.map(async ([name, entry]) => {
+      if (!entry?.trustedPrivateHost || !entry.allowedIps) return;
+      privatePinStatusByServer.set(
+        name,
+        await inspectMcpRecordedTargetPins(
+          new URL(entry.url),
+          entry.trustedPrivateHost,
+          entry.allowedIps,
+        ),
+      );
+    }),
+  );
 
   return entries.map(([name, entry]) => {
     const support = entry ? getPersistedBridgeSupport(entry) : getSupportSummary(agent);
@@ -221,8 +262,23 @@ export async function statusMcpBridge(
       credentialWarning = storedCredentialWarning(entry);
       if (credentialWarning) warnings.push(credentialWarning);
     }
+    const privatePinStatus = privatePinStatusByServer.get(name);
+    if (privatePinStatus?.state === "drift") {
+      warnings.push(
+        "Trusted-private DNS answers differ from the recorded pins. Remove and re-add this server to approve changed pins.",
+      );
+    } else if (privatePinStatus?.state === "unresolved") {
+      warnings.push(
+        "Trusted-private DNS resolution is unavailable. The recorded policy pins were not changed.",
+      );
+    }
     const unsafeCredentialMayBeAttached =
       !!credentialWarning && !!entry?.providerName && attached !== false;
+    const readiness = {
+      policyGatewayPresent: policyPresence,
+      providerAttached: attached,
+      providerCredentialReady,
+    };
     const credentialResolution =
       options.probeCredentialResolution && entry
         ? unsafeCredentialMayBeAttached
@@ -231,22 +287,44 @@ export async function statusMcpBridge(
               detail:
                 "probe skipped: the unsupported legacy credential may still be attached to fresh sandbox children",
             }
-          : probeCredentialResolution(sandboxName, entry, support.adapter, {
-              policyGatewayPresent: policyPresence,
-              providerAttached: attached,
-              providerCredentialReady,
-            })
+          : probeCredentialResolution(sandboxName, entry, support.adapter, readiness)
         : undefined;
     const resolutionWarning = credentialResolution
       ? credentialResolutionWarning(entry?.env[0], credentialResolution)
       : undefined;
     if (resolutionWarning) warnings.push(resolutionWarning);
+    const toolDiscovery =
+      options.discoverTools && entry
+        ? unsafeCredentialMayBeAttached
+          ? {
+              ok: false,
+              count: 0,
+              tools: [],
+              truncated: false,
+              detail:
+                "tool discovery skipped: the unsupported legacy credential may still be attached to fresh sandbox children",
+            }
+          : discoverMcpTools(sandboxName, entry, support.adapter, readiness)
+        : undefined;
     return {
       server: name,
       agent: entry?.agent ?? agent.name,
       warnings,
       support,
       ...(entry ? { url: entry.url } : {}),
+      ...(entry?.trustedPrivateHost && entry.allowedIps && privatePinStatus
+        ? {
+            trustedPrivateTarget: {
+              host: entry.trustedPrivateHost,
+              recordedPins: [...entry.allowedIps],
+              ...(privatePinStatus.currentAddresses
+                ? { currentPins: privatePinStatus.currentAddresses }
+                : {}),
+              state: privatePinStatus.state,
+              ...(privatePinStatus.detail ? { detail: privatePinStatus.detail } : {}),
+            },
+          }
+        : {}),
       ...(entry?.addState ? { addState: entry.addState } : {}),
       env: {
         names: entry?.env ?? [],
@@ -277,6 +355,7 @@ export async function statusMcpBridge(
               "Adapter inspection was skipped because the unsupported legacy credential may still be attached to fresh sandbox children.",
           }
         : getAdapterRegistration(sandboxName, support.adapter, entry, hermesReconciliation),
+      ...(toolDiscovery ? { toolDiscovery } : {}),
       ...(entry?.addedAt ? { addedAt: entry.addedAt } : {}),
       ...(entry?.updatedAt ? { updatedAt: entry.updatedAt } : {}),
     };

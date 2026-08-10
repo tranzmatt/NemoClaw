@@ -3,6 +3,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { MIN_HERMES_OLLAMA_CONTEXT_WINDOW } from "../inference/ollama-runtime-context";
 import {
   decideInstallOllamaLinuxMode,
   type InstallOllamaLinuxOptions,
@@ -26,6 +27,8 @@ function makeOpts(overrides: Partial<InstallOllamaLinuxOptions>): InstallOllamaL
     ensureManagedOllamaLoopbackSystemdOverrideImpl: vi.fn().mockReturnValue("ready"),
     fileExistsImpl: vi.fn().mockReturnValue(false),
     readFileImpl: vi.fn().mockReturnValue(""),
+    recordUserLocalOllamaOwnershipImpl: vi.fn(),
+    removeUserLocalOllamaOwnershipImpl: vi.fn(),
     log: vi.fn(),
     errorLog: vi.fn(),
     ...overrides,
@@ -145,12 +148,14 @@ describe("installOllamaOnLinux (user-local)", () => {
       .fn()
       .mockReturnValue({ status: 0, stdout: "", stderr: "", error: null });
     const runCaptureExImpl = vi.fn().mockReturnValue({ stdout: "", exitCode: 0, timedOut: false });
+    const recordOwnership = vi.fn();
     const opts = makeOpts({
       modeOverride: "user-local",
       arch: () => "arm64",
       runCaptureImpl,
       runCaptureExImpl,
       runShellImpl,
+      recordUserLocalOllamaOwnershipImpl: recordOwnership,
     });
     const result = installOllamaOnLinux(opts);
     expect(result).toEqual({
@@ -169,7 +174,28 @@ describe("installOllamaOnLinux (user-local)", () => {
     const startCall = findRunShellCall(runShellImpl, "nohup '/home/test/.local/bin/ollama'");
     expect(startCall).toBeDefined();
     expect(startCall).toContain(`OLLAMA_HOST=127.0.0.1:`);
+    expect(startCall).not.toContain("OLLAMA_CONTEXT_LENGTH=");
     expect(startCall).toContain(" serve ");
+    expect(recordOwnership).toHaveBeenCalledWith("/home/test/.local/bin/ollama", {
+      homeDir: "/home/test",
+    });
+  });
+
+  it("starts user-local Ollama with the requested Hermes context floor", () => {
+    const runShellImpl = vi
+      .fn()
+      .mockReturnValue({ status: 0, stdout: "", stderr: "", error: null });
+    const opts = makeOpts({
+      modeOverride: "user-local",
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+      runShellImpl,
+    });
+    const result = installOllamaOnLinux(opts);
+    expect(result.ok).toBe(true);
+    const startCall = findRunShellCall(runShellImpl, "nohup");
+    expect(startCall).toBeDefined();
+    expect(startCall).toContain(`OLLAMA_CONTEXT_LENGTH=${MIN_HERMES_OLLAMA_CONTEXT_WINDOW}`);
   });
 
   it("uses the amd64 tarball on x64 hosts", () => {
@@ -319,6 +345,21 @@ describe("installOllamaOnLinux (user-local)", () => {
       else process.env.PATH = originalPath;
     }
   });
+
+  it("reports failure when user-local ownership cannot be recorded (#8502)", () => {
+    const errorLog = vi.fn();
+    const opts = makeOpts({
+      modeOverride: "user-local",
+      runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+      recordUserLocalOllamaOwnershipImpl: () => {
+        throw new Error("receipt write denied");
+      },
+      errorLog,
+    });
+
+    expect(installOllamaOnLinux(opts).ok).toBe(false);
+    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("receipt write denied"));
+  });
 });
 
 describe("installOllamaOnLinux (system)", () => {
@@ -338,11 +379,13 @@ describe("installOllamaOnLinux (system)", () => {
       .fn()
       .mockReturnValue({ status: 0, stdout: "", stderr: "", error: null });
     const ensureOverride = vi.fn().mockReturnValue("ready");
+    const removeOwnership = vi.fn();
     const opts = makeOpts({
       modeOverride: "system",
       runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
       runShellImpl,
       ensureManagedOllamaLoopbackSystemdOverrideImpl: ensureOverride,
+      removeUserLocalOllamaOwnershipImpl: removeOwnership,
     });
     const result = installOllamaOnLinux(opts);
     expect(result).toEqual({ ok: true, mode: "system", binPath: "/usr/local/bin/ollama" });
@@ -350,6 +393,23 @@ describe("installOllamaOnLinux (system)", () => {
     expect(installCall).toBeDefined();
     expect(installCall).toContain("curl -fsSL");
     expect(ensureOverride).toHaveBeenCalled();
+    expect(removeOwnership).toHaveBeenCalledWith({ homeDir: "/home/test" });
+  });
+
+  it("passes the requested Hermes context floor to the systemd override", () => {
+    const ensureOverride = vi.fn().mockReturnValue("ready");
+    const opts = makeOpts({
+      modeOverride: "system",
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+      runCaptureImpl: vi.fn().mockReturnValue("/usr/bin/zstd"),
+      ensureManagedOllamaLoopbackSystemdOverrideImpl: ensureOverride,
+    });
+    const result = installOllamaOnLinux(opts);
+    expect(result.ok).toBe(true);
+    expect(ensureOverride).toHaveBeenCalledWith({
+      isNonInteractive: opts.isNonInteractive,
+      contextWindowFloor: MIN_HERMES_OLLAMA_CONTEXT_WINDOW,
+    });
   });
 
   it("returns ok:false when the systemd override fails to recover", () => {

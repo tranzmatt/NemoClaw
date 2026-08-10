@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { WebSearchConfig } from "../../inference/web-search";
+import type { InferenceEndpointSource } from "../../inference/selection";
 import type { Session } from "../../state/onboard-session";
 import type { OnboardStateHandlerResult } from "./runner";
 
@@ -17,11 +18,14 @@ export interface OnboardFlowContext<Agent = unknown, Gpu = unknown, SandboxGpuCo
   model: string | null;
   provider: string | null;
   endpointUrl: string | null;
+  endpointSource?: InferenceEndpointSource | null;
+  onboardEndpointUrl?: string | null;
   credentialEnv: string | null;
   hermesAuthMethod: Session["hermesAuthMethod"];
   hermesToolGateways: string[];
   preferredInferenceApi: string | null;
   compatibleEndpointReasoning: string | null;
+  compatibleEndpointReasoningEffort: string | null;
   nimContainer: string | null;
   webSearchConfig: WebSearchConfig | null;
   webSearchConfigChanged?: boolean;
@@ -63,11 +67,14 @@ export interface ProviderModelSelectedContextUpdate {
   model: string;
   provider: string;
   endpointUrl: string | null;
+  endpointSource?: InferenceEndpointSource | null;
+  onboardEndpointUrl?: string | null;
   credentialEnv: string | null;
   hermesAuthMethod: Session["hermesAuthMethod"];
   hermesToolGateways: string[];
   preferredInferenceApi: string | null;
   compatibleEndpointReasoning: string | null;
+  compatibleEndpointReasoningEffort: string | null;
   nimContainer: string | null;
   webSearchConfig: WebSearchConfig | null;
 }

@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { Buffer } from "node:buffer";
-import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,12 +18,14 @@ import {
   type TrustedSandboxShellScript,
   trustedProviderEndpoint,
   trustedSandboxShellScript,
+  validateSandboxName,
 } from "../fixtures/clients/index.ts";
 import type {
   ShellProbeResult,
   ShellProbeRunOptions,
   TrustedShellCommand,
 } from "../fixtures/shell-probe.ts";
+import { sandboxShWithArgs } from "../live/phase6-messaging-helpers.ts";
 
 interface RunnerCall {
   command: string;
@@ -76,6 +76,23 @@ class FakeRunner implements CommandRunner {
 }
 
 describe("E2E fixture clients", () => {
+  it("enforces the OpenShell 0.0.99 sandbox identity boundary (#8497)", () => {
+    expect(() => validateSandboxName("a234567890123456789")).not.toThrow();
+
+    for (const invalidName of [
+      "a2345678901234567890",
+      "e2e--sandbox",
+      "1e2e-sandbox",
+      "E2e-sandbox",
+      "e2e.sandbox",
+      "e2e_sandbox",
+    ]) {
+      expect(() => validateSandboxName(invalidName), invalidName).toThrow(
+        /sandbox name is invalid for fixture client/,
+      );
+    }
+  });
+
   it("host client runs the configured NemoClaw CLI", async () => {
     const runner = new FakeRunner();
     runner.stdout = "nemoclaw 0.1.0\n";
@@ -95,6 +112,40 @@ describe("E2E fixture clients", () => {
         },
       },
     ]);
+  });
+
+  it.each([
+    { exitCode: 0, expected: true, label: "available" },
+    { exitCode: 1, expected: false, label: "missing" },
+  ])("host client reports a command as $label", async ({ exitCode, expected }) => {
+    const runner = new FakeRunner();
+    runner.enqueue({ exitCode });
+    const host = new HostCliClient(runner, { cliPath: "nemoclaw" });
+    const options = {
+      artifactName: "cleanup-command-probe",
+      env: { PATH: "/test/bin" },
+      redactionValues: ["cleanup-secret"],
+      timeoutMs: 123_000,
+    };
+
+    await expect(host.isCommandAvailable("openshell", options)).resolves.toBe(expected);
+    expect(runner.calls).toEqual([
+      {
+        command: "bash",
+        args: ["-lc", 'command -v "$1" >/dev/null 2>&1', "command-availability-probe", "openshell"],
+        options,
+      },
+    ]);
+  });
+
+  it("host client surfaces an unexpected command availability failure", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue({ exitCode: 2, stderr: "shell probe failed" });
+    const host = new HostCliClient(runner, { cliPath: "nemoclaw" });
+
+    await expect(host.isCommandAvailable("openshell")).rejects.toThrow(
+      "probe command availability for openshell failed: shell probe failed",
+    );
   });
 
   it("host client validates list/status and cleans up sandbox destroys", async () => {
@@ -183,6 +234,34 @@ describe("E2E fixture clients", () => {
     ]);
   });
 
+  it.each([
+    "No active forward",
+    "forward 18789 not found",
+    "forward stop failed: not running",
+  ])("host client accepts canonical already-absent forward output: %s", async (stderr) => {
+    const runner = new FakeRunner();
+    runner.enqueue({ exitCode: 1, stderr });
+    const host = new HostCliClient(runner, { cliPath: "nemoclaw" });
+
+    await host.cleanupForward(18789);
+
+    expect(runner.calls.map((call) => call.args)).toEqual([["forward", "stop", "18789"]]);
+  });
+
+  it.each([
+    "permission denied",
+    "daemon not running",
+    "some unrelated error: not running",
+  ])("host client surfaces unexpected forward cleanup failure: %s", async (stderr) => {
+    const runner = new FakeRunner();
+    runner.enqueue({ exitCode: 1, stderr });
+    const host = new HostCliClient(runner, { cliPath: "nemoclaw" });
+
+    await expect(host.cleanupForward(18789)).rejects.toThrow(
+      `cleanup forward 18789 failed: ${stderr}`,
+    );
+  });
+
   it("host client does not hide a current gateway remove failure behind the legacy verb", async () => {
     const runner = new FakeRunner();
     runner.enqueue({ exitCode: 1, stderr: "permission denied" });
@@ -203,6 +282,51 @@ describe("E2E fixture clients", () => {
     await expect(host.cleanupGatewayRegistration("nemoclaw")).rejects.toThrow(
       "cleanup gateway registration nemoclaw failed: permission denied",
     );
+  });
+
+  it("host cleanup resources preserve caller probe options and gateway artifact suffixes", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue({ exitCode: 0 });
+    runner.enqueue({ exitCode: 2, stderr: "unrecognized subcommand 'remove'" });
+    runner.enqueue({ exitCode: 0 });
+    runner.enqueue({ exitCode: 0 });
+    const host = new HostCliClient(runner, {
+      cliPath: "nemoclaw",
+      openshellPath: "/opt/openshell/bin/openshell",
+    });
+    const options = {
+      artifactName: "resource-cleanup",
+      env: { OPENSHELL_GATEWAY: "nemoclaw-18080" },
+      redactionValues: ["cleanup-secret"],
+      timeoutMs: 123_000,
+    };
+
+    await host.cleanupSandbox("assistant", options);
+    await host.cleanupGatewayRegistration("nemoclaw-18080", options);
+    await host.cleanupForward(18789, options);
+
+    expect(runner.calls).toEqual([
+      {
+        command: "nemoclaw",
+        args: ["assistant", "destroy", "--yes"],
+        options,
+      },
+      {
+        command: "/opt/openshell/bin/openshell",
+        args: ["gateway", "remove", "nemoclaw-18080"],
+        options: { ...options, artifactName: "resource-cleanup-remove" },
+      },
+      {
+        command: "/opt/openshell/bin/openshell",
+        args: ["gateway", "destroy", "-g", "nemoclaw-18080"],
+        options: { ...options, artifactName: "resource-cleanup-legacy-destroy" },
+      },
+      {
+        command: "/opt/openshell/bin/openshell",
+        args: ["forward", "stop", "18789"],
+        options,
+      },
+    ]);
   });
 
   it("host client propagates cwd, env, and timeout options", async () => {
@@ -313,6 +437,49 @@ describe("E2E fixture clients", () => {
     });
   });
 
+  it("sandbox client removes an OpenShell sandbox with caller cleanup options", async () => {
+    const runner = new FakeRunner();
+    const sandbox = new SandboxClient(runner);
+    const options = {
+      artifactName: "cleanup-partial-sandbox",
+      env: { OPENSHELL_GATEWAY: "nemoclaw-18080" },
+      redactionValues: ["secret-cleanup-value"],
+      timeoutMs: 60_000,
+    };
+
+    await sandbox.cleanupSandbox("assistant", options);
+
+    expect(runner.calls).toEqual([
+      {
+        command: "openshell",
+        args: ["sandbox", "delete", "assistant"],
+        options,
+      },
+    ]);
+  });
+
+  it.each([
+    "NotFound: sandbox assistant",
+    "sandbox assistant not present",
+    "no such sandbox: assistant",
+  ])("sandbox client accepts canonical already-absent cleanup output: %s", async (stderr) => {
+    const runner = new FakeRunner();
+    runner.enqueue({ exitCode: 1, stderr });
+    const sandbox = new SandboxClient(runner);
+
+    await expect(sandbox.cleanupSandbox("assistant")).resolves.toBeUndefined();
+  });
+
+  it("sandbox client surfaces unexpected cleanup failures", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue({ exitCode: 1, stderr: "permission denied" });
+    const sandbox = new SandboxClient(runner);
+
+    await expect(sandbox.cleanupSandbox("assistant")).rejects.toThrow(
+      "cleanup OpenShell sandbox assistant failed: permission denied",
+    );
+  });
+
   it("sandbox client validates list output using the OpenShell gateway env", async () => {
     const runner = new FakeRunner();
     runner.stdout = "NAME\nassistant\n";
@@ -377,11 +544,10 @@ describe("E2E fixture clients", () => {
     ]);
   });
 
-  it("sandbox client wraps shell scripts with the named sandbox exec form", async () => {
+  it("sandbox client passes trusted shell scripts through the named sandbox exec form", async () => {
     const runner = new FakeRunner();
     const sandbox = new SandboxClient(runner, { openshellPath: "openshell" });
     const script = trustedSandboxShellScript("echo ready");
-    const encodedScript = Buffer.from(script, "utf8").toString("base64");
 
     expectTypeOf<
       Parameters<SandboxClient["execShell"]>[1]
@@ -394,20 +560,7 @@ describe("E2E fixture clients", () => {
 
     expect(runner.calls[0]).toEqual({
       command: "openshell",
-      args: [
-        "sandbox",
-        "exec",
-        "-n",
-        "assistant",
-        "--",
-        "sh",
-        "-lc",
-        [
-          "command -v base64 >/dev/null 2>&1 || { echo NEMOCLAW_BASE64_MISSING >&2; exit 127; }",
-          `_NEMOCLAW_E2E_SCRIPT="$(printf '%s' '${encodedScript}' | base64 -d)" || exit $?`,
-          `eval "$_NEMOCLAW_E2E_SCRIPT"`,
-        ].join("; "),
-      ],
+      args: ["sandbox", "exec", "-n", "assistant", "--", "sh", "-lc", script],
       options: {
         artifactName: "custom-exec-shell",
         timeoutMs: 123,
@@ -415,7 +568,7 @@ describe("E2E fixture clients", () => {
     });
   });
 
-  it("sandbox client keeps multiline shell scripts out of OpenShell argv", async () => {
+  it("sandbox client preserves multiline shell bytes in one OpenShell argv element", async () => {
     const runner = new FakeRunner();
     const sandbox = new SandboxClient(runner, { openshellPath: "openshell" });
     const script = trustedSandboxShellScript("set -eu\nprintf '%s\\n' ready\r\n");
@@ -423,25 +576,53 @@ describe("E2E fixture clients", () => {
     await sandbox.execShell("assistant", script);
 
     const payload = runner.calls[0]?.args.at(-1) ?? "";
-    expect(payload).not.toMatch(/[\r\n]/);
-    const encodedScript = payload.match(/'([A-Za-z0-9+/=]+)'/)?.[1] ?? "";
-    expect(Buffer.from(encodedScript, "base64").toString("utf8")).toBe(script);
+    expect(payload).toBe(script);
+    expect(payload).toContain("\n");
+    expect(payload).toContain("\r\n");
   });
 
-  it("sandbox client fails closed when the sandbox has no base64 decoder", async () => {
+  it("sandbox client does not add an eval or decoder transport", async () => {
     const runner = new FakeRunner();
     const sandbox = new SandboxClient(runner, { openshellPath: "openshell" });
 
-    await sandbox.execShell("assistant", trustedSandboxShellScript("echo should-not-run"));
+    const script = trustedSandboxShellScript("echo should-run-directly");
+    await sandbox.execShell("assistant", script);
 
     const payload = runner.calls[0]?.args.at(-1) ?? "";
-    const result = spawnSync("/bin/sh", ["-c", payload], {
-      encoding: "utf8",
-      env: { PATH: "" },
+    expect(payload).toBe(script);
+    expect(payload).not.toContain("base64");
+    expect(payload).not.toContain("eval");
+  });
+
+  it("phase-six shell helpers preserve multiline source and positional arguments", async () => {
+    const runner = new FakeRunner();
+    const sandbox = new SandboxClient(runner, { openshellPath: "openshell" });
+    const script = "set -eu\nprintf '%s\\n' \"$1\"";
+    const argument = "line one\r\nline two";
+
+    await sandboxShWithArgs(sandbox, "assistant", script, [argument], {
+      artifactName: "phase-six-native-argv",
+      redactionValues: ["sensitive-marker"],
+      timeoutMs: 321,
     });
-    expect(result.status).toBe(127);
-    expect(result.stderr).toContain("NEMOCLAW_BASE64_MISSING");
-    expect(result.stdout).not.toContain("should-not-run");
+
+    expect(runner.calls[0]?.args).toEqual([
+      "sandbox",
+      "exec",
+      "-n",
+      "assistant",
+      "--",
+      "sh",
+      "-c",
+      script,
+      "nemoclaw-e2e-script",
+      argument,
+    ]);
+    expect(runner.calls[0]?.options).toMatchObject({
+      artifactName: "phase-six-native-argv",
+      redactionValues: ["sensitive-marker"],
+      timeoutMs: 321,
+    });
   });
 
   it("sandbox client requires trusted non-empty shell scripts", () => {

@@ -55,14 +55,6 @@ const broken = (detail = "BROKEN 503"): SandboxInferenceRouteProbe => ({
   detail,
 });
 
-const inconclusive = (
-  detail = "openshell sandbox exec exited with status 7",
-): SandboxInferenceRouteProbe => ({
-  healthy: false,
-  broken: false,
-  detail,
-});
-
 function sandbox(overrides: Partial<SandboxEntry> = {}): SandboxEntry {
   return {
     name: "demo",
@@ -113,35 +105,34 @@ function makeRepairDeps(
 }
 
 describe("sandbox connect route repair unit flow", () => {
-  it("skips work when route repair is disabled", () => {
-    const { calls, deps } = makeRepairDeps([], {
+  it("still probes and fails closed when route repair is disabled (#8502)", () => {
+    const { calls, deps } = makeRepairDeps([broken()], {
       isRepairDisabled: () => true,
     });
 
     const result = repairSandboxInferenceRouteWithDeps("demo", sandbox(), {}, deps);
 
     expect(result).toEqual({
-      healthy: true,
+      healthy: false,
       repairAttempted: false,
-      detail: "route repair disabled",
+      detail: "route repair disabled; BROKEN 503",
     });
-    expect(calls.probeOptions).toEqual([]);
+    expect(calls.probeOptions).toEqual([undefined]);
+    expect(calls.legacyRepairs).toEqual([]);
   });
 
-  it("does not repair healthy or inconclusive initial probes", () => {
-    for (const firstProbe of [healthy(), inconclusive()]) {
-      const { calls, deps } = makeRepairDeps([firstProbe]);
+  it("does not repair a healthy initial probe", () => {
+    const { calls, deps } = makeRepairDeps([healthy()]);
 
-      const result = repairSandboxInferenceRouteWithDeps("demo", sandbox(), {}, deps);
+    const result = repairSandboxInferenceRouteWithDeps("demo", sandbox(), {}, deps);
 
-      expect(result).toEqual({
-        healthy: true,
-        repairAttempted: false,
-        detail: firstProbe.detail,
-      });
-      expect(calls.legacyRepairs).toEqual([]);
-      expect(calls.reapplications).toEqual([]);
-    }
+    expect(result).toEqual({
+      healthy: true,
+      repairAttempted: false,
+      detail: "OK 200",
+    });
+    expect(calls.legacyRepairs).toEqual([]);
+    expect(calls.reapplications).toEqual([]);
   });
 
   it("repairs legacy kubernetes routes through the DNS proxy path", () => {

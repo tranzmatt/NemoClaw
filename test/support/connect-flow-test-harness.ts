@@ -5,8 +5,9 @@ import childProcess from "node:child_process";
 import { createRequire } from "node:module";
 
 import { type MockInstance, vi } from "vitest";
-
+import type { ManagedGatewayControlCompletion } from "../../src/lib/actions/sandbox/gateway-restart";
 import type { SecretBoundaryRefusalReason } from "../../src/lib/actions/sandbox/hermes-secret-boundary-recovery";
+import type { ConfigObject } from "../../src/lib/security/credential-filter";
 import type { SandboxEntry } from "../../src/lib/state/registry";
 
 type ConnectSandbox = typeof import("../../src/lib/actions/sandbox/connect")["connectSandbox"];
@@ -27,30 +28,42 @@ export type ConnectHarness = {
   checkAndRecoverSpy: MockInstance;
   connectSandbox: ConnectSandbox;
   ensureOllamaAuthProxySpy: MockInstance;
+  findReachableOllamaHostSpy: MockInstance;
   ensureLiveSandboxSpy: MockInstance;
   errorSpy: MockInstance;
   logSpy: MockInstance;
   preflightVllmSpy: MockInstance;
+  probeLocalProviderHealthSpy: MockInstance;
+  probeOllamaAuthProxyHealthSpy: MockInstance;
+  readSandboxConfigSpy: MockInstance;
+  recoverPortableDemoLifecycleSpy: MockInstance;
   registryEntries: SandboxEntry[];
+  resolveAgentConfigSpy: MockInstance;
   runAutoPairSpy: MockInstance;
   runOpenshellSpy: MockInstance;
   runSetupDnsProxySpy: MockInstance;
   spawnSyncSpy: MockInstance;
   withGatewayRouteMutationLockSpy: MockInstance;
+  writeSandboxConfigSpy: MockInstance;
 };
 
 export type ConnectHarnessOptions = {
   agentName?: string;
   inferenceGetOutput?: string;
-  inferenceProbeResponses?: string[];
+  inferenceProbeResponses?: Array<
+    string | { status?: number | null; output?: string | null; stderr?: string | null }
+  >;
+  hermesConfig?: ConfigObject;
   registryEntry?: Partial<SandboxEntry>;
   registryEntries?: Array<Partial<SandboxEntry> & Pick<SandboxEntry, "name">>;
   sessionAgent?: unknown;
   listOutput?: string;
+  listOutputs?: string[];
   processCheck?: {
     checked: boolean;
     wasRunning?: boolean;
     recovered?: boolean;
+    managedControlCompletion?: ManagedGatewayControlCompletion;
     forwardRecovered?: boolean;
     forwardRecoveryFailed?: boolean;
     forwardRecoveryFailureDetail?: string;
@@ -59,6 +72,7 @@ export type ConnectHarnessOptions = {
     mcpReconciliationRefused?: boolean;
     mcpReconciliationReason?: string;
   };
+  portableRecoveryResult?: { kind: "not-installed" | "already-running" | "recovered" };
   spawnSignal?: NodeJS.Signals | null;
   spawnStatus?: number | null;
   sttyThrows?: boolean;
@@ -103,11 +117,13 @@ export function createConnectHarness(options: ConnectHarnessOptions = {}): Conne
   const gatewayFailureClassifier = requireDist(
     "../../src/lib/actions/sandbox/gateway-failure-classifier.js",
   );
+  const localInference = requireDist("../../src/lib/inference/local.js");
   const ollamaProxy = requireDist("../../src/lib/inference/ollama/proxy.js");
   const gatewayRouteMutationLock = requireDist(
     "../../src/lib/inference/gateway-route-mutation-lock.js",
   );
   const sandboxVersion = requireDist("../../src/lib/sandbox/version.js");
+  const sandboxConfig = requireDist("../../src/lib/sandbox/config.js");
   const registry = requireDist("../../src/lib/state/registry.js");
   const sandboxSession = requireDist("../../src/lib/state/sandbox-session.js");
   const vmDnsMonkeypatch = requireDist("../../src/lib/actions/sandbox/vm-dns-monkeypatch.js");
@@ -121,12 +137,19 @@ export function createConnectHarness(options: ConnectHarnessOptions = {}): Conne
   });
   vi.spyOn(gatewayFailureClassifier, "isDockerRuntimeDown").mockReturnValue(false);
   const inferenceProbeResponses = [...(options.inferenceProbeResponses ?? [])];
+  const listOutputs = [...(options.listOutputs ?? [])];
   const captureOpenshellSpy = vi
     .spyOn(runtime, "captureOpenshell")
     .mockImplementation((args: unknown) => {
       const argv = Array.isArray(args) ? args : [];
       if (argv[0] === "sandbox" && argv[1] === "list") {
-        return { status: 0, output: options.listOutput ?? "alpha Ready" };
+        return {
+          status: 0,
+          output:
+            listOutputs.shift() ??
+            options.listOutput ??
+            `${options.registryEntry?.name ?? "alpha"} Ready`,
+        };
       }
       if (argv[0] === "inference" && argv[1] === "get") {
         return {
@@ -139,7 +162,8 @@ export function createConnectHarness(options: ConnectHarnessOptions = {}): Conne
         argv[1] === "exec" &&
         argv.join(" ").includes("inference.local/v1/models")
       ) {
-        return { status: 0, output: inferenceProbeResponses.shift() ?? "OK 200" };
+        const response = inferenceProbeResponses.shift() ?? "OK 200";
+        return typeof response === "string" ? { status: 0, output: response } : response;
       }
       return { status: 0, output: "" };
     });
@@ -166,9 +190,21 @@ export function createConnectHarness(options: ConnectHarnessOptions = {}): Conne
   const checkAndRecoverSpy = vi
     .spyOn(processRecovery, "checkAndRecoverSandboxProcesses")
     .mockReturnValue(options.processCheck ?? { checked: true, wasRunning: true, recovered: false });
+  const recoverPortableDemoLifecycleSpy = vi
+    .spyOn(gatewayState, "recoverPortableDemoSandboxLifecycleForConnect")
+    .mockReturnValue(options.portableRecoveryResult ?? { kind: "not-installed" });
   const ensureOllamaAuthProxySpy = vi
     .spyOn(ollamaProxy, "ensureOllamaAuthProxy")
     .mockImplementation(() => undefined);
+  const findReachableOllamaHostSpy = vi
+    .spyOn(localInference, "findReachableOllamaHost")
+    .mockReturnValue("127.0.0.1");
+  const probeLocalProviderHealthSpy = vi
+    .spyOn(localInference, "probeLocalProviderHealth")
+    .mockReturnValue({ ok: true });
+  const probeOllamaAuthProxyHealthSpy = vi
+    .spyOn(ollamaProxy, "probeOllamaAuthProxyHealth")
+    .mockReturnValue({ ok: true });
   const primaryRegistryEntry: SandboxEntry = {
     name: "alpha",
     agent: options.agentName ?? "openclaw",
@@ -199,13 +235,34 @@ export function createConnectHarness(options: ConnectHarnessOptions = {}): Conne
     sandboxes: registryEntries,
     defaultSandbox: primaryRegistryEntry.name,
   });
+  const hermesConfigTarget = {
+    agentName: "hermes",
+    configPath: "/sandbox/.hermes/config.yaml",
+    configDir: "/sandbox/.hermes",
+    format: "yaml",
+    configFile: "config.yaml",
+    sensitiveFiles: ["/sandbox/.hermes/.config-hash", "/sandbox/.hermes/.env"],
+    stateLockPlanInImage: true,
+  };
+  const resolveAgentConfigSpy = vi
+    .spyOn(sandboxConfig, "resolveAgentConfig")
+    .mockImplementation((name: unknown) => {
+      const entry = registryEntries.find((candidate) => candidate.name === String(name));
+      return entry?.agent === "hermes" ? hermesConfigTarget : sandboxConfig.DEFAULT_AGENT_CONFIG;
+    });
+  const readSandboxConfigSpy = vi
+    .spyOn(sandboxConfig, "readSandboxConfig")
+    .mockReturnValue(options.hermesConfig ?? {});
+  const writeSandboxConfigSpy = vi
+    .spyOn(sandboxConfig, "writeSandboxConfig")
+    .mockImplementation(() => undefined);
   vi.spyOn(agentRuntime, "getSessionAgent").mockReturnValue(
     (options.sessionAgent ?? { name: "openclaw" }) as never,
   );
   vi.spyOn(agentRuntime, "getAgentDisplayName").mockReturnValue("OpenClaw");
   const runAutoPairSpy = vi
-    .spyOn(autoPairApproval, "runSandboxAutoPairApprovalPass")
-    .mockReturnValue({ reported: 0, approved: 0 });
+    .spyOn(autoPairApproval, "runConnectAutoPairApprovalPass")
+    .mockImplementation(() => undefined);
 
   logSpy.mockClear();
   errorSpy.mockClear();
@@ -217,15 +274,22 @@ export function createConnectHarness(options: ConnectHarnessOptions = {}): Conne
     checkAndRecoverSpy,
     connectSandbox: requireDist(connectModulePath).connectSandbox,
     ensureOllamaAuthProxySpy,
+    findReachableOllamaHostSpy,
     ensureLiveSandboxSpy,
     errorSpy,
     logSpy,
     preflightVllmSpy,
+    probeLocalProviderHealthSpy,
+    probeOllamaAuthProxyHealthSpy,
+    readSandboxConfigSpy,
+    recoverPortableDemoLifecycleSpy,
     registryEntries,
+    resolveAgentConfigSpy,
     runAutoPairSpy,
     runOpenshellSpy,
     runSetupDnsProxySpy,
     spawnSyncSpy,
     withGatewayRouteMutationLockSpy,
+    writeSandboxConfigSpy,
   };
 }

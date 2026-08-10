@@ -11,15 +11,24 @@ import {
   type UpgradeSandboxesOptions,
 } from "../domain/lifecycle/options";
 import {
+  classifyOrphanedRegistrySandboxes,
+  orphanedRegistryRemediation,
+  orphanedRegistrySummary,
+} from "../domain/maintenance/orphan-detection";
+import {
   classifyUpgradeableSandboxes,
+  describeStaleUpgrade,
   shouldSkipUpgradeConfirmation,
   splitRebuildableSandboxes,
-  type UpgradeSandboxCandidate,
 } from "../domain/maintenance/upgrade";
 import { resolveGatewayName, resolveSandboxGatewayName } from "../onboard/gateway-binding";
-import { captureSandboxListWithGatewayPreflightOrExit } from "../openshell-sandbox-list";
+import {
+  captureNamedGatewaySandboxListReadOnly,
+  captureSandboxListWithGatewayPreflightOrExit,
+} from "../openshell-sandbox-list";
 import { parseLiveSandboxEntries, parseReadySandboxNames } from "../runtime-recovery";
 import * as sandboxVersion from "../sandbox/version";
+import { diagnosticPreview, isValidName, NAME_ALLOWED_FORMAT } from "../sandbox-name-contract";
 import * as registry from "../state/registry";
 import * as sandboxState from "../state/sandbox";
 
@@ -69,24 +78,11 @@ function resolveCurrentNemoclawVersion(): string | null {
   }
 }
 
-/**
- * Build a human-readable description of why a sandbox needs rebuilding, covering
- * an outdated agent version, NemoClaw image/build drift, or both (#5026).
- */
-function describeStaleUpgrade(s: UpgradeSandboxCandidate): string {
-  const reasons = s.reasons ?? [];
-  const parts: string[] = [];
-  if (reasons.includes("agent-version")) {
-    parts.push(`v${s.current || "?"} → v${s.expected}`);
-  } else if (reasons.includes("image-drift") && s.current) {
-    // Agent version is current; make clear it is the NemoClaw image that drifted.
-    parts.push(`v${s.current} unchanged`);
-  }
-  if (reasons.includes("image-drift")) {
-    const from = s.imageCurrent ? `v${s.imageCurrent}` : "unknown build";
-    parts.push(`NemoClaw image ${from} → v${s.imageExpected}`);
-  }
-  return parts.join("; ");
+// Rendering over domain/maintenance/orphan-detection.ts (#6520).
+function printOrphanedRegistrySandboxes(orphans: registry.SandboxEntry[]): void {
+  if (orphans.length === 0) return;
+  console.log(`  ${YW}${orphanedRegistrySummary(orphans.map((sandbox) => sandbox.name))}${R}`);
+  console.log(`  ${D}${orphanedRegistryRemediation(CLI_NAME)}${R}`);
 }
 
 type PreparedBackupRecovery = {
@@ -157,12 +153,13 @@ function confirmedLegacyManagedRecoveryNames(): Set<string> {
   }
 }
 
-// Under installer restore intent, a registry sandbox the selected gateway does
-// not report Ready/Running is eligible for prepared-backup recovery only when
-// its persisted binding resolves to that selected gateway, whether the gateway
-// observes it in a non-Ready phase or it is absent. Observation alone is
-// insufficient: a sandbox bound to a different recorded gateway may be Ready
-// there, so recovering it would clobber a healthy sandbox.
+// Under installer restore intent, a registry sandbox is eligible for prepared-
+// backup recovery only when its persisted binding resolves to the selected
+// gateway. Ready/Running sandboxes are eligible only when upgrade classification
+// also proves them stale; non-Ready or absent sandboxes remain eligible because
+// the replaced gateway may expose legacy state optimistically or not at all.
+// Observation alone is insufficient: a sandbox bound to a different recorded
+// gateway may be Ready there, so recovering it would clobber a healthy sandbox.
 // resolveSandboxGatewayName throws on an invalid persisted
 // binding — report that fixed, sanitized condition and treat it as ineligible so
 // a corrupted registry row never drives a recreate. Remove this guard only when
@@ -170,9 +167,10 @@ function confirmedLegacyManagedRecoveryNames(): Set<string> {
 function isPreparedRecoveryCandidate(
   sandbox: registry.SandboxEntry,
   liveNames: Set<string>,
+  staleLiveNames: Set<string>,
   selectedGatewayName: string,
 ): boolean {
-  if (liveNames.has(sandbox.name)) return false;
+  if (liveNames.has(sandbox.name) && !staleLiveNames.has(sandbox.name)) return false;
   try {
     return resolveSandboxGatewayName(sandbox) === selectedGatewayName;
   } catch {
@@ -191,24 +189,68 @@ function isPreparedRecoveryCandidate(
 // the second read is dropped rather than rebuilt from a possibly stale backup.
 // A non-Ready phase on the second read remains eligible because prepared-backup
 // restore intent explicitly targets sandboxes stuck in those phases.
-// Any confirmation preflight or listing failure deliberately aborts the whole
-// command, even when other candidates were already observed. Continuing after
-// target-gateway evidence becomes unavailable could mix stale and current state
-// in one destructive recovery run, so uncorroborated absence always fails closed.
+// In the mutating path, a confirmation preflight or listing failure aborts the
+// command. Continuing after target-gateway evidence becomes unavailable could
+// mix stale and current state in one destructive recovery run. Check mode uses
+// the non-mutating list path and reports an unreachable sandbox as unobserved.
 async function confirmAbsentRecoveryCandidates(
   absentCandidates: registry.SandboxEntry[],
   selectedGatewayName: string,
+  checkOnly = false,
 ): Promise<registry.SandboxEntry[]> {
   if (absentCandidates.length === 0) return absentCandidates;
-  const confirmation = await captureSandboxListWithGatewayPreflightOrExit(
-    {
-      action: "confirming sandboxes absent from the selected gateway",
-      command: `${CLI_NAME} upgrade-sandboxes`,
-    },
-    { gatewayName: selectedGatewayName },
-  );
+  const context = {
+    action: "confirming sandboxes absent from the selected gateway",
+    command: `${CLI_NAME} upgrade-sandboxes`,
+  };
+  // #7279: a read-only check must never recover/select the gateway.
+  const confirmation = checkOnly
+    ? captureNamedGatewaySandboxListReadOnly(context, selectedGatewayName)
+    : await captureSandboxListWithGatewayPreflightOrExit(context, {
+        gatewayName: selectedGatewayName,
+      });
   const confirmedLiveNames = parseReadySandboxNames(confirmation.output || "");
   return absentCandidates.filter((sandbox) => !confirmedLiveNames.has(sandbox.name));
+}
+
+/**
+ * Choose the gateway `upgrade-sandboxes --check` observes. A read-only check
+ * must target where the registered sandboxes actually live, not the ambient
+ * NEMOCLAW_GATEWAY_PORT default: onboarding under a non-default port records the
+ * sandbox under e.g. `nemoclaw-18080`, and pinning to the default `nemoclaw`
+ * both misreports it and (before #7279) started/selected the wrong gateway.
+ * A single recorded gateway is the unambiguous target; with several distinct
+ * ones (or none), keep the ambient default so multi-gateway behavior is
+ * unchanged — the read-only query still avoids any mutation either way.
+ */
+function resolveCheckGatewayName(
+  sandboxes: readonly registry.SandboxEntry[],
+  fallbackGatewayName: string,
+): string {
+  const recorded = new Set<string>();
+  for (const sandbox of sandboxes) {
+    try {
+      recorded.add(resolveSandboxGatewayName(sandbox));
+    } catch {
+      console.warn(
+        `  Warning: sandbox ${JSON.stringify(sandbox.name)} has an invalid persisted gateway binding; excluding it from check-mode gateway resolution.`,
+      );
+    }
+  }
+  return recorded.size === 1 ? [...recorded][0] : fallbackGatewayName;
+}
+
+function printIncompatibleRegisteredSandboxNames(names: readonly string[]): void {
+  console.error(
+    `\n  ${YW}Registered sandbox names cannot be recreated by this NemoClaw version:${R}`,
+  );
+  for (const name of names) {
+    console.error(`    ${diagnosticPreview(name)}`);
+  }
+  console.error(`\n  Registered sandbox names must use: ${NAME_ALLOWED_FORMAT}.`);
+  console.error(
+    `  For each listed sandbox, create a replacement with a valid name and transfer its state before rerunning \`${CLI_NAME} upgrade-sandboxes\`.`,
+  );
 }
 
 export async function upgradeSandboxes(
@@ -218,28 +260,53 @@ export async function upgradeSandboxes(
   const checkOnly = normalized.check === true;
   const skipConfirm = shouldSkipUpgradeConfirmation(normalized);
 
-  const sandboxes = registry.listSandboxes().sandboxes;
+  const sandboxes = registry
+    .listSandboxes()
+    .sandboxes.filter((sandbox) => !registry.isRouteOnlySandboxReservation(sandbox));
   if (sandboxes.length === 0) {
     console.log("  No sandboxes found in the registry.");
     return;
+  }
+
+  // OpenShell can no longer recreate legacy registry identities that fall
+  // outside the canonical sandbox-name contract. Detect every such identity
+  // before resolving or querying a gateway so check mode remains read-only and
+  // the mutating path cannot cross the rebuild boundary with an invalid name.
+  const incompatibleSandboxNames = sandboxes
+    .map((sandbox) => sandbox.name)
+    .filter((name) => !isValidName(name))
+    .sort();
+  if (incompatibleSandboxNames.length > 0) {
+    printIncompatibleRegisteredSandboxNames(incompatibleSandboxNames);
+    if (checkOnly) return;
+    process.exit(1);
   }
 
   // Resolve the configured gateway once and pin every observation to it. The
   // initial list, the confirmation list, and persisted-binding eligibility must
   // share this source; OpenShell's mutable current selection may be a sibling
   // gateway where the same sandbox name has different state.
-  const selectedGatewayName = resolveGatewayName(upgradeSandboxesDependencies.getGatewayPort());
-  const liveResult = await captureSandboxListWithGatewayPreflightOrExit(
-    {
-      action: "checking sandbox upgrade state",
-      command: `${CLI_NAME} upgrade-sandboxes`,
-    },
-    { gatewayName: selectedGatewayName },
-  );
+  const ambientGatewayName = resolveGatewayName(upgradeSandboxesDependencies.getGatewayPort());
+  // #7279: `--check` is documented read-only. Target the gateway the registered
+  // sandboxes actually record and query it without starting or selecting any
+  // gateway; only the mutating auto path keeps the recovering preflight.
+  const selectedGatewayName = checkOnly
+    ? resolveCheckGatewayName(sandboxes, ambientGatewayName)
+    : ambientGatewayName;
+  const liveListContext = {
+    action: "checking sandbox upgrade state",
+    command: `${CLI_NAME} upgrade-sandboxes`,
+  };
+  const liveResult = checkOnly
+    ? captureNamedGatewaySandboxListReadOnly(liveListContext, selectedGatewayName)
+    : await captureSandboxListWithGatewayPreflightOrExit(liveListContext, {
+        gatewayName: selectedGatewayName,
+      });
   const liveNames = parseReadySandboxNames(liveResult.output || "");
   // Sandboxes the selected gateway observes in a non-Ready phase. Absence from
-  // the selected gateway is handled by isPreparedRecoveryCandidate, which recovers
-  // an absent sandbox only when it resolves to the selected gateway.
+  // the selected gateway and stale Ready/Running rows are handled by
+  // isPreparedRecoveryCandidate, which recovers them only when they resolve to
+  // the selected gateway.
   const nonReadyLiveNames = new Set(
     parseLiveSandboxEntries(liveResult.output || "")
       .filter(
@@ -258,14 +325,15 @@ export async function upgradeSandboxes(
     { currentNemoclawVersion: resolveCurrentNemoclawVersion() },
   );
 
-  // Source boundary (#6114): a v0.0.55/legacy-OpenShell install can leave its
-  // already-registered sandboxes in Provisioning/Error after the host upgrade.
-  // That state comes from the already-installed legacy CLI/gateway and cannot be
-  // prevented at its source by this candidate. install.sh exports this signal only
-  // after the current CLI completes a strict backup, or after an operator asserts
-  // prepared upgrade state. Pre-fingerprint OpenClaw/Hermes rows require a separate,
-  // exact-name confirmation that they used a managed image; custom-image evidence
-  // still fails closed.
+  // Source boundary (#6114): a legacy OpenShell install can leave its already-
+  // registered sandboxes in Provisioning/Error after the host upgrade, or the
+  // replacement gateway can report a stale row as Ready even though its legacy
+  // state is no longer inspectable. That state comes from the already-installed
+  // legacy CLI/gateway and cannot be prevented at its source by this candidate.
+  // install.sh exports this signal only after the current CLI completes a strict
+  // backup, or after an operator asserts prepared upgrade state. Pre-fingerprint
+  // OpenClaw/Hermes rows require a separate, exact-name confirmation that they
+  // used a managed image; custom-image evidence still fails closed.
   // upgrade-sandboxes-recovery.test.ts and
   // install-preexisting-sandbox-recovery.test.ts guard the handoff. Remove this
   // bridge with onboard's matching consumer once prepared-backup installer recovery
@@ -283,21 +351,39 @@ export async function upgradeSandboxes(
     confirmedLegacyManagedNames.delete(name);
   }
   let recoveryCandidates: registry.SandboxEntry[] = [];
+  // Absent candidates the confirming second listing observed as Ready:
+  // reconnected mid-run, so neither recovery candidates nor orphans.
+  const becameReadyNames = new Set<string>();
   if (recoverPreparedBackups) {
+    const staleLiveNames = new Set(
+      stale.filter((sandbox) => sandbox.running).map((sandbox) => sandbox.name),
+    );
     const gatewayEligible = sandboxes.filter((sandbox) =>
-      isPreparedRecoveryCandidate(sandbox, liveNames, selectedGatewayName),
+      isPreparedRecoveryCandidate(sandbox, liveNames, staleLiveNames, selectedGatewayName),
+    );
+    const staleLiveCandidates = gatewayEligible.filter((sandbox) =>
+      staleLiveNames.has(sandbox.name),
     );
     const nonReadyCandidates = gatewayEligible.filter((sandbox) =>
       nonReadyLiveNames.has(sandbox.name),
     );
     const absentCandidates = gatewayEligible.filter(
-      (sandbox) => !nonReadyLiveNames.has(sandbox.name),
+      (sandbox) => !staleLiveNames.has(sandbox.name) && !nonReadyLiveNames.has(sandbox.name),
     );
     const confirmedAbsentCandidates = await confirmAbsentRecoveryCandidates(
       absentCandidates,
       selectedGatewayName,
+      checkOnly,
     );
-    recoveryCandidates = [...nonReadyCandidates, ...confirmedAbsentCandidates];
+    const confirmedAbsentNames = new Set(confirmedAbsentCandidates.map((s) => s.name));
+    for (const sandbox of absentCandidates) {
+      if (!confirmedAbsentNames.has(sandbox.name)) becameReadyNames.add(sandbox.name);
+    }
+    recoveryCandidates = [
+      ...staleLiveCandidates,
+      ...nonReadyCandidates,
+      ...confirmedAbsentCandidates,
+    ];
   }
   const backupRecoveryAssessments = recoveryCandidates.map((sandbox) =>
     prepareBackupRecovery(
@@ -314,12 +400,31 @@ export async function upgradeSandboxes(
     backupRecoveryAssessments.map((candidate) => candidate.sandbox.name),
   );
 
+  // #6520: see domain/maintenance/orphan-detection.ts; recovered sandboxes
+  // are excluded at print time.
+  const unobservedOwnGatewaySandboxes = classifyOrphanedRegistrySandboxes(sandboxes, {
+    observedNames: new Set([...liveNames, ...nonReadyLiveNames]),
+    reconnectedNames: becameReadyNames,
+    selectedGatewayName,
+    resolveGatewayBinding: resolveSandboxGatewayName,
+  });
+  // An orphan's version is unknown because the sandbox is gone, not because a
+  // probe is pending — listing it under "Unknown version" with start-and-rerun
+  // guidance would contradict the orphan block's remediation. Stale orphans
+  // stay in the stale list: their version drift is real information.
+  const orphanNames = new Set(unobservedOwnGatewaySandboxes.map((sandbox) => sandbox.name));
+  const unknownWithoutOrphans = unknown.filter((sandbox) => !orphanNames.has(sandbox.name));
+
   if (
     stale.length === 0 &&
-    unknown.length === 0 &&
+    unknownWithoutOrphans.length === 0 &&
     preparedRecoveries.length === 0 &&
     rejectedRecoveries.length === 0
   ) {
+    if (unobservedOwnGatewaySandboxes.length > 0) {
+      printOrphanedRegistrySandboxes(unobservedOwnGatewaySandboxes);
+      return;
+    }
     console.log("  All sandboxes are up to date.");
     return;
   }
@@ -331,9 +436,9 @@ export async function upgradeSandboxes(
       console.log(`    ${s.name}  ${describeStaleUpgrade(s)}  (${status})`);
     }
   }
-  if (unknown.length > 0) {
+  if (unknownWithoutOrphans.length > 0) {
     console.log(`\n  ${YW}Unknown version:${R}`);
-    for (const s of unknown) {
+    for (const s of unknownWithoutOrphans) {
       const status = s.running ? `${G}running${R}` : `${D}stopped${R}`;
       console.log(`    ${s.name}  v? → v${s.expected}  (${status})`);
     }
@@ -342,7 +447,14 @@ export async function upgradeSandboxes(
     console.log(`\n  ${B}Prepared backup recovery:${R}`);
     for (const recovery of preparedRecoveries) {
       console.log(
-        `    ${recovery.sandbox.name}  ${D}${recovery.manifest.timestamp}${R}  (non-Ready)`,
+        `    ${recovery.sandbox.name}  ${D}${recovery.manifest.timestamp}${R}  (pre-upgrade backup)`,
+      );
+      // #7073: the validated manifest records the agent-specific managed state
+      // root restored for this sandbox. Warn before the destructive recreate so
+      // users can back up paths outside that exact root rather than silently
+      // losing them.
+      console.log(
+        `    ${YW}⚠ Recovery restores ${JSON.stringify(recovery.manifest.dir)} state only for this sandbox. Files outside this recorded managed state path (e.g. /sandbox/user-data) are NOT preserved by the recreate — back them up before upgrading.${R}`,
       );
     }
   }
@@ -356,26 +468,29 @@ export async function upgradeSandboxes(
 
   if (checkOnly) {
     if (stale.length > 0) console.log(`  ${stale.length} sandbox(es) need upgrading.`);
-    if (unknown.length > 0) {
+    if (unknownWithoutOrphans.length > 0) {
       console.log(
-        `  ${unknown.length} sandbox(es) could not be version-checked; start them and rerun, or rebuild manually.`,
+        `  ${unknownWithoutOrphans.length} sandbox(es) could not be version-checked; start them and rerun, or rebuild manually.`,
       );
     }
     if (preparedRecoveries.length > 0) {
       console.log(
-        `  ${preparedRecoveries.length} non-Ready sandbox(es) have a validated pre-upgrade backup.`,
+        `  ${preparedRecoveries.length} sandbox(es) have a validated pre-upgrade backup.`,
       );
     }
     if (rejectedRecoveries.length > 0) {
-      console.log(
-        `  ${rejectedRecoveries.length} non-Ready sandbox(es) cannot be recovered automatically.`,
-      );
+      console.log(`  ${rejectedRecoveries.length} sandbox(es) cannot be recovered automatically.`);
     }
+    // Check mode must agree with auto mode on the orphan diagnosis (#6520).
+    printOrphanedRegistrySandboxes(unobservedOwnGatewaySandboxes);
     console.log(`  Run \`${CLI_NAME} upgrade-sandboxes\` to rebuild them.`);
     return;
   }
 
   const { rebuildable, stopped } = splitRebuildableSandboxes(stale);
+  const ordinaryRebuildable = rebuildable.filter(
+    (sandbox) => !assessedRecoveryNames.has(sandbox.name),
+  );
   const notObservedReadyOrNonReady = stopped.filter(
     (sandbox) => !assessedRecoveryNames.has(sandbox.name),
   );
@@ -385,18 +500,20 @@ export async function upgradeSandboxes(
     );
   }
   if (
-    rebuildable.length === 0 &&
+    ordinaryRebuildable.length === 0 &&
     preparedRecoveries.length === 0 &&
     rejectedRecoveries.length === 0
   ) {
+    printOrphanedRegistrySandboxes(unobservedOwnGatewaySandboxes);
     console.log("  No running stale sandboxes to rebuild.");
     return;
   }
 
   let rebuilt = 0;
   let failed = rejectedRecoveries.length;
+  const recoveredNames = new Set<string>();
   const work = [
-    ...rebuildable.map((sandbox) => ({ sandbox, manifest: null })),
+    ...ordinaryRebuildable.map((sandbox) => ({ sandbox, manifest: null })),
     ...preparedRecoveries.map((recovery) => ({
       sandbox: { name: recovery.sandbox.name },
       manifest: recovery.manifest,
@@ -424,6 +541,7 @@ export async function upgradeSandboxes(
           : {}),
       });
       rebuilt++;
+      recoveredNames.add(sandbox.name);
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
       const verb = manifest ? "recover" : "rebuild";
@@ -433,6 +551,9 @@ export async function upgradeSandboxes(
   }
 
   console.log("");
+  printOrphanedRegistrySandboxes(
+    unobservedOwnGatewaySandboxes.filter((sandbox) => !recoveredNames.has(sandbox.name)),
+  );
   if (rebuilt > 0) console.log(`  ${G}✓${R} ${rebuilt} sandbox(es) rebuilt.`);
   if (failed > 0) console.log(`  ${YW}⚠${R} ${failed} sandbox(es) failed — see errors above.`);
   if (failed > 0) process.exit(1);

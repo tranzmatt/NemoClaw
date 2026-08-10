@@ -5,15 +5,16 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagingTokenDef } from "./messaging-prep";
 import {
   materializeSandboxCreatePlan,
-  prepareSandboxCreatePlan,
   resolveSandboxCreateIntent,
   resolveSandboxCreateMessagingProviderRequests,
+  resolveSandboxCreatePolicyTier,
 } from "./sandbox-create-plan";
 import type { SandboxGpuCreateConfig } from "./sandbox-gpu-create";
 
 const sandboxGpuConfig: SandboxGpuCreateConfig = {
   sandboxGpuEnabled: true,
   sandboxGpuDevice: "nvidia.com/gpu=0",
+  hostGpuDetected: true,
 };
 
 afterEach(() => {
@@ -70,32 +71,41 @@ function expectCredentialBindingFailure({
     hermesToolGateways: [],
     sandboxGpuConfig,
     gpuCreateArgs: [],
-    useDockerGpuPatch: false,
+    gpuRoutePlan: "native-only",
     sandboxGpuLogMessage: null,
     policyTier: null,
   });
-  const preparePolicy = vi.fn(() => ({ policyPath: "/tmp/policy.yaml", appliedPresets: [] }));
-  const appendResources = vi.fn();
+  const preparePolicy = vi.fn(() => ({
+    policyPath: "/tmp/policy.yaml",
+    appliedPresets: [],
+  }));
   const cleanupProviders = vi.fn();
   const upsertProviders = vi.fn(() => []);
 
   expect(() =>
     materializeSandboxCreatePlan({
       intent,
-      buildCtx: "/tmp/nemoclaw-build-1",
+      fromRef: "/tmp/nemoclaw-build-1/Dockerfile",
       messagingTokenDefs: materializedTokenDefs,
       prepareInitialSandboxCreatePolicy: preparePolicy,
-      appendResourceFlags: appendResources,
       runProviderPreDeleteCleanup: cleanupProviders,
       upsertMessagingProviders: upsertProviders,
       getHermesToolGatewayProviderName: vi.fn(),
     }),
   ).toThrow(expectedMessage);
   expect(preparePolicy).not.toHaveBeenCalled();
-  expect(appendResources).not.toHaveBeenCalled();
   expect(cleanupProviders).not.toHaveBeenCalled();
   expect(upsertProviders).not.toHaveBeenCalled();
 }
+
+describe("resolveSandboxCreatePolicyTier", () => {
+  it("recognizes Personal as a create-time policy tier", () => {
+    vi.stubEnv("NEMOCLAW_NON_INTERACTIVE", "1");
+    vi.stubEnv("NEMOCLAW_POLICY_TIER", "personal");
+
+    expect(resolveSandboxCreatePolicyTier()).toBe("personal");
+  });
+});
 
 describe("resolveSandboxCreateIntent", () => {
   it("turns credential-bearing inputs into secretless provider requests", () => {
@@ -159,13 +169,26 @@ describe("resolveSandboxCreateIntent", () => {
       reusableMessagingChannels: ["discord", "slack"],
       reusableMessagingProviders: ["sandbox-existing-discord", "sandbox-slack-bridge"],
       extraProviders: ["custom-provider", "custom-provider", ""],
+      staleExtraProviders: ["stale-provider", "stale-provider", ""],
       hermesToolGateways: ["github"],
       sandboxGpuConfig,
       gpuCreateArgs: ["--gpu", "--gpu-device", "nvidia.com/gpu=0"],
-      useDockerGpuPatch: false,
+      resourceCreateArgs: ["--cpu", "4", "--memory", "16Gi"],
+      gpuRoutePlan: "native-only" as const,
       sandboxGpuLogMessage: "gpu note",
+      extraPlaceholderKeys: ["TELEGRAM_BOT_TOKEN_AGENT_A"],
       agentName: "hermes",
       policyTier: "balanced",
+      baselineExclusions: [
+        {
+          version: 1 as const,
+          agent: "hermes",
+          key: "nous_research",
+          digest: "abc",
+          acknowledgedAt: "2026-07-19T00:00:00.000Z",
+          appliedAgentVersion: null,
+        },
+      ],
     };
 
     const first = resolveSandboxCreateIntent(input);
@@ -179,15 +202,28 @@ describe("resolveSandboxCreateIntent", () => {
     ]);
     expect(first.reusableMessagingProviders).toEqual(["sandbox-existing-discord"]);
     expect(first.extraProviders).toEqual(["custom-provider"]);
+    expect(first.staleExtraProviders).toEqual(["stale-provider"]);
+    expect(first.resourceCreateArgs).toEqual(["--cpu", "4", "--memory", "16Gi"]);
+    expect(first.extraPlaceholderKeys).toEqual(["TELEGRAM_BOT_TOKEN_AGENT_A"]);
     expect(first.policy).toEqual({
       basePolicyPath: "/repo/policy.yaml",
       activeMessagingChannels: ["telegram", "discord", "whatsapp"],
       options: {
         directGpu: true,
-        dockerGpuPatch: false,
+        hostGpuAvailable: true,
         additionalPresets: ["github"],
         agentName: "hermes",
         policyTier: "balanced",
+        baselineExclusions: [
+          {
+            version: 1,
+            agent: "hermes",
+            key: "nous_research",
+            digest: "abc",
+            acknowledgedAt: "2026-07-19T00:00:00.000Z",
+            appliedAgentVersion: null,
+          },
+        ],
       },
     });
     expect(JSON.parse(JSON.stringify(first))).toEqual(first);
@@ -219,7 +255,8 @@ describe("resolveSandboxCreateIntent", () => {
       hermesToolGateways: ["github"],
       sandboxGpuConfig,
       gpuCreateArgs: ["--gpu"],
-      useDockerGpuPatch: false,
+      resourceCreateArgs: ["--memory", "16g"],
+      gpuRoutePlan: "native-only",
       sandboxGpuLogMessage: null,
       agentName: "hermes",
       policyTier: "balanced",
@@ -229,15 +266,15 @@ describe("resolveSandboxCreateIntent", () => {
 
     const result = materializeSandboxCreatePlan({
       intent,
-      buildCtx: "/tmp/nemoclaw-build-1",
+      fromRef: "/tmp/nemoclaw-build-1/Dockerfile",
       messagingTokenDefs: tokenDefs,
       prepareInitialSandboxCreatePolicy: vi.fn(() => {
         events.push("policy");
         return { policyPath: "/tmp/policy.yaml", appliedPresets: ["telegram"] };
       }),
-      appendResourceFlags: (args) => {
-        events.push("resources");
-        args.push("--memory", "16g");
+      discloseInitialSandboxPolicy: (policy) => {
+        events.push("disclose");
+        expect(policy.appliedPresets).toEqual(["telegram"]);
       },
       runProviderPreDeleteCleanup: () => events.push("cleanup"),
       upsertMessagingProviders: vi.fn((receivedTokenDefs) => {
@@ -251,7 +288,7 @@ describe("resolveSandboxCreateIntent", () => {
       },
     });
 
-    expect(events).toEqual(["policy", "resources", "cleanup", "upsert", "hermes"]);
+    expect(events).toEqual(["policy", "disclose", "cleanup", "upsert", "hermes"]);
     expect(result.createArgs).toEqual([
       "--from",
       "/tmp/nemoclaw-build-1/Dockerfile",
@@ -273,6 +310,51 @@ describe("resolveSandboxCreateIntent", () => {
     ]);
     expect(serializedIntent).not.toContain("telegram-super-secret");
     expect(JSON.stringify(intent)).toBe(serializedIntent);
+  });
+
+  it("cleans up the prepared policy when disclosure fails before provider effects (#7179)", () => {
+    const intent = resolveSandboxCreateIntent({
+      basePolicyPath: "/repo/policy.yaml",
+      sandboxName: "sandbox",
+      channels,
+      enabledChannels: [],
+      disabledChannelNames: new Set(),
+      messagingProviderRequests: [],
+      primaryMessagingCredentialEnvKeys: [],
+      reusableMessagingChannels: [],
+      reusableMessagingProviders: [],
+      hermesToolGateways: [],
+      sandboxGpuConfig,
+      gpuCreateArgs: [],
+      gpuRoutePlan: "native-only",
+      sandboxGpuLogMessage: null,
+      policyTier: null,
+    });
+    const cleanupPolicy = vi.fn(() => true);
+    const cleanupProviders = vi.fn();
+    const upsertProviders = vi.fn(() => []);
+
+    expect(() =>
+      materializeSandboxCreatePlan({
+        intent,
+        fromRef: "/tmp/nemoclaw-build-1/Dockerfile",
+        messagingTokenDefs: [],
+        prepareInitialSandboxCreatePolicy: vi.fn(() => ({
+          policyPath: "/tmp/policy.yaml",
+          appliedPresets: [],
+          cleanup: cleanupPolicy,
+        })),
+        discloseInitialSandboxPolicy: () => {
+          throw new Error("disclosure failed");
+        },
+        runProviderPreDeleteCleanup: cleanupProviders,
+        upsertMessagingProviders: upsertProviders,
+        getHermesToolGatewayProviderName: vi.fn(),
+      }),
+    ).toThrow("disclosure failed");
+    expect(cleanupPolicy).toHaveBeenCalledOnce();
+    expect(cleanupProviders).not.toHaveBeenCalled();
+    expect(upsertProviders).not.toHaveBeenCalled();
   });
 
   it("rejects changed credential availability before running effects", () => {
@@ -327,311 +409,42 @@ describe("resolveSandboxCreateIntent", () => {
         "Cannot materialize sandbox create intent; provider type changed for 'sandbox-brave-search'.",
     });
   });
-});
 
-describe("prepareSandboxCreatePlan", () => {
-  it("builds create args, policy, providers, and active channels in onboard order", () => {
-    vi.stubEnv("NEMOCLAW_NON_INTERACTIVE", "1");
-    vi.stubEnv("NEMOCLAW_POLICY_TIER", "restricted");
-    const events: string[] = [];
-    const appendResourceFlags = vi.fn((args: string[]) => {
-      events.push("resources");
-      args.push("--memory", "16g");
-    });
-    const runProviderPreDeleteCleanup = vi.fn(() => events.push("cleanup"));
-    const upsertMessagingProviders = vi.fn(() => {
-      events.push("upsert");
-      return ["sandbox-telegram-bridge", "sandbox-slack-bridge"];
-    });
-    const prepareInitialSandboxCreatePolicy = vi.fn(() => ({
-      policyPath: "/tmp/policy.yaml",
-      appliedPresets: ["telegram"],
-      cleanup: vi.fn(),
-    }));
-
-    const result = prepareSandboxCreatePlan({
+  it("materializes a managed image reference without a Dockerfile suffix", () => {
+    const reference = `ghcr.io/nvidia/nemoclaw/openclaw@sha256:${"a".repeat(64)}`;
+    const intent = resolveSandboxCreateIntent({
       basePolicyPath: "/repo/policy.yaml",
-      buildCtx: "/tmp/nemoclaw-build-1",
       sandboxName: "sandbox",
-      channels,
-      enabledChannels: ["telegram", "whatsapp"],
-      disabledChannelNames: new Set(),
-      messagingTokenDefs: [
-        {
-          name: "sandbox-telegram-bridge",
-          envKey: "TELEGRAM_BOT_TOKEN",
-          token: "telegram-token",
-        },
-        {
-          name: "sandbox-slack-app-bridge",
-          envKey: "SLACK_APP_TOKEN",
-          token: "slack-app-token",
-        },
-        {
-          name: "sandbox-slack-bridge",
-          envKey: "SLACK_BOT_TOKEN",
-          token: "slack-bot-token",
-        },
-      ],
-      reusableMessagingChannels: ["discord"],
-      reusableMessagingProviders: ["sandbox-existing-discord"],
-      hermesToolGateways: ["github"],
-      sandboxGpuConfig,
-      dockerDriverGateway: true,
-      appendResourceFlags,
-      runProviderPreDeleteCleanup,
-      upsertMessagingProviders,
-      getMessagingChannelForEnvKey: (envKey) =>
-        envKey === "TELEGRAM_BOT_TOKEN"
-          ? "telegram"
-          : envKey === "SLACK_BOT_TOKEN"
-            ? "slack"
-            : null,
-      getHermesToolGatewayProviderName: (sandboxName) => `${sandboxName}-hermes-tools`,
-      agentName: "langchain-deepagents-code",
-      deps: {
-        resolveDockerGpuSandboxCreatePlan: vi.fn(() => ({
-          useDockerGpuPatch: false,
-          logMessage: "gpu note",
-        })),
-        prepareInitialSandboxCreatePolicy,
-        buildSandboxGpuCreateArgs: vi.fn(() => ["--gpu", "--gpu-device", "nvidia.com/gpu=0"]),
-      },
-    });
-
-    expect(result.activeMessagingChannels).toEqual(["telegram", "slack", "discord", "whatsapp"]);
-    expect(prepareInitialSandboxCreatePolicy).toHaveBeenCalledWith(
-      "/repo/policy.yaml",
-      ["telegram", "slack", "discord", "whatsapp"],
-      {
-        directGpu: true,
-        dockerGpuPatch: false,
-        additionalPresets: ["github"],
-        agentName: "langchain-deepagents-code",
-        policyTier: "restricted",
-      },
-    );
-    expect(result.policyTier).toBe("restricted");
-    expect(result.createArgs).toEqual([
-      "--from",
-      "/tmp/nemoclaw-build-1/Dockerfile",
-      "--name",
-      "sandbox",
-      "--policy",
-      "/tmp/policy.yaml",
-      "--gpu",
-      "--gpu-device",
-      "nvidia.com/gpu=0",
-      "--memory",
-      "16g",
-      "--provider",
-      "sandbox-telegram-bridge",
-      "--provider",
-      "sandbox-slack-bridge",
-      "--provider",
-      "sandbox-existing-discord",
-      "--provider",
-      "sandbox-hermes-tools",
-    ]);
-    expect(result.messagingProviders).toEqual([
-      "sandbox-telegram-bridge",
-      "sandbox-slack-bridge",
-      "sandbox-existing-discord",
-    ]);
-    expect(result.sandboxGpuLogMessage).toBe("gpu note");
-    expect(events).toEqual(["resources", "cleanup", "upsert"]);
-  });
-
-  it("filters disabled channels from token, reusable, and provider sources", () => {
-    const upsertMessagingProviders = vi.fn(() => [
-      "sandbox-telegram-bridge",
-      "sandbox-slack-bridge",
-    ]);
-
-    const result = prepareSandboxCreatePlan({
-      basePolicyPath: "/repo/policy.yaml",
-      buildCtx: "/tmp/nemoclaw-build-1",
-      sandboxName: "sandbox",
-      channels,
-      enabledChannels: ["telegram", "slack", "whatsapp"],
-      disabledChannelNames: new Set(["slack"]),
-      messagingTokenDefs: [
-        { name: "sandbox-telegram-bridge", envKey: "TELEGRAM_BOT_TOKEN", token: "telegram" },
-        { name: "sandbox-slack-bridge", envKey: "SLACK_BOT_TOKEN", token: "slack" },
-      ],
-      reusableMessagingChannels: ["slack", "whatsapp"],
-      reusableMessagingProviders: ["sandbox-slack-bridge", "sandbox-existing-whatsapp"],
-      hermesToolGateways: [],
-      sandboxGpuConfig,
-      dockerDriverGateway: true,
-      appendResourceFlags: vi.fn(),
-      runProviderPreDeleteCleanup: vi.fn(),
-      upsertMessagingProviders,
-      getMessagingChannelForEnvKey: (envKey) =>
-        envKey === "TELEGRAM_BOT_TOKEN"
-          ? "telegram"
-          : envKey === "SLACK_BOT_TOKEN"
-            ? "slack"
-            : null,
-      getHermesToolGatewayProviderName: vi.fn(),
-      deps: {
-        resolveDockerGpuSandboxCreatePlan: vi.fn(() => ({
-          useDockerGpuPatch: false,
-          logMessage: null,
-        })),
-        prepareInitialSandboxCreatePolicy: vi.fn(() => ({
-          policyPath: "/tmp/policy.yaml",
-          appliedPresets: [],
-        })),
-        buildSandboxGpuCreateArgs: vi.fn(() => []),
-      },
-    });
-
-    expect(upsertMessagingProviders).toHaveBeenCalledWith(
-      [{ name: "sandbox-telegram-bridge", envKey: "TELEGRAM_BOT_TOKEN", token: "telegram" }],
-      { replaceExisting: true },
-    );
-    expect(result.activeMessagingChannels).toEqual(["telegram", "whatsapp"]);
-    expect(result.messagingProviders).toEqual([
-      "sandbox-telegram-bridge",
-      "sandbox-existing-whatsapp",
-    ]);
-    expect(result.createArgs).toContain("sandbox-telegram-bridge");
-    expect(result.createArgs).not.toContain("sandbox-slack-bridge");
-  });
-
-  it("does not activate slack from an app token alone and suppresses --gpu for Docker GPU patching", () => {
-    const result = prepareSandboxCreatePlan({
-      basePolicyPath: "/repo/policy.yaml",
-      buildCtx: "/tmp/nemoclaw-build-1",
-      sandboxName: "sandbox",
-      channels,
-      enabledChannels: ["slack", "whatsapp"],
-      disabledChannelNames: new Set(["whatsapp"]),
-      messagingTokenDefs: [
-        {
-          name: "sandbox-slack-app-bridge",
-          envKey: "SLACK_APP_TOKEN",
-          token: "slack-app-token",
-        },
-      ],
-      reusableMessagingChannels: [],
-      reusableMessagingProviders: [],
-      hermesToolGateways: [],
-      sandboxGpuConfig,
-      dockerDriverGateway: true,
-      appendResourceFlags: vi.fn(),
-      runProviderPreDeleteCleanup: vi.fn(),
-      upsertMessagingProviders: vi.fn(() => []),
-      getMessagingChannelForEnvKey: () => null,
-      getHermesToolGatewayProviderName: vi.fn(),
-      deps: {
-        resolveDockerGpuSandboxCreatePlan: vi.fn(() => ({
-          useDockerGpuPatch: true,
-          logMessage: null,
-        })),
-        prepareInitialSandboxCreatePolicy: vi.fn(() => ({
-          policyPath: "/tmp/policy.yaml",
-          appliedPresets: [],
-        })),
-        buildSandboxGpuCreateArgs: vi.fn(() => []),
-      },
-    });
-
-    expect(result.activeMessagingChannels).toEqual([]);
-    expect(result.useDockerGpuPatch).toBe(true);
-    expect(result.createArgs).toEqual([
-      "--from",
-      "/tmp/nemoclaw-build-1/Dockerfile",
-      "--name",
-      "sandbox",
-      "--policy",
-      "/tmp/policy.yaml",
-    ]);
-  });
-
-  it("appends extra providers via --provider after messaging and Hermes tool providers", () => {
-    const result = prepareSandboxCreatePlan({
-      basePolicyPath: "/repo/policy.yaml",
-      buildCtx: "/tmp/nemoclaw-build-1",
-      sandboxName: "sandbox",
-      channels,
+      channels: [],
       enabledChannels: [],
       disabledChannelNames: new Set(),
-      messagingTokenDefs: [],
+      messagingProviderRequests: [],
+      primaryMessagingCredentialEnvKeys: [],
       reusableMessagingChannels: [],
       reusableMessagingProviders: [],
-      extraProviders: ["tavily-search", "tavily-search", "custom-provider"],
       hermesToolGateways: [],
       sandboxGpuConfig,
-      dockerDriverGateway: true,
-      appendResourceFlags: vi.fn(),
+      gpuCreateArgs: [],
+      gpuRoutePlan: "native-only",
+      sandboxGpuLogMessage: null,
+      policyTier: null,
+    });
+
+    const plan = materializeSandboxCreatePlan({
+      intent,
+      fromRef: reference,
+      messagingTokenDefs: [],
+      prepareInitialSandboxCreatePolicy: vi.fn(() => ({
+        policyPath: "/tmp/policy.yaml",
+        appliedPresets: [],
+      })),
       runProviderPreDeleteCleanup: vi.fn(),
       upsertMessagingProviders: vi.fn(() => []),
-      getMessagingChannelForEnvKey: () => null,
       getHermesToolGatewayProviderName: vi.fn(),
-      deps: {
-        resolveDockerGpuSandboxCreatePlan: vi.fn(() => ({
-          useDockerGpuPatch: false,
-          logMessage: null,
-        })),
-        prepareInitialSandboxCreatePolicy: vi.fn(() => ({
-          policyPath: "/tmp/policy.yaml",
-          appliedPresets: [],
-        })),
-        buildSandboxGpuCreateArgs: vi.fn(() => []),
-      },
     });
+    const fromIndex = plan.createArgs.indexOf("--from");
 
-    const providerArgs = result.createArgs
-      .map((arg, index) => (arg === "--provider" ? result.createArgs[index + 1] : null))
-      .filter((value): value is string => value !== null);
-    expect(providerArgs).toEqual(["tavily-search", "custom-provider"]);
-  });
-
-  it("does not duplicate an extra provider that is already a messaging provider", () => {
-    const result = prepareSandboxCreatePlan({
-      basePolicyPath: "/repo/policy.yaml",
-      buildCtx: "/tmp/nemoclaw-build-1",
-      sandboxName: "sandbox",
-      channels,
-      enabledChannels: ["telegram"],
-      disabledChannelNames: new Set(),
-      messagingTokenDefs: [
-        {
-          name: "sandbox-telegram-bridge",
-          envKey: "TELEGRAM_BOT_TOKEN",
-          token: "telegram",
-        },
-      ],
-      reusableMessagingChannels: [],
-      reusableMessagingProviders: [],
-      extraProviders: ["sandbox-telegram-bridge", "tavily-search"],
-      hermesToolGateways: [],
-      sandboxGpuConfig,
-      dockerDriverGateway: true,
-      appendResourceFlags: vi.fn(),
-      runProviderPreDeleteCleanup: vi.fn(),
-      upsertMessagingProviders: vi.fn(() => ["sandbox-telegram-bridge"]),
-      getMessagingChannelForEnvKey: (envKey) =>
-        envKey === "TELEGRAM_BOT_TOKEN" ? "telegram" : null,
-      getHermesToolGatewayProviderName: vi.fn(),
-      deps: {
-        resolveDockerGpuSandboxCreatePlan: vi.fn(() => ({
-          useDockerGpuPatch: false,
-          logMessage: null,
-        })),
-        prepareInitialSandboxCreatePolicy: vi.fn(() => ({
-          policyPath: "/tmp/policy.yaml",
-          appliedPresets: [],
-        })),
-        buildSandboxGpuCreateArgs: vi.fn(() => []),
-      },
-    });
-
-    const providerArgs = result.createArgs
-      .map((arg, index) => (arg === "--provider" ? result.createArgs[index + 1] : null))
-      .filter((value): value is string => value !== null);
-    expect(providerArgs).toEqual(["sandbox-telegram-bridge", "tavily-search"]);
+    expect(plan.createArgs.slice(fromIndex, fromIndex + 2)).toEqual(["--from", reference]);
+    expect(plan.createArgs.join(" ")).not.toContain("/Dockerfile");
   });
 });

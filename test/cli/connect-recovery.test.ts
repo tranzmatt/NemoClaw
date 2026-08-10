@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
+import { nonWslPlatformNodeOptions } from "../helpers/platform-override-node-options";
 import {
   runWithEnv,
   testTimeoutOptions,
@@ -16,13 +17,23 @@ import {
 
 type GatewayControlDockerStubOptions = {
   callsFile: string;
+  newPid?: number;
+  oldPid?: number;
+  recoveryDisposition?: "ok" | "already-running";
   stateFile: string;
   recoveryStatus?: number;
 };
 
 function writeGatewayControlDockerStub(
   localBin: string,
-  { callsFile, stateFile, recoveryStatus = 0 }: GatewayControlDockerStubOptions,
+  {
+    callsFile,
+    newPid = 123,
+    oldPid = 0,
+    recoveryDisposition = "ok",
+    stateFile,
+    recoveryStatus = 0,
+  }: GatewayControlDockerStubOptions,
 ): void {
   fs.writeFileSync(
     path.join(localBin, "docker"),
@@ -31,6 +42,9 @@ function writeGatewayControlDockerStub(
       `calls=${JSON.stringify(callsFile)}`,
       `state_file=${JSON.stringify(stateFile)}`,
       `recovery_status=${recoveryStatus}`,
+      `recovery_disposition=${JSON.stringify(recoveryDisposition)}`,
+      `old_pid=${oldPid}`,
+      `new_pid=${newPid}`,
       'printf \'%s\\n\' "$*" >> "$calls"',
       'if [ "$1" = "info" ]; then echo "24.0.0"; exit 0; fi',
       'if [ "$1" = "ps" ]; then',
@@ -48,7 +62,9 @@ function writeGatewayControlDockerStub(
       '      exit "$recovery_status"',
       "    fi",
       '    echo recovered > "$state_file"',
-      "    echo 'GATEWAY_PID=123'",
+      '    nonce="${!#}"',
+      '    printf \'v1 %s complete %s %s %s\\n\' "$nonce" "$recovery_disposition" "$old_pid" "$new_pid"',
+      "    printf 'GATEWAY_PID=%s\\n' \"$new_pid\"",
       "    exit 0",
       "  fi",
       '  if [[ "$*" == *"curl -so"* ]]; then',
@@ -154,10 +170,27 @@ async function startForwardListeners(ports: number[]): Promise<() => Promise<voi
 }
 
 describe("CLI connect recovery process contracts", () => {
-  it(
-    "connect --probe-only recovers the gateway without opening SSH",
+  it.each([
+    {
+      caseName: "connect --probe-only reports controller recovery without opening SSH",
+      expectedOutput: "Probe complete: recovered OpenClaw gateway",
+      newPid: 123,
+      oldPid: 0,
+      recoveryDisposition: "ok" as const,
+      unexpectedOutput: "Probe complete: OpenClaw gateway is running",
+    },
+    {
+      caseName: "connect --probe-only does not attribute PID 1 auto-respawn to controller recovery",
+      expectedOutput: "Probe complete: OpenClaw gateway is running",
+      newPid: 456,
+      oldPid: 123,
+      recoveryDisposition: "already-running" as const,
+      unexpectedOutput: "Probe complete: recovered OpenClaw gateway",
+    },
+  ])(
+    "$caseName (#7919)",
     testTimeoutOptions(15_000),
-    async () => {
+    async ({ expectedOutput, newPid, oldPid, recoveryDisposition, unexpectedOutput }) => {
       const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cli-connect-probe-"));
       const localBin = path.join(home, "bin");
       const markerFile = path.join(home, "openshell-calls");
@@ -174,7 +207,8 @@ describe("CLI connect recovery process contracts", () => {
           `marker_file=${JSON.stringify(markerFile)}`,
           `state_file=${JSON.stringify(stateFile)}`,
           'printf \'%s\\n\' "$*" >> "$marker_file"',
-          'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && [ "$3" = "alpha" ]; then',
+          'if [ "$1" = "sandbox" ] && [ "$2" = "list" ]; then echo "alpha  Ready"; exit 0; fi',
+          'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && { [ "$3" = "alpha" ] || [ "$5" = "alpha" ]; }; then',
           "  echo 'Sandbox:'",
           "  echo",
           "  echo '  Id: abc'",
@@ -185,7 +219,12 @@ describe("CLI connect recovery process contracts", () => {
           "fi",
           'if [ "$1" = "sandbox" ] && [ "$2" = "exec" ] && [ "$3" = "--name" ] && [ "$4" = "alpha" ]; then',
           '  cmd="$8"',
+          '  if [[ "$*" == *"inference.local/v1/models"* ]]; then echo "OK 200"; exit 0; fi',
           '  case "$cmd" in',
+          '    *"inference.local/v1/models"*)',
+          "      echo 'OK 200'",
+          "      exit 0",
+          "      ;;",
           "    *'curl -so'*)",
           "      echo '__NEMOCLAW_SANDBOX_EXEC_STARTED__'",
           '      if [ "$(cat "$state_file")" = recovered ]; then echo RUNNING; else echo STOPPED; fi',
@@ -199,20 +238,28 @@ describe("CLI connect recovery process contracts", () => {
         ].join("\n"),
         { mode: 0o755 },
       );
-      writeGatewayControlDockerStub(localBin, { callsFile: dockerCalls, stateFile });
+      writeGatewayControlDockerStub(localBin, {
+        callsFile: dockerCalls,
+        newPid,
+        oldPid,
+        recoveryDisposition,
+        stateFile,
+      });
       writeRecordingCommand(localBin, "ssh", sshMarkerFile, 98);
       const stopForwardListeners = await startForwardListeners([18789]);
 
       try {
         const result = runWithEnv("alpha connect --probe-only", {
           HOME: home,
+          NODE_OPTIONS: nonWslPlatformNodeOptions(home),
           PATH: `${localBin}:${process.env.PATH || ""}`,
         });
 
-        expect(result.code).toBe(0);
-        expect(result.out).toContain("Probe complete: recovered OpenClaw gateway");
+        expect(result.code, result.out).toBe(0);
+        expect(result.out).toContain(expectedOutput);
+        expect(result.out).not.toContain(unexpectedOutput);
         const calls = fs.readFileSync(markerFile, "utf8").trim().split("\n").filter(Boolean);
-        expect(calls).toContain("sandbox get alpha");
+        expect(calls).toContain("sandbox get -g nemoclaw alpha");
         expect(calls.some((call) => call.startsWith("sandbox exec --name alpha -- sh -c"))).toBe(
           true,
         );
@@ -246,7 +293,8 @@ describe("CLI connect recovery process contracts", () => {
           `calls=${JSON.stringify(openshellCalls)}`,
           `state_file=${JSON.stringify(stateFile)}`,
           'printf \'%s\\n\' "$*" >> "$calls"',
-          'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && [ "$3" = "alpha" ]; then',
+          'if [ "$1" = "sandbox" ] && [ "$2" = "list" ]; then echo "alpha  Ready"; exit 0; fi',
+          'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && { [ "$3" = "alpha" ] || [ "$5" = "alpha" ]; }; then',
           "  echo 'Sandbox:'",
           "  echo",
           "  echo '  Id: abc'",
@@ -257,6 +305,7 @@ describe("CLI connect recovery process contracts", () => {
           "fi",
           'if [ "$1" = "sandbox" ] && [ "$2" = "exec" ] && [ "$3" = "--name" ] && [ "$4" = "alpha" ]; then',
           '  cmd="$8"',
+          '  if [[ "$*" == *"inference.local/v1/models"* ]]; then echo "OK 200"; exit 0; fi',
           '  if [[ "$cmd" == *"curl -so"* ]]; then',
           "    echo '__NEMOCLAW_SANDBOX_EXEC_STARTED__'",
           '    if [ "$(cat "$state_file")" = recovered ]; then echo RUNNING; else echo STOPPED; fi',
@@ -280,6 +329,7 @@ describe("CLI connect recovery process contracts", () => {
       try {
         const result = runWithEnv("alpha connect --probe-only", {
           HOME: home,
+          NODE_OPTIONS: nonWslPlatformNodeOptions(home),
           PATH: `${localBin}:${process.env.PATH || ""}`,
         });
 
@@ -314,7 +364,8 @@ describe("CLI connect recovery process contracts", () => {
         `calls=${JSON.stringify(openshellCalls)}`,
         `state_file=${JSON.stringify(stateFile)}`,
         'printf \'%s\\n\' "$*" >> "$calls"',
-        'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && [ "$3" = "alpha" ]; then',
+        'if [ "$1" = "sandbox" ] && [ "$2" = "list" ]; then echo "alpha  Ready"; exit 0; fi',
+        'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && { [ "$3" = "alpha" ] || [ "$5" = "alpha" ]; }; then',
         "  echo 'Sandbox:'",
         "  echo",
         "  echo '  Id: abc'",
@@ -325,6 +376,7 @@ describe("CLI connect recovery process contracts", () => {
         "fi",
         'if [ "$1" = "sandbox" ] && [ "$2" = "exec" ] && [ "$3" = "--name" ] && [ "$4" = "alpha" ]; then',
         '  cmd="$8"',
+        '  if [[ "$*" == *"inference.local/v1/models"* ]]; then echo "OK 200"; exit 0; fi',
         '  if [[ "$cmd" == *"curl -so"* ]]; then',
         "    echo '__NEMOCLAW_SANDBOX_EXEC_STARTED__'",
         '    if [ "$(cat "$state_file")" = recovered ]; then echo RUNNING; else echo STOPPED; fi',
@@ -348,10 +400,11 @@ describe("CLI connect recovery process contracts", () => {
     try {
       const result = runWithEnv("alpha connect --probe-only", {
         HOME: home,
+        NODE_OPTIONS: nonWslPlatformNodeOptions(home),
         PATH: `${localBin}:${process.env.PATH || ""}`,
       });
 
-      expect(result.code).toBe(0);
+      expect(result.code, result.out).toBe(0);
       expect(result.out).toContain("Probe complete: recovered Hermes Agent gateway");
       const openshellLog = fs.readFileSync(openshellCalls, "utf8");
       expect(openshellLog).toContain("sandbox exec --name alpha -- sh -c");
@@ -438,13 +491,17 @@ describe("CLI connect recovery process contracts", () => {
         "  echo 'alpha          Ready      2m ago'",
         "  exit 0",
         "fi",
-        'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && [ "$3" = "alpha" ]; then',
+        'if [ "$1" = "sandbox" ] && [ "$2" = "get" ] && { [ "$3" = "alpha" ] || [ "$5" = "alpha" ]; }; then',
         "  echo 'Sandbox:'",
         "  echo",
         "  echo '  Id: abc'",
         "  echo '  Name: alpha'",
         "  echo '  Namespace: openshell'",
         "  echo '  Phase: Ready'",
+        "  exit 0",
+        "fi",
+        'if [ "$1" = "sandbox" ] && [ "$2" = "exec" ] && [ "$3" = "--name" ] && [ "$4" = "alpha" ]; then',
+        "  echo 'OK 200'",
         "  exit 0",
         "fi",
         'if [ "$1" = "sandbox" ] && [ "$2" = "connect" ] && [ "$3" = "alpha" ]; then',
@@ -461,13 +518,14 @@ describe("CLI connect recovery process contracts", () => {
 
     const result = runWithEnv("alpha connect", {
       HOME: home,
+      NODE_OPTIONS: nonWslPlatformNodeOptions(home),
       PATH: `${localBin}:${process.env.PATH || ""}`,
     });
 
     expect(result.code).toBe(0);
     const calls = fs.readFileSync(markerFile, "utf8");
     expect(calls).toContain("sandbox list");
-    expect(calls).toContain("sandbox get alpha");
+    expect(calls).toContain("sandbox get -g nemoclaw alpha");
     expect(calls).toContain("sandbox connect alpha");
     const recoveredRegistry = JSON.parse(
       fs.readFileSync(path.join(nemoclawDir, "sandboxes.json"), "utf8"),

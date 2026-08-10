@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   configureDcodeSession,
   makeDcodeSandboxEntry,
-} from "../../../../test/helpers/rebuild-dcode-flow-support";
+} from "../../../../test/helpers/rebuild-dcode-flow-helpers";
 import {
   createRebuildFlowHarness,
   makePreparedRecoveryManifest,
@@ -43,13 +43,14 @@ describe("rebuildSandbox DCode flow: recovery", () => {
     expect(harness.prepareManagedDcodeRebuildImageSpy).toHaveBeenCalledOnce();
     expect(harness.backupSandboxStateSpy).not.toHaveBeenCalled();
     expect(harness.runOpenshellSpy).toHaveBeenCalledWith(
-      ["sandbox", "delete", "alpha"],
+      ["sandbox", "delete", "-g", "nemoclaw", "alpha"],
       expect.objectContaining({ ignoreError: true }),
     );
     expect(harness.onboardSpy).toHaveBeenCalledOnce();
     expect(harness.restoreSandboxStateSpy).toHaveBeenCalledWith(
       "alpha",
       recoveryManifest.backupPath,
+      { targetAgentType: "langchain-deepagents-code" },
     );
   });
   it("replays captured custom policies during stale DCode recovery without a backup (#6195)", async () => {

@@ -11,6 +11,7 @@ const {
   validateConfigDotpath,
   findClobberingAncestor,
   classifyNewKeyGate,
+  configSetAllowsOpenShellBridge,
   setDotpath,
   validateUrlValue,
   validateUrlValueWithDns,
@@ -90,6 +91,16 @@ describe("selectDirectSandboxContainer", () => {
     expect(selected).toBe("generated-id");
   });
 
+  it("returns the immutable id for a v0.0.99 default-workspace container", () => {
+    const selected = selectDirectSandboxContainer(
+      "demo",
+      "generated-id\topenshell-default--demo-abc123\n",
+      ["demo"],
+    );
+
+    expect(selected).toBe("generated-id");
+  });
+
   it("rejects a prefix-collision container owned by a longer sandbox name", () => {
     expect(() =>
       selectDirectSandboxContainer("demo", "child-id\topenshell-demo-child\n", [
@@ -125,7 +136,7 @@ describe("config set helpers", () => {
     it("routes --restart through the managed gateway supervisor flow", () => {
       const calls: string[] = [];
 
-      restartSandboxAgentAfterConfigSet("alpha", (sandboxName: string) => {
+      restartSandboxAgentAfterConfigSet("alpha", "openclaw", (sandboxName: string) => {
         calls.push(sandboxName);
         return { ok: true };
       });
@@ -133,10 +144,18 @@ describe("config set helpers", () => {
       expect(calls).toEqual(["alpha"]);
     });
 
-    it("fails the config command when the managed restart fails", () => {
-      expect(() => restartSandboxAgentAfterConfigSet("alpha", () => ({ ok: false }))).toThrow(
-        "Config was updated, but the managed gateway restart failed for 'alpha'.",
-      );
+    it("fails with a written-but-not-applied message and a retry hint when the restart fails", () => {
+      let thrown: unknown;
+      try {
+        restartSandboxAgentAfterConfigSet("alpha", "openclaw", () => ({ ok: false }));
+      } catch (error) {
+        thrown = error;
+      }
+
+      const message = thrown instanceof Error ? thrown.message : String(thrown);
+      expect(message).toContain("written to disk but NOT applied to the running agent");
+      expect(message).toContain("openclaw gateway restart did not complete for 'alpha'");
+      expect(message).toContain("nemoclaw 'alpha' gateway restart");
     });
   });
 
@@ -342,6 +361,39 @@ describe("config set helpers", () => {
     });
   });
 
+  describe("configSetAllowsOpenShellBridge", () => {
+    it("allows supported endpoint config leaf paths", () => {
+      expect(
+        configSetAllowsOpenShellBridge("openclaw", "models.providers.ollama-mem.baseUrl"),
+      ).toBe(true);
+      expect(
+        configSetAllowsOpenShellBridge("openclaw", "models.providers.ollama-mem", ["baseUrl"]),
+      ).toBe(true);
+      expect(configSetAllowsOpenShellBridge("hermes", "model.base_url")).toBe(true);
+    });
+
+    it("does not make the OpenShell bridge exception key-agnostic", () => {
+      expect(configSetAllowsOpenShellBridge("openclaw", "telemetry.endpoint")).toBe(false);
+      expect(
+        configSetAllowsOpenShellBridge("openclaw", "models.providers.ollama-mem", ["healthUrl"]),
+      ).toBe(false);
+      expect(configSetAllowsOpenShellBridge("openclaw", "models.providers", ["0", "baseUrl"])).toBe(
+        false,
+      );
+      expect(configSetAllowsOpenShellBridge("hermes", "custom_providers.base_url")).toBe(false);
+    });
+
+    it("does not grant the bridge exception through reserved key segments", () => {
+      expect(
+        configSetAllowsOpenShellBridge("openclaw", "models.providers", ["__proto__", "baseUrl"]),
+      ).toBe(false);
+      expect(
+        configSetAllowsOpenShellBridge("openclaw", "models.providers", ["constructor", "baseUrl"]),
+      ).toBe(false);
+      expect(configSetAllowsOpenShellBridge("hermes", "model", ["__proto__"])).toBe(false);
+    });
+  });
+
   describe("validateUrlValue", () => {
     it("accepts public https URLs", () => {
       expect(() => validateUrlValue("https://api.nvidia.com/v1")).not.toThrow();
@@ -396,6 +448,48 @@ describe("config set helpers", () => {
     it("rejects reserved hostname suffixes from the shared blocklist", () => {
       expect(() => validateUrlValue("http://printer.local:8080")).toThrow(/private/i);
       expect(() => validateUrlValue("http://my-vm.internal:8080")).toThrow(/private/i);
+    });
+
+    it("rejects the exact OpenShell host bridge by default", () => {
+      expect(() => validateUrlValue("http://host.openshell.internal:1024")).toThrow(/private/i);
+      expect(() => validateUrlValue("http://HOST.OPENSHELL.INTERNAL.:65535/v1")).toThrow(
+        /private/i,
+      );
+    });
+
+    it("allows the exact OpenShell host bridge only when explicitly enabled", () => {
+      expect(() =>
+        validateUrlValue("http://host.openshell.internal:1024", {
+          allowOpenShellBridge: true,
+        }),
+      ).not.toThrow();
+      expect(() =>
+        validateUrlValue("http://HOST.OPENSHELL.INTERNAL.:65535/v1", {
+          allowOpenShellBridge: true,
+        }),
+      ).not.toThrow();
+    });
+
+    it("rejects adjacent OpenShell host bridge bypass shapes", () => {
+      const options = { allowOpenShellBridge: true };
+      expect(() => validateUrlValue("http://host.openshell.internal:1023/v1", options)).toThrow(
+        /private/i,
+      );
+      expect(() => validateUrlValue("https://host.openshell.internal:11434/v1", options)).toThrow(
+        /private/i,
+      );
+      expect(() =>
+        validateUrlValue("http://evil.host.openshell.internal:11434/v1", options),
+      ).toThrow(/private/i);
+      expect(() =>
+        validateUrlValue("http://host.openshell.internal:11434/v1?token=secret", options),
+      ).toThrow(/private/i);
+      expect(() =>
+        validateUrlValue("http://user:pass@host.openshell.internal:11434/v1", options),
+      ).toThrow(/private/i);
+      expect(() => validateUrlValue("http://host.openshell.internal/v1", options)).toThrow(
+        /private/i,
+      );
     });
 
     it("rejects additional reserved special-use ranges from the shared blocklist", () => {
@@ -485,6 +579,26 @@ describe("config set helpers", () => {
       ).resolves.toBe(undefined);
     });
 
+    it("rejects the exact OpenShell host bridge by default without DNS lookup", async () => {
+      const lookup = async () => {
+        throw new Error("lookup should not run for the OpenShell host bridge");
+      };
+      await expect(
+        validateUrlValueWithDns("http://host.openshell.internal:11434/v1", lookup),
+      ).rejects.toThrow(/private/i);
+    });
+
+    it("allows the exact OpenShell host bridge only when explicitly enabled", async () => {
+      const lookup = async () => {
+        throw new Error("lookup should not run for the OpenShell host bridge");
+      };
+      await expect(
+        validateUrlValueWithDns("http://host.openshell.internal:11434/v1", lookup, {
+          allowOpenShellBridge: true,
+        }),
+      ).resolves.toBe(undefined);
+    });
+
     it("fails closed when DNS lookup errors", async () => {
       const lookup = async () => {
         throw new Error("NXDOMAIN");
@@ -524,6 +638,112 @@ describe("config set helpers", () => {
       await expect(
         rewriteConfigUrlsWithDnsPinning("https://93.184.216.34/v1", lookup),
       ).resolves.toBe("https://93.184.216.34/v1");
+    });
+
+    it("rejects exact OpenShell host bridge URLs by default", async () => {
+      const lookup = async () => {
+        throw new Error("lookup should not run for the OpenShell host bridge");
+      };
+      await expect(
+        rewriteConfigUrlsWithDnsPinning("http://host.openshell.internal:11434", lookup),
+      ).rejects.toThrow(/private/i);
+    });
+
+    it("preserves exact OpenShell host bridge URLs only when explicitly enabled (#7453)", async () => {
+      const lookup = async () => {
+        throw new Error("lookup should not run for the OpenShell host bridge");
+      };
+      await expect(
+        rewriteConfigUrlsWithDnsPinning(
+          {
+            models: {
+              providers: {
+                "ollama-mem": {
+                  api: "ollama",
+                  baseUrl: "http://host.openshell.internal:11434",
+                },
+              },
+            },
+          },
+          lookup,
+          { allowOpenShellBridge: true },
+        ),
+      ).resolves.toEqual({
+        models: {
+          providers: {
+            "ollama-mem": {
+              api: "ollama",
+              baseUrl: "http://host.openshell.internal:11434",
+            },
+          },
+        },
+      });
+    });
+
+    it("allows exact OpenShell host bridge URLs only at allowlisted nested paths", async () => {
+      const lookup = async () => {
+        throw new Error("lookup should not run for the OpenShell host bridge");
+      };
+
+      await expect(
+        rewriteConfigUrlsWithDnsPinning(
+          {
+            api: "ollama",
+            baseUrl: "http://host.openshell.internal:11434",
+            healthUrl: "http://host.openshell.internal:11434/api/tags",
+            apiKey: "x",
+            models: [{ id: "qwen3-embedding:4b", name: "Q" }],
+          },
+          lookup,
+          {
+            allowOpenShellBridgePath: (relativePath: readonly string[]) =>
+              configSetAllowsOpenShellBridge(
+                "openclaw",
+                "models.providers.ollama-mem",
+                relativePath,
+              ),
+          },
+        ),
+      ).rejects.toThrow(/private/i);
+
+      await expect(
+        rewriteConfigUrlsWithDnsPinning(
+          {
+            api: "ollama",
+            baseUrl: "http://host.openshell.internal:11434",
+            apiKey: "x",
+            models: [{ id: "qwen3-embedding:4b", name: "Q" }],
+          },
+          lookup,
+          {
+            allowOpenShellBridgePath: (relativePath: readonly string[]) =>
+              configSetAllowsOpenShellBridge(
+                "openclaw",
+                "models.providers.ollama-mem",
+                relativePath,
+              ),
+          },
+        ),
+      ).resolves.toEqual({
+        api: "ollama",
+        baseUrl: "http://host.openshell.internal:11434",
+        apiKey: "x",
+        models: [{ id: "qwen3-embedding:4b", name: "Q" }],
+      });
+    });
+
+    it("rejects exact OpenShell host bridge URLs below reserved object keys", async () => {
+      const lookup = async () => {
+        throw new Error("lookup should not run for the OpenShell host bridge");
+      };
+      const value = JSON.parse('{"__proto__":{"baseUrl":"http://host.openshell.internal:9999"}}');
+
+      await expect(
+        rewriteConfigUrlsWithDnsPinning(value, lookup, {
+          allowOpenShellBridgePath: (relativePath: readonly string[]) =>
+            configSetAllowsOpenShellBridge("openclaw", "models.providers", relativePath),
+        }),
+      ).rejects.toThrow(/private/i);
     });
 
     it("recursively rewrites nested HTTP URLs and leaves non-URLs unchanged", async () => {

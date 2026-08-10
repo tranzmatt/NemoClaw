@@ -54,12 +54,12 @@ describe("connectSandbox flow", () => {
     await expect(harness.connectSandbox("alpha")).rejects.toThrow("process.exit(0)");
 
     expect(harness.captureOpenshellSpy).toHaveBeenCalledWith(
-      ["sandbox", "list"],
+      ["sandbox", "list", "-g", "nemoclaw"],
       expect.objectContaining({ ignoreError: true }),
     );
     expect(harness.checkAndRecoverSpy).toHaveBeenCalledWith("alpha");
     expect(harness.ensureOllamaAuthProxySpy).toHaveBeenCalledTimes(1);
-    expect(harness.runAutoPairSpy).toHaveBeenCalledWith("alpha", expect.any(Object));
+    expect(harness.runAutoPairSpy).toHaveBeenCalledWith("alpha");
     expect(harness.spawnSyncSpy).toHaveBeenCalledWith(
       "openshell",
       ["sandbox", "connect", "alpha"],
@@ -237,7 +237,7 @@ describe("connectSandbox flow", () => {
     expect(exitSpy).toHaveBeenCalledWith(0);
   });
 
-  it("runs the dcode inference route probe through its login-shell proxy contract (#6191)", async () => {
+  it("runs the DCode route probe through its managed runtime boundary (#6191)", async () => {
     const harness = createConnectHarness({
       agentName: "langchain-deepagents-code",
       sessionAgent: {
@@ -279,31 +279,204 @@ describe("connectSandbox flow", () => {
         "exec",
         "--name",
         "alpha",
+        "--no-tty",
+        "--env",
+        "HOME=/usr/local/lib/nemoclaw",
+        "--env",
+        "BASH_ENV=",
+        "--env",
+        "ENV=",
         "--",
-        "env",
-        "-u",
-        "HTTP_PROXY",
-        "-u",
-        "HTTPS_PROXY",
-        "-u",
-        "http_proxy",
-        "-u",
-        "https_proxy",
-        "-u",
-        "NO_PROXY",
-        "-u",
-        "no_proxy",
-        "-u",
-        "ALL_PROXY",
-        "-u",
-        "all_proxy",
-        "HOME=/sandbox",
-        "bash",
-        "-lc",
-        expect.stringContaining("https://inference.local/v1/models"),
+        "/usr/local/lib/nemoclaw/dcode-managed-exec",
+        "/bin/sh",
+        "-c",
+        expect.stringContaining("/usr/bin/curl"),
       ],
       expect.objectContaining({ ignoreError: true }),
     );
+  });
+
+  it.each([
+    401, 403, 404,
+  ])("rejects HTTP %i from inference.local for an Ollama recovery path (#8502)", async (httpStatus) => {
+    const response = `OK ${String(httpStatus)}`;
+    const harness = createConnectHarness({
+      inferenceGetOutput: "Provider: ollama-local\nModel: qwen3-vl:4b\n",
+      inferenceProbeResponses: [response, response],
+      registryEntry: { provider: "ollama-local", model: "qwen3-vl:4b" },
+    });
+
+    await expect(harness.connectSandbox("alpha", { probeOnly: true })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    expect(harness.errorSpy.mock.calls.flat().join("\n")).toContain(
+      "inference.local/v1/models must return HTTP 2xx",
+    );
+    expect(harness.probeLocalProviderHealthSpy).toHaveBeenCalledWith("ollama-local", {
+      skipOllamaAuthProxySubprobe: true,
+    });
+    expect(harness.probeOllamaAuthProxyHealthSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("rechecks HTTP 2xx after repairing an Ollama inference route (#8502)", async () => {
+    const harness = createConnectHarness({
+      inferenceGetOutput: "Provider: ollama-local\nModel: qwen3-vl:4b\n",
+      inferenceProbeResponses: ["BROKEN 503", "OK 401", "OK 401"],
+      registryEntry: { provider: "ollama-local", model: "qwen3-vl:4b" },
+    });
+
+    await expect(harness.connectSandbox("alpha", { probeOnly: true })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    expect(harness.runSetupDnsProxySpy).toHaveBeenCalled();
+    expect(harness.errorSpy.mock.calls.flat().join("\n")).toContain(
+      "inference.local/v1/models must return HTTP 2xx",
+    );
+  });
+
+  it("fails closed with actionable diagnostics when the initial route probe is inconclusive (#6192)", async () => {
+    const longProbeDetail = `route probe unavailable NVIDIA_API_KEY=super-secret ${"x".repeat(400)}`;
+    const harness = createConnectHarness({
+      registryEntry: {
+        provider: "nvidia-prod",
+        model: "nvidia/nemotron-3-super-120b-a12b",
+      },
+      inferenceGetOutput: "Provider: nvidia-prod\nModel: nvidia/nemotron-3-super-120b-a12b\n",
+      inferenceProbeResponses: [longProbeDetail],
+    });
+
+    await expect(harness.connectSandbox("alpha")).rejects.toThrow("process.exit(1)");
+
+    expect(harness.applyVmDnsMonkeypatchSpy).not.toHaveBeenCalled();
+    expect(harness.runSetupDnsProxySpy).not.toHaveBeenCalled();
+    expect(harness.spawnSyncSpy).not.toHaveBeenCalledWith(
+      "openshell",
+      ["sandbox", "connect", "alpha"],
+      expect.any(Object),
+    );
+    const errorOutput = harness.errorSpy.mock.calls.flat().join("\n");
+    expect(errorOutput).toContain("did not return a trusted result");
+    expect(errorOutput).toContain("Last probe: route probe unavailable");
+    expect(errorOutput).toContain("Run:  nemoclaw alpha doctor");
+    expect(errorOutput).not.toContain("super-secret");
+    expect(errorOutput).not.toContain("x".repeat(241));
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("fails closed without repair when the route probe transport throws (#6192)", async () => {
+    const harness = createConnectHarness({
+      registryEntry: {
+        provider: "nvidia-prod",
+        model: "nvidia/nemotron-3-super-120b-a12b",
+      },
+    });
+    harness.captureOpenshellSpy
+      .mockReturnValueOnce({ status: 0, output: "alpha Ready" })
+      .mockReturnValueOnce({
+        status: 0,
+        output:
+          "Gateway inference:\n  Provider: nvidia-prod\n  Model: nvidia/nemotron-3-super-120b-a12b\n",
+      })
+      .mockImplementationOnce(() => {
+        throw new Error("sandbox exec transport failed");
+      });
+
+    await expect(harness.connectSandbox("alpha")).rejects.toThrow("process.exit(1)");
+
+    expect(JSON.stringify(harness.captureOpenshellSpy.mock.calls[2]?.[0])).toContain(
+      "inference.local/v1/models",
+    );
+    expect(harness.applyVmDnsMonkeypatchSpy).not.toHaveBeenCalled();
+    expect(harness.runSetupDnsProxySpy).not.toHaveBeenCalled();
+    expect(harness.runOpenshellSpy).not.toHaveBeenCalled();
+    expect(harness.spawnSyncSpy).not.toHaveBeenCalledWith(
+      "openshell",
+      ["sandbox", "connect", "alpha"],
+      expect.any(Object),
+    );
+    const errorOutput = harness.errorSpy.mock.calls.flat().join("\n");
+    expect(errorOutput).toContain("did not return a trusted result");
+    expect(errorOutput).toContain("Last probe: sandbox exec transport failed");
+    expect(errorOutput).not.toContain("after DNS and route repair");
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("fails closed without repair when the route probe transport times out (#6192)", async () => {
+    const timeoutError = Object.assign(new Error("sandbox exec timed out"), {
+      code: "ETIMEDOUT",
+    });
+    const harness = createConnectHarness({
+      registryEntry: {
+        provider: "nvidia-prod",
+        model: "nvidia/nemotron-3-super-120b-a12b",
+      },
+    });
+    harness.captureOpenshellSpy
+      .mockReturnValueOnce({ status: 0, output: "alpha Ready" })
+      .mockReturnValueOnce({
+        status: 0,
+        output:
+          "Gateway inference:\n  Provider: nvidia-prod\n  Model: nvidia/nemotron-3-super-120b-a12b\n",
+      })
+      .mockReturnValueOnce({ status: null, output: "", error: timeoutError });
+
+    await expect(harness.connectSandbox("alpha")).rejects.toThrow("process.exit(1)");
+
+    expect(JSON.stringify(harness.captureOpenshellSpy.mock.calls[2]?.[0])).toContain(
+      "inference.local/v1/models",
+    );
+    expect(harness.applyVmDnsMonkeypatchSpy).not.toHaveBeenCalled();
+    expect(harness.runSetupDnsProxySpy).not.toHaveBeenCalled();
+    expect(harness.runOpenshellSpy).not.toHaveBeenCalled();
+    expect(harness.spawnSyncSpy).not.toHaveBeenCalledWith(
+      "openshell",
+      ["sandbox", "connect", "alpha"],
+      expect.any(Object),
+    );
+    const errorOutput = harness.errorSpy.mock.calls.flat().join("\n");
+    expect(errorOutput).toContain("did not return a trusted result");
+    expect(errorOutput).toContain("openshell sandbox exec exited with status 1");
+    expect(errorOutput).not.toContain("after DNS and route repair");
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("fails closed without repair when the OpenShell CA boundary is unavailable (#6192)", async () => {
+    const harness = createConnectHarness({
+      registryEntry: {
+        provider: "nvidia-prod",
+        model: "nvidia/nemotron-3-super-120b-a12b",
+      },
+    });
+    harness.captureOpenshellSpy
+      .mockReturnValueOnce({ status: 0, output: "alpha Ready" })
+      .mockReturnValueOnce({
+        status: 0,
+        output:
+          "Gateway inference:\n  Provider: nvidia-prod\n  Model: nvidia/nemotron-3-super-120b-a12b\n",
+      })
+      .mockReturnValueOnce({
+        status: 0,
+        output: "UNAVAILABLE OpenShell CA bundle missing or unreadable",
+      });
+
+    await expect(harness.connectSandbox("alpha")).rejects.toThrow("process.exit(1)");
+
+    expect(harness.applyVmDnsMonkeypatchSpy).not.toHaveBeenCalled();
+    expect(harness.runSetupDnsProxySpy).not.toHaveBeenCalled();
+    expect(harness.runOpenshellSpy).not.toHaveBeenCalled();
+    expect(harness.spawnSyncSpy).not.toHaveBeenCalledWith(
+      "openshell",
+      ["sandbox", "connect", "alpha"],
+      expect.any(Object),
+    );
+    const errorOutput = harness.errorSpy.mock.calls.flat().join("\n");
+    expect(errorOutput).toContain("did not return a trusted result");
+    expect(errorOutput).toContain("OpenShell CA bundle missing or unreadable");
+    expect(errorOutput).not.toContain("after DNS and route repair");
+    expect(exitSpy).toHaveBeenCalledWith(1);
   });
 
   it("stops before opening SSH when the sandbox list reports a terminal failure phase", async () => {
@@ -323,13 +496,21 @@ describe("connectSandbox flow", () => {
 
   it("probe-only mode reports recovered gateways without opening an interactive shell", async () => {
     const harness = createConnectHarness({
-      processCheck: { checked: true, wasRunning: false, recovered: true },
+      processCheck: {
+        checked: true,
+        wasRunning: false,
+        recovered: true,
+        managedControlCompletion: { disposition: "ok", oldPid: 0, newPid: 123 },
+      },
     });
 
     await expect(harness.connectSandbox("alpha", { probeOnly: true })).resolves.toBeUndefined();
 
-    expect(harness.checkAndRecoverSpy).toHaveBeenCalledWith("alpha", { quiet: true });
-    expect(harness.runAutoPairSpy).toHaveBeenCalledWith("alpha", expect.any(Object));
+    expect(harness.checkAndRecoverSpy).toHaveBeenCalledWith(
+      "alpha",
+      expect.objectContaining({ quiet: true }),
+    );
+    expect(harness.runAutoPairSpy).toHaveBeenCalledWith("alpha");
     expect(harness.spawnSyncSpy).not.toHaveBeenCalledWith(
       "openshell",
       ["sandbox", "connect", "alpha"],
@@ -338,6 +519,48 @@ describe("connectSandbox flow", () => {
     expect(harness.logSpy.mock.calls.flat().join("\n")).toContain(
       "Probe complete: recovered OpenClaw gateway in 'alpha'.",
     );
+  });
+
+  it("probe-only mode exits before reporting success when inference.local returns no trusted result (#8502)", async () => {
+    const harness = createConnectHarness({
+      registryEntry: {
+        provider: "nvidia-prod",
+        model: "nvidia/nemotron-3-super-120b-a12b",
+      },
+      inferenceGetOutput: "Provider: nvidia-prod\nModel: nvidia/nemotron-3-super-120b-a12b\n",
+      inferenceProbeResponses: ["route probe unavailable"],
+    });
+
+    await expect(harness.connectSandbox("alpha", { probeOnly: true })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    expect(harness.logSpy.mock.calls.flat().join("\n")).not.toContain("Probe complete");
+    expect(harness.errorSpy.mock.calls.flat().join("\n")).toContain(
+      "inference route is not known healthy",
+    );
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it("probe-only mode reports an ordinary running gateway for an already-running completion (#7919)", async () => {
+    const harness = createConnectHarness({
+      processCheck: {
+        checked: true,
+        wasRunning: false,
+        recovered: true,
+        managedControlCompletion: {
+          disposition: "already-running",
+          oldPid: 123,
+          newPid: 456,
+        },
+      },
+    });
+
+    await expect(harness.connectSandbox("alpha", { probeOnly: true })).resolves.toBeUndefined();
+
+    const output = harness.logSpy.mock.calls.flat().join("\n");
+    expect(output).toContain("Probe complete: OpenClaw gateway is running in 'alpha'.");
+    expect(output).not.toContain("Probe complete: recovered OpenClaw gateway");
   });
 
   it("probe-only mode exits when process inspection cannot run", async () => {
@@ -357,6 +580,30 @@ describe("connectSandbox flow", () => {
     );
     expect(exitSpy).toHaveBeenCalledWith(1);
   });
+  it("probe-only mode reports the supported repair when relaunch is quarantined (#7801)", async () => {
+    const harness = createConnectHarness({
+      processCheck: { checked: true, wasRunning: false, recovered: false },
+    });
+    // Managed recovery runs quiet on this path, so the classified layer only
+    // reaches the operator through the callback the probe passes in.
+    harness.checkAndRecoverSpy.mockImplementation((_sandboxName: unknown, options: unknown) => {
+      (
+        options as { onRecoveryFailureLayer?: (layer: string) => void } | undefined
+      )?.onRecoveryFailureLayer?.("relaunch quarantined");
+      return { checked: true, wasRunning: false, recovered: false };
+    });
+
+    await expect(harness.connectSandbox("alpha", { probeOnly: true })).rejects.toThrow(
+      "process.exit(1)",
+    );
+
+    const errorOutput = harness.errorSpy.mock.calls.map((call) => String(call[0] ?? "")).join("\n");
+    expect(errorOutput).toContain("quarantined gateway relaunch");
+    expect(errorOutput).toContain("nemoclaw alpha rebuild --yes");
+    expect(errorOutput).not.toContain("Check /tmp/gateway.log inside the sandbox for details.");
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
   it("probe-only mode exits when primary dashboard/API forward recovery fails", async () => {
     const harness = createConnectHarness({
       processCheck: {

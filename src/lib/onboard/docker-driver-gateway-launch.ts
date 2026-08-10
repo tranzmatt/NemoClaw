@@ -12,6 +12,7 @@ import {
 } from "./docker-driver-gateway-compat";
 import {
   buildDockerDriverGatewayConfigToml,
+  NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV,
   prepareDockerDriverGatewayConfigEnv,
 } from "./docker-driver-gateway-config";
 import {
@@ -22,6 +23,7 @@ import {
   buildDockerDriverGatewayLocalTlsEnv,
   ensureDockerDriverGatewayLocalTlsBundle,
 } from "./docker-driver-gateway-local-tls";
+import { buildOwnedHostGatewayArgv0 } from "./gateway-process-identity";
 
 export {
   compareDottedVersions,
@@ -37,6 +39,7 @@ export { buildDockerDriverGatewayConfigToml };
 export type DockerDriverGatewayLaunch = {
   command: string;
   args: string[];
+  argv0?: string;
   env: NodeJS.ProcessEnv;
   mode: "host" | "container";
   processGatewayBin: string | null;
@@ -74,6 +77,7 @@ export function spawnDockerDriverGateway(
 ): ChildProcess {
   try {
     return spawn(launch.command, launch.args, {
+      argv0: launch.argv0,
       detached: true,
       stdio: ["ignore", logFd, logFd],
       env: launch.env,
@@ -111,6 +115,9 @@ function buildGatewayProcessEnv(
   if (!("OPENSHELL_DISABLE_GATEWAY_AUTH" in gatewayEnv)) {
     delete env.OPENSHELL_DISABLE_GATEWAY_AUTH;
   }
+  if (!(NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV in gatewayEnv)) {
+    delete env[NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV];
+  }
   return env;
 }
 
@@ -144,6 +151,7 @@ export function buildDockerDriverGatewayLaunch(
     return {
       command: options.gatewayBin,
       args: [],
+      argv0: buildOwnedHostGatewayArgv0(options.gatewayName) ?? undefined,
       env,
       mode: "host",
       processGatewayBin: options.gatewayBin,
@@ -173,6 +181,7 @@ export function buildDockerDriverGatewayRuntimeIdentity(
     ...Object.keys(options.gatewayEnv),
     "OPENSHELL_DOCKER_SUPERVISOR_BIN",
     "OPENSHELL_GATEWAY_CONFIG",
+    NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV,
   ]);
   const desiredEnv = Object.fromEntries(
     Object.entries(launch.env).filter(

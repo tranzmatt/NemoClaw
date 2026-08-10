@@ -2,9 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { type MockInstance, vi } from "vitest";
+import type { GatewayRestartResult } from "../../src/lib/actions/sandbox/gateway-restart";
 import type { SandboxGatewayState } from "../../src/lib/actions/sandbox/gateway-state";
-import type { RebuildImagePreflightResult } from "../../src/lib/actions/sandbox/rebuild-custom-image-preflight";
+import type {
+  finalizePreparedRebuildImageMessagingPlan,
+  RebuildImagePreflightResult,
+} from "../../src/lib/actions/sandbox/rebuild-custom-image-preflight";
 import type { RebuildRecreateOnboardOpts } from "../../src/lib/actions/sandbox/rebuild-gpu-opt-out";
+import type { VersionCheckResult } from "../../src/lib/sandbox/version";
+import type { PreservedEnvFile } from "../../src/lib/state/preserved-env";
 import type { SandboxRemovalReceipt } from "../../src/lib/state/registry";
 
 export type RebuildSandbox =
@@ -28,13 +34,25 @@ export type RebuildFlowSession = Record<string, unknown> & {
   steps: Record<string, RebuildFlowStep>;
 };
 export type RebuildFlowOverrides = {
+  entryUpdatesAfterVersionCheck?: Record<string, unknown>;
   applyPreset?: (presetName: string) => boolean;
   baseImagePreflight?: {
     ok: boolean;
     imageRef: string | null;
     overrideEnvVar: string | null;
+    disposeImageRef?: () => boolean;
   };
   executeSandboxCommand?: () => { status: number; stdout: string; stderr: string } | null;
+  checkAndRecoverSandboxProcesses?: () => {
+    checked: boolean;
+    wasRunning: boolean | null;
+    recovered: boolean;
+    forwardRecovered: boolean;
+    forwardRecoveryFailed?: boolean;
+    secretBoundaryRefused?: boolean;
+    mcpReconciliationRefused?: boolean;
+  };
+  restartSandboxGateway?: () => GatewayRestartResult;
   onboard?: (
     session: RebuildFlowSession,
     options: RebuildRecreateOnboardOpts,
@@ -52,6 +70,12 @@ export type RebuildFlowOverrides = {
   };
   restoreMcpBridgesAfterRebuild?: () => Promise<void>;
   buildMessagingRebuildPlan?: () => Promise<unknown> | unknown;
+  agentPolicyAdditionsContent?: string;
+  preflightWithProductionBaselineResolver?: boolean;
+  preflightAuthoritativeRebuildTarget?: (options: Record<string, unknown>) => Promise<void> | void;
+  revalidateRebuildRouteBeforeDelete?: (
+    receipt: Record<string, unknown>,
+  ) => { ok: true; receipt: Record<string, unknown> } | { ok: false; message: string };
   sandboxEntry?: Record<string, unknown>;
   sandboxBaseImageLabelsOutput?: string;
   sessionSandboxName?: string;
@@ -71,19 +95,34 @@ export type RebuildFlowOverrides = {
     detachedProviderEntries: Array<Record<string, unknown>>;
     scrubbedAdapterEntries?: Array<Record<string, unknown>>;
   };
-  runOpenshell?: (args: string[]) => {
-    status: number;
-    output: string;
+  runOpenshell?: (args: string[]) =>
+    | {
+        status: number;
+        output: string;
+        stdout?: string;
+        stderr?: string;
+      }
+    | undefined;
+  captureOpenshell?: (
+    args: string[],
+    options?: Record<string, unknown>,
+  ) => {
+    status: number | null;
+    output?: string;
     stdout?: string;
     stderr?: string;
+    error?: Error;
   };
   backupPolicyPresets?: string[];
+  backupPreservedEnv?: PreservedEnvFile[];
   ensureValidatedBraveSearchCredential?: () => Promise<unknown>;
   ensureValidatedWebSearchCredential?: () => Promise<unknown>;
   hermesCredentialKeys?: string[] | null;
   hermesProviderExists?: boolean;
+  versionCheck?: VersionCheckResult;
   hydrateCredentialEnv?: (credentialEnv: string) => string | null;
   customImagePreflight?: RebuildImagePreflightResult;
+  finalizePreparedImage?: typeof finalizePreparedRebuildImageMessagingPlan;
   defaultSelectionRevision?: number;
   preDeleteDefaultSelectionRevision?: number;
   removalReceipt?: SandboxRemovalReceipt | null;
@@ -94,6 +133,8 @@ export type RebuildFlowHarness = {
   rebuildSandbox: RebuildSandbox;
   applyPresetSpy: MockInstance;
   backupSandboxStateSpy: MockInstance;
+  checkAndRecoverSandboxProcessesSpy: MockInstance;
+  restartSandboxGatewaySpy: MockInstance;
   errorSpy: MockInstance;
   executeSandboxCommandSpy: MockInstance;
   ensureMessagingHostForwardAfterRebuildSpy: MockInstance;
@@ -102,7 +143,7 @@ export type RebuildFlowHarness = {
   ensureValidatedBraveSearchCredentialSpy: MockInstance;
   hydrateCredentialEnvSpy: MockInstance;
   logSpy: MockInstance;
-  markStepFailedSpy: MockInstance;
+  finalizeIncompleteOnboardStepSpy: MockInstance;
   onboardSpy: MockInstance;
   registryUpdateSpy: MockInstance;
   setDefaultSpy: MockInstance;
@@ -112,9 +153,11 @@ export type RebuildFlowHarness = {
     defaultSandbox: string | null;
     defaultSelectionRevision: number;
   };
+  registerHermesInferenceProviderSpy: MockInstance;
   releaseOnboardLockSpy: MockInstance;
   relockSpy: MockInstance;
   restoreSandboxStateSpy: MockInstance;
+  captureOpenshellSpy: MockInstance;
   runOpenshellSpy: MockInstance;
   messagingRebuildPlanSpy: MockInstance;
   prepareMcpBridgesForAbsentSandboxRebuildSpy: MockInstance;
@@ -125,6 +168,7 @@ export type RebuildFlowHarness = {
   restoreSandboxEntryIfMissingSpy: MockInstance;
   restoreMcpBridgesAfterRebuildSpy: MockInstance;
   warnUnpreservedUserManagedFilesSpy: MockInstance;
+  finalizePreparedImageSpy: MockInstance;
   session: RebuildFlowSession;
 };
 export const originalSandboxName = process.env.NEMOCLAW_SANDBOX_NAME;
@@ -147,10 +191,23 @@ function createStep(status: string): RebuildFlowStep {
 }
 export function createRebuildFlowSession(machineSnapshotVersion: number): RebuildFlowSession {
   return {
+    sessionId: "rebuild-flow-session",
+    updatedAt: "2026-06-01T00:00:00.000Z",
     sandboxName: "alpha",
+    agent: null,
     provider: "ollama-local",
     model: "nvidia/nemotron",
     credentialEnv: null,
+    checkpoint: null,
+    webSearchConfig: null,
+    resourceProfile: null,
+    messagingPlan: null,
+    sandboxPromptProgress: {
+      sandboxName: true,
+      webSearch: false,
+      messaging: false,
+      resourceProfile: false,
+    },
     metadata: {},
     hermesToolGateways: [],
     lastStepStarted: null,
@@ -175,15 +232,18 @@ export function createRebuildFlowSession(machineSnapshotVersion: number): Rebuil
   };
 }
 export function installTerminalStepFailureMock(
-  onboardSession: { markStepFailed: (...args: unknown[]) => unknown },
+  onboardSession: { finalizeIncompleteOnboardStep: (...args: unknown[]) => unknown },
   session: RebuildFlowSession,
 ): MockInstance {
   return vi
-    .spyOn(onboardSession, "markStepFailed")
-    .mockImplementation((stepName: unknown, message: unknown, options: unknown) => {
+    .spyOn(onboardSession, "finalizeIncompleteOnboardStep")
+    .mockImplementation((stepName: unknown, message: unknown) => {
+      if (session.machine.state === "failed" || session.machine.state === "complete") {
+        return session;
+      }
       const stepKey = String(stepName);
-      const step = session.steps[stepKey] ?? createStep("pending");
-      session.steps[stepKey] = step;
+      const step = session.steps[stepKey];
+      if (!step) return session;
       step.status = "failed";
       step.error = typeof message === "string" ? message : null;
       session.status = "failed";
@@ -192,10 +252,8 @@ export function installTerminalStepFailureMock(
         message: typeof message === "string" ? message : null,
         recordedAt: "2026-06-01T00:02:00.000Z",
       };
-      const updateMachine =
-        (options as { updateMachine?: boolean } | undefined)?.updateMachine === true;
-      session.machine.state = updateMachine ? "failed" : session.machine.state;
-      session.machine.revision += updateMachine ? 1 : 0;
+      session.machine.state = "failed";
+      session.machine.revision += 1;
       return session;
     });
 }

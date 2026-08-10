@@ -14,6 +14,7 @@ import { resultText } from "../fixtures/clients/command.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import { type SandboxClient, trustedSandboxShellScript } from "../fixtures/clients/sandbox.ts";
 import { expect } from "../fixtures/e2e-test.ts";
+import { discoverHostAddress } from "../fixtures/host-address.ts";
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 import {
   type DnsRebindingHostsFixture,
@@ -114,10 +115,10 @@ export function buildRawOpenShellAllowedIpsRebindingPolicy(
  * This intentionally bypasses every NemoClaw MCP command and agent adapter.
  *
  * Pinned resolve-validate-connect implementation:
- * https://github.com/NVIDIA/OpenShell/blob/8cb16de9eae4c44d7d31e1493747d8c10abb5963/crates/openshell-supervisor-network/src/proxy.rs#L2476-L2502
- * resolves once, #L2527-L2567 validates that address list, #L2622-L2630
- * returns it unchanged, and #L3885-L3893 plus #L4123-L4125 carry that same
- * list through the explicit HTTP-forward connection path used by this probe.
+ * https://github.com/NVIDIA/OpenShell/blob/3dee5570a46076a57a3b056f35f35ebc0861ac85/crates/openshell-supervisor-network/src/proxy.rs#L2648-L2674
+ * resolves once, #L2699-L2739 plus #L2794-L2803 validate and return that
+ * address list, and #L4093-L4100 plus #L4340-L4342 carry that same list through
+ * the explicit HTTP-forward connection path used by this probe.
  */
 export function buildRawOpenShellAllowedIpsRebindingProbeScript(targetUrl: string): string {
   const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" });
@@ -141,26 +142,7 @@ export function buildRawOpenShellAllowedIpsRebindingProbeScript(targetUrl: strin
 }
 
 async function hostAddressForSandbox(host: HostCliClient): Promise<string> {
-  const probe = await host.command(
-    "bash",
-    [
-      "-lc",
-      [
-        'ip_addr="$(ip route get 1.1.1.1 2>/dev/null | awk \'{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}\')"',
-        'if [ -n "$ip_addr" ]; then echo "$ip_addr"; exit 0; fi',
-        "ip_addr=\"$(hostname -I 2>/dev/null | awk '{print $1}')\"",
-        'if [ -n "$ip_addr" ]; then echo "$ip_addr"; exit 0; fi',
-        "echo 127.0.0.1",
-      ].join("\n"),
-    ],
-    {
-      artifactName: "raw-openshell-rebinding-host-address",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 30_000,
-    },
-  );
-  expect(probe.exitCode, resultText(probe)).toBe(0);
-  return probe.stdout.trim();
+  return (await discoverHostAddress(host)).address;
 }
 
 async function closeServer(server: Server): Promise<void> {

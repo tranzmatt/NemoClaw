@@ -14,6 +14,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
+import { registerSandboxCleanupUnlessKept } from "../fixtures/cleanup-resources.ts";
 import { resultText } from "../fixtures/clients/command.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import { validateSandboxName } from "../fixtures/clients/sandbox.ts";
@@ -23,7 +24,7 @@ import { CLI_DIST_ENTRYPOINT, CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/path
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
 import { parseJsonFromText } from "./json-envelope.ts";
 
-const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-sessions-agents-cli";
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-sessions-cli";
 const TEST_AGENT_ID = process.env.NEMOCLAW_E2E_AGENT_ID ?? "work";
 const ONBOARD_TIMEOUT_MS = 40 * 60_000;
 const AGENT_TURN_TIMEOUT_MS = 5 * 60_000;
@@ -65,14 +66,6 @@ function commandEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
     PATH: [path.join(process.env.HOME ?? "", ".local", "bin"), base.PATH].filter(Boolean).join(":"),
     ...extra,
   };
-}
-
-async function bestEffort(run: () => Promise<unknown>): Promise<void> {
-  try {
-    await run();
-  } catch {
-    // Cleanup is best effort so an early setup failure keeps the original error.
-  }
 }
 
 async function runNemoclaw(
@@ -131,7 +124,7 @@ async function ensureOpenshellAvailable(host: HostCliClient): Promise<void> {
   ).toBe(0);
 }
 
-async function cleanupSandbox(host: HostCliClient, hosted: HostedInferenceConfig): Promise<void> {
+async function precleanSandbox(host: HostCliClient, hosted: HostedInferenceConfig): Promise<void> {
   if (process.env.NEMOCLAW_E2E_KEEP_SANDBOX === "1") return;
 
   const destroy = await runNemoclaw(host, [SANDBOX_NAME, "destroy", "--yes"], hosted, {
@@ -307,7 +300,17 @@ async function expectJsonCommand(
 
 test("sessions/agents host CLI routes to OpenClaw and preserves JSON envelopes", {
   timeout: TEST_TIMEOUT_MS,
-}, async ({ artifacts, cleanup, host, secrets, skip }) => {
+  meta: {
+    e2ePhases: [
+      "confirm CLI Docker and OpenShell prerequisites",
+      "onboard the sessions and agents sandbox",
+      "exercise main-agent session JSON and reset",
+      "add and list the secondary agent",
+      "seed and delete the secondary-agent session",
+      "delete the secondary agent and confirm absence",
+    ],
+  },
+}, async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
   expect(fs.existsSync(CLI_ENTRYPOINT), "bin/nemoclaw.js missing").toBe(true);
   expect(
     fs.existsSync(CLI_DIST_ENTRYPOINT),
@@ -340,12 +343,25 @@ test("sessions/agents host CLI routes to OpenClaw and preserves JSON envelopes",
 
   const hosted = requireHostedInferenceConfig(secrets);
   await ensureOpenshellAvailable(host);
-  cleanup.add(`destroy sessions/agents sandbox ${SANDBOX_NAME}`, async () =>
-    bestEffort(() => cleanupSandbox(host, hosted)),
-  );
-  await cleanupSandbox(host, hosted);
+  registerSandboxCleanupUnlessKept(process.env.NEMOCLAW_E2E_KEEP_SANDBOX === "1", () => {
+    cleanup.trackDisposable(`delete OpenShell sandbox ${SANDBOX_NAME}`, () =>
+      sandbox.cleanupSandbox(SANDBOX_NAME, {
+        artifactName: "cleanup-openshell-sandbox-delete-sessions-agents-cli",
+        env: commandEnv(),
+        timeoutMs: 60_000,
+      }),
+    );
+    cleanup.trackSandbox(host, SANDBOX_NAME, {
+      artifactName: "cleanup-nemoclaw-destroy-sessions-agents-cli",
+      env: commandEnv(hosted.env),
+      redactionValues: [hosted.apiKey],
+      timeoutMs: 5 * 60_000,
+    });
+  });
+  await precleanSandbox(host, hosted);
   fs.rmSync(path.join(process.env.HOME ?? "", ".nemoclaw", "onboard.lock"), { force: true });
 
+  progress.phase("onboard the sessions and agents sandbox");
   const onboard = await runNemoclaw(
     host,
     ["onboard", "--non-interactive", "--yes-i-accept-third-party-software"],
@@ -371,6 +387,7 @@ test("sessions/agents host CLI routes to OpenClaw and preserves JSON envelopes",
 
   await approvePendingPairingRequests(host, hosted, "post-onboard-scope");
 
+  progress.phase("exercise main-agent session JSON and reset");
   const mainSeed = await runNemoclaw(
     host,
     [SANDBOX_NAME, "exec", "--", "openclaw", "agent", "--agent", "main", "-m", "ping"],
@@ -422,6 +439,7 @@ test("sessions/agents host CLI routes to OpenClaw and preserves JSON envelopes",
     });
   }
 
+  progress.phase("add and list the secondary agent");
   const addAgent = await runNemoclaw(
     host,
     [
@@ -459,6 +477,7 @@ test("sessions/agents host CLI routes to OpenClaw and preserves JSON envelopes",
     `agents list --json must include '${TEST_AGENT_ID}'`,
   ).toBe(true);
 
+  progress.phase("seed and delete the secondary-agent session");
   const workSeed = await runNemoclaw(
     host,
     [SANDBOX_NAME, "exec", "--", "openclaw", "agent", "--agent", TEST_AGENT_ID, "-m", "ping"],
@@ -506,6 +525,7 @@ test("sessions/agents host CLI routes to OpenClaw and preserves JSON envelopes",
     `session key '${sessionKey}' must be absent after delete`,
   ).toBe(false);
 
+  progress.phase("delete the secondary agent and confirm absence");
   const deleteAgent = await runNemoclaw(
     host,
     [SANDBOX_NAME, "agents", "delete", TEST_AGENT_ID, "--force", "--json"],

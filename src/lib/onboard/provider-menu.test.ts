@@ -7,6 +7,7 @@ import { buildInferenceProviderMenu } from "./provider-menu";
 
 const REMOTE_PROVIDER_CONFIG = {
   build: { label: "NVIDIA Endpoints" },
+  openrouter: { label: "OpenRouter" },
   openai: { label: "OpenAI" },
   custom: { label: "Other OpenAI-compatible endpoint" },
   anthropic: { label: "Anthropic" },
@@ -47,11 +48,13 @@ describe("buildInferenceProviderMenu", () => {
     expect(result.hermesProviderAvailable).toBe(false);
     expect(result.options.map((option) => option.key)).toEqual([
       "build",
+      "openrouter",
       "openai",
       "custom",
       "anthropic",
       "anthropicCompatible",
       "gemini",
+      "llama-cpp",
     ]);
   });
 
@@ -72,6 +75,7 @@ describe("buildInferenceProviderMenu", () => {
     expect(result.hermesProviderAvailable).toBe(true);
     expect(result.options.map((option) => option.key)).toEqual([
       "build",
+      "openrouter",
       "openai",
       "custom",
       "anthropic",
@@ -83,6 +87,7 @@ describe("buildInferenceProviderMenu", () => {
       "install-ollama",
       "routed",
       "hermesProvider",
+      "llama-cpp",
     ]);
     expect(result.options.find((option) => option.key === "build")?.label).toBe("NVIDIA Endpoints");
     expect(result.options.find((option) => option.key === "hermesProvider")?.label).toBe(
@@ -97,7 +102,7 @@ describe("buildInferenceProviderMenu", () => {
       windowsHostInstallLabel: "Install Ollama on Windows host (requires Docker Desktop)",
     });
 
-    expect(result.options.at(-1)).toEqual({
+    expect(result.options.at(-2)).toEqual({
       key: "install-windows-ollama",
       label: "Install Ollama on Windows host (requires Docker Desktop)",
     });
@@ -113,7 +118,7 @@ describe("buildInferenceProviderMenu", () => {
         reachable ? "Use Ollama on Windows host - running" : "Start Ollama on Windows host",
     });
 
-    expect(result.options.at(-1)).toEqual({
+    expect(result.options.at(-2)).toEqual({
       key: "start-windows-ollama",
       label: "Use Ollama on Windows host - running",
     });
@@ -131,5 +136,19 @@ describe("buildInferenceProviderMenu", () => {
 
     expect(result.options.map((option) => option.key)).toContain("ollama");
     expect(result.options.map((option) => option.key)).not.toContain("start-windows-ollama");
+  });
+
+  it("omits Windows-host install when Ollama is reachable but its executable is not detected (#7472)", () => {
+    const result = buildMenu({
+      isWsl: true,
+      hasOllama: false,
+      ollamaRunning: true,
+      ollamaHost: "host.docker.internal",
+      hasWindowsOllama: false,
+      isWindowsHostOllama: true,
+    });
+
+    expect(result.options.map((option) => option.key)).toContain("ollama");
+    expect(result.options.map((option) => option.key)).not.toContain("install-windows-ollama");
   });
 });

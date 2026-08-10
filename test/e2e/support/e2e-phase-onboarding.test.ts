@@ -123,11 +123,11 @@ describe("onboarding phase fixture", () => {
     const secrets = new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret-token" });
     const onboard = new OnboardingPhaseFixture(new HostCliClient(runner), secrets);
 
-    const instance = await onboard.from(ready(), { sandboxName: "e2e-ubuntu-repo-cloud-openclaw" });
+    const instance = await onboard.from(ready(), { sandboxName: "e2e-cloud-oc" });
 
     expect(instance).toMatchObject({
       onboarding: "cloud-openclaw",
-      sandboxName: "e2e-ubuntu-repo-cloud-openclaw",
+      sandboxName: "e2e-cloud-oc",
       agent: "openclaw",
       provider: "nvidia",
       providerEnv: "cloud",
@@ -143,7 +143,7 @@ describe("onboarding phase fixture", () => {
           env: expect.objectContaining({
             NEMOCLAW_AGENT: "openclaw",
             NEMOCLAW_PROVIDER: "cloud",
-            NEMOCLAW_SANDBOX_NAME: "e2e-ubuntu-repo-cloud-openclaw",
+            NEMOCLAW_SANDBOX_NAME: "e2e-cloud-oc",
             NVIDIA_INFERENCE_API_KEY: "secret-token",
             PATH: expect.any(String),
           }),
@@ -161,12 +161,12 @@ describe("onboarding phase fixture", () => {
     const onboard = new OnboardingPhaseFixture(new HostCliClient(runner), secrets);
 
     const instance = await onboard.from(ready({ onboarding: "cloud-langchain-deepagents-code" }), {
-      sandboxName: "e2e-ubuntu-repo-cloud-langchain-deepagents-code",
+      sandboxName: "e2e-dcode-cloud",
     });
 
     expect(instance).toMatchObject({
       agent: "langchain-deepagents-code",
-      sandboxName: "e2e-ubuntu-repo-cloud-langchain-deepagents-code",
+      sandboxName: "e2e-dcode-cloud",
     });
     expect(runner.calls[0]).toMatchObject({
       command: "nemoclaw",
@@ -344,6 +344,82 @@ describe("onboarding phase fixture", () => {
     expect(cleanup.calls[0]?.name).toBe("destroy NemoClaw sandbox e2e-no-docker");
   });
 
+  it("runs the missing custom policy presets negative path", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue(
+      shellResult(1, "NEMOCLAW_POLICY_PRESETS is required when NEMOCLAW_POLICY_MODE=custom."),
+    );
+    const secrets = new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret-token" });
+    const cleanup = new FakeCleanup();
+    const onboard = new OnboardingPhaseFixture(new HostCliClient(runner), secrets, cleanup);
+
+    const instance = await onboard.from(
+      ready({ onboarding: "cloud-openclaw-policy-custom-missing-presets" }),
+      { sandboxName: "e2e-policy-missing" },
+    );
+
+    expect(instance).toMatchObject({
+      onboarding: "cloud-openclaw-policy-custom-missing-presets",
+      sandboxName: "e2e-policy-missing",
+      expectedFailure: {
+        phase: "onboarding",
+        errorClass: "policy-presets-required",
+      },
+    });
+    expect(runner.calls[0]).toMatchObject({
+      command: "nemoclaw",
+      args: ["onboard", "--non-interactive", "--yes", "--yes-i-accept-third-party-software"],
+      options: {
+        artifactName: "onboard-cloud-openclaw-policy-custom-missing-presets",
+        env: expect.objectContaining({
+          NEMOCLAW_POLICY_MODE: "custom",
+          NEMOCLAW_POLICY_PRESETS: "",
+          NEMOCLAW_SANDBOX_NAME: "e2e-policy-missing",
+          NVIDIA_INFERENCE_API_KEY: "secret-token",
+        }),
+        redactionValues: ["secret-token"],
+        timeoutMs: 900_000,
+      },
+    });
+    expect(cleanup.calls).toHaveLength(1);
+    expect(cleanup.calls[0]?.name).toBe("destroy NemoClaw sandbox e2e-policy-missing");
+  });
+
+  it("rejects unrelated failures for the missing custom policy presets negative path", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue(shellResult(1, "provider rejected credential"));
+    const onboard = new OnboardingPhaseFixture(
+      new HostCliClient(runner),
+      new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret" }),
+    );
+
+    await expect(
+      onboard.from(ready({ onboarding: "cloud-openclaw-policy-custom-missing-presets" }), {
+        sandboxName: "e2e-policy-missing",
+      }),
+    ).rejects.toThrow(/failed without the policy preset signature/);
+  });
+
+  it("rejects the expected policy preset failure when it includes a stack trace", async () => {
+    const runner = new FakeRunner();
+    runner.enqueue(
+      shellResult(
+        1,
+        "NEMOCLAW_POLICY_PRESETS is required when NEMOCLAW_POLICY_MODE=custom.\nTypeError: unexpected\n    at Object.onboard (/app/onboard.js:1:1)",
+      ),
+    );
+    const onboard = new OnboardingPhaseFixture(
+      new HostCliClient(runner),
+      new FakeSecrets({ NVIDIA_INFERENCE_API_KEY: "secret" }),
+    );
+
+    await expect(
+      onboard.from(ready({ onboarding: "cloud-openclaw-policy-custom-missing-presets" }), {
+        sandboxName: "e2e-policy-missing",
+      }),
+    ).rejects.toThrow(/failed with a JavaScript stack trace/);
+  });
+
   it("publishes redacted legacy preflight evidence for the no-Docker negative path", async () => {
     const previousContextDir = process.env.E2E_CONTEXT_DIR;
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-typed-no-docker-"));
@@ -362,6 +438,7 @@ describe("onboarding phase fixture", () => {
           onboarding: "cloud-openclaw-no-docker",
           docker: { id: "docker-missing", expectation: "missing", available: true },
         }),
+        { sandboxName: "e2e-no-docker" },
       );
 
       const logBody = fs.readFileSync(path.join(tmp, "negative-preflight.log"), "utf8");
@@ -392,6 +469,7 @@ describe("onboarding phase fixture", () => {
         onboarding: "cloud-openclaw-no-docker",
         docker: { id: "docker-missing", expectation: "missing", available: false },
       }),
+      { sandboxName: "e2e-no-docker" },
     );
 
     expect(instance.expectedFailure).toEqual({
@@ -432,6 +510,7 @@ describe("onboarding phase fixture", () => {
           onboarding: "cloud-openclaw-no-docker",
           docker: { id: "docker-missing", expectation: "missing", available: false },
         }),
+        { sandboxName: "e2e-no-docker" },
       );
 
       const pathValue = runner.calls[0]?.options?.env?.PATH;
@@ -468,19 +547,19 @@ describe("onboarding phase fixture", () => {
           onboarding: "cloud-openclaw-no-docker",
           docker: { id: "docker-missing", expectation: "missing", available: false },
         }),
-        { sandboxName: "e2e-no-docker-success" },
+        { sandboxName: "e2e-no-docker-ok" },
       ),
     ).rejects.toThrow(/unexpectedly succeeded/);
 
     expect(cleanup.calls).toHaveLength(1);
-    expect(cleanup.calls[0]?.name).toBe("destroy NemoClaw sandbox e2e-no-docker-success");
+    expect(cleanup.calls[0]?.name).toBe("destroy NemoClaw sandbox e2e-no-docker-ok");
     runner.enqueue(shellResult(0, "destroyed\n"));
     await cleanup.calls[0]?.run();
     expect(runner.calls[1]).toMatchObject({
       command: "nemoclaw",
-      args: ["e2e-no-docker-success", "destroy", "--yes"],
+      args: ["e2e-no-docker-ok", "destroy", "--yes"],
       options: {
-        artifactName: "cleanup-destroy-e2e-no-docker-success",
+        artifactName: "cleanup-destroy-e2e-no-docker-ok",
         timeoutMs: 900_000,
       },
     });
@@ -501,6 +580,7 @@ describe("onboarding phase fixture", () => {
           onboarding: "cloud-openclaw-no-docker",
           docker: { id: "docker-missing", expectation: "missing", available: false },
         }),
+        { sandboxName: "e2e-no-docker" },
       ),
     ).rejects.toThrow(/without Docker-missing preflight signature/);
   });
@@ -528,13 +608,13 @@ describe("onboarding phase fixture", () => {
         new ArtifactSink(tmp),
       );
 
-      await onboard.from(ready(), { sandboxName: "e2e-artifact-success" });
+      await onboard.from(ready(), { sandboxName: "e2e-artifact-ok" });
 
       expect(readJson(path.join(tmp, "onboarding.result.json"))).toMatchObject({
         phase: "onboarding",
         status: "passed",
         onboarding: "cloud-openclaw",
-        sandboxName: "e2e-artifact-success",
+        sandboxName: "e2e-artifact-ok",
         agent: "openclaw",
         provider: "nvidia",
         providerEnv: "cloud",

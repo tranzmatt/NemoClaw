@@ -24,9 +24,10 @@ import {
   expectSandboxReady,
   installSandboxOrSkipOnRateLimit,
   resultText,
+  trackSandboxCleanup,
 } from "./phase6-messaging-helpers.ts";
 
-const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-openclaw-slack-pairing";
+const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-oc-slack-pair";
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN ?? "xoxb-fake-slack-pairing-e2e";
 const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN ?? "xapp-fake-slack-pairing-e2e";
 const LIVE_TIMEOUT_MS = 55 * 60_000;
@@ -68,7 +69,17 @@ function assertSlackCapture(captureFile: string, expectedCode: string, expectedU
 
 test("OpenClaw Slack Socket Mode pairing request is shared with connect-shell approval", {
   timeout: LIVE_TIMEOUT_MS,
-}, async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
+  meta: {
+    e2ePhases: [
+      "load Slack credentials and clear pairing state",
+      "install the Slack-enabled OpenClaw sandbox",
+      "inspect Slack providers and preset policy",
+      "route Slack API and websocket traffic through managed policies",
+      "issue a Slack pairing request",
+      "approve the Slack code through connect-shell",
+    ],
+  },
+}, async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
   const apiKey = secrets.required("NVIDIA_INFERENCE_API_KEY");
   const env = pairingEnv({
     sandboxName: SANDBOX_NAME,
@@ -91,14 +102,27 @@ test("OpenClaw Slack Socket Mode pairing request is shared with connect-shell ap
     pairingUser: PAIRING_USER.slack,
   });
 
-  cleanup.add(`destroy Slack pairing sandbox ${SANDBOX_NAME}`, () =>
-    cleanupPairingSandbox(host, SANDBOX_NAME, env, redactions, "cleanup-slack-pairing"),
+  cleanup.trackGateway(host, "nemoclaw", {
+    artifactName: "cleanup-slack-pairing-openshell-gateway-destroy",
+    env,
+    redactionValues: redactions,
+    timeoutMs: 120_000,
+  });
+  trackSandboxCleanup(
+    cleanup,
+    host,
+    sandbox,
+    SANDBOX_NAME,
+    env,
+    redactions,
+    "cleanup-slack-pairing",
   );
   await cleanupPairingSandbox(host, SANDBOX_NAME, env, redactions, "preclean-slack-pairing");
 
   const docker = await dockerInfo(host, env);
   expect(docker.exitCode, resultText(docker)).toBe(0);
 
+  progress.phase("install the Slack-enabled OpenClaw sandbox");
   const install = await installSandboxOrSkipOnRateLimit(
     host,
     env,
@@ -110,6 +134,7 @@ test("OpenClaw Slack Socket Mode pairing request is shared with connect-shell ap
   expectExitZero(install, "install.sh --non-interactive with Slack");
   await expectSandboxReady(host, SANDBOX_NAME, env, redactions, "sandbox-list-slack-pairing");
 
+  progress.phase("inspect Slack providers and preset policy");
   for (const providerName of [`${SANDBOX_NAME}-slack-bridge`, `${SANDBOX_NAME}-slack-app`]) {
     const provider = await host.command("openshell", ["provider", "get", providerName], {
       artifactName: `provider-get-${providerName}`,
@@ -128,6 +153,7 @@ test("OpenClaw Slack Socket Mode pairing request is shared with connect-shell ap
     redactions,
   });
 
+  progress.phase("route Slack API and websocket traffic through managed policies");
   const fakeSlack = await startFakeSlackApi(
     host,
     cleanup,
@@ -157,6 +183,7 @@ test("OpenClaw Slack Socket Mode pairing request is shared with connect-shell ap
     artifactName: "apply-slack-websocket-policy",
   });
 
+  progress.phase("issue a Slack pairing request");
   const issue = await issuePairingRequest({
     sandbox,
     sandboxName: SANDBOX_NAME,
@@ -169,6 +196,7 @@ test("OpenClaw Slack Socket Mode pairing request is shared with connect-shell ap
   assertSlackCapture(fakeSlack.captureFile, code, PAIRING_USER.slack);
   await writePairingArtifacts(artifacts, "slack", { code, user: PAIRING_USER.slack });
 
+  progress.phase("approve the Slack code through connect-shell");
   await approveAndAssertPairing({
     sandbox,
     sandboxName: SANDBOX_NAME,

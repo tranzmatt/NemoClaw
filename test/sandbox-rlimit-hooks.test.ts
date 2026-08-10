@@ -6,55 +6,19 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { dockerRunCommandBetween, runLoggedDockerShell } from "./helpers/dockerfile-run-shell";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const DOCKERFILE = path.join(ROOT, "Dockerfile");
 const DOCKERFILE_BASE = path.join(ROOT, "Dockerfile.base");
 const HERMES_DOCKERFILE = path.join(ROOT, "agents", "hermes", "Dockerfile");
+const DCODE_DOCKERFILE_BASE = path.join(
+  ROOT,
+  "agents",
+  "langchain-deepagents-code",
+  "Dockerfile.base",
+);
 const SANDBOX_RLIMITS = path.join(ROOT, "scripts", "lib", "sandbox-rlimits.sh");
-
-function dockerRunCommandBetween(
-  dockerfile: string,
-  startMarker: string,
-  endMarker: string,
-): string {
-  const start = dockerfile.indexOf(startMarker);
-  const end = dockerfile.indexOf(endMarker, start);
-  expect(start, `Expected Dockerfile block start marker ${startMarker}`).not.toBe(-1);
-  expect(end, `Expected Dockerfile block end marker ${endMarker}`).toBeGreaterThan(start);
-  const runIndex = dockerfile.indexOf("RUN ", start);
-  expect(runIndex, `Expected RUN instruction after ${startMarker}`).not.toBe(-1);
-  expect(runIndex, `Expected RUN instruction before ${endMarker}`).toBeLessThanOrEqual(end);
-  const sourceLines = dockerfile.slice(runIndex, end).split("\n");
-  const finalLineIndex = sourceLines.findIndex((line) => !line.trimEnd().endsWith("\\"));
-  expect(
-    finalLineIndex,
-    `Expected complete RUN instruction before ${endMarker}`,
-  ).toBeGreaterThanOrEqual(0);
-  const runLines = sourceLines.slice(0, finalLineIndex + 1);
-  return runLines
-    .join("\n")
-    .trim()
-    .replace(/^RUN\s+/, "")
-    .replace(/\\\n/g, " ");
-}
-
-function runLoggedDockerShell(command: string, tmp: string) {
-  const logPath = path.join(tmp, "calls.log");
-  fs.rmSync(logPath, { force: true });
-  const scriptPath = path.join(tmp, "run-docker-block.sh");
-  fs.writeFileSync(
-    scriptPath,
-    [
-      "#!/usr/bin/env bash",
-      "set -euo pipefail",
-      `call_log=${JSON.stringify(logPath)}`,
-      command,
-    ].join("\n"),
-    { mode: 0o700 },
-  );
-  return spawnSync("bash", [scriptPath], { encoding: "utf-8", timeout: 5000 });
-}
 
 function copyRlimitFixture(rlimitLib: string): void {
   // TEST-ONLY OVERRIDE: production remains 512 in scripts/lib/sandbox-rlimits.sh.
@@ -74,6 +38,10 @@ function copyRlimitFixtureWithNprocLimit(rlimitLib: string, limit: number): void
 
 function rlimitShim(rlimitLib: string): string {
   return `[ -f ${rlimitLib} ] && . ${rlimitLib} && harden_resource_limits --quiet && verify_resource_limits --quiet || true`;
+}
+
+function dcodeRlimitShim(rlimitLib: string): string {
+  return `[ -f ${rlimitLib} ] && . ${rlimitLib} && harden_resource_limits --quiet && verify_resource_limits_exact --quiet || { printf "%s\\n" "[SECURITY] Sandbox resource limits were NOT hardened for this shell." >&2; true; }`;
 }
 
 type ProbeValues = Record<string, string | undefined>;
@@ -98,7 +66,7 @@ function occurrenceCount(haystack: string, needle: string): number {
 function expectSystemRlimitHookEnforcesLimits(hookPath: string): void {
   const probe = [
     "set -euo pipefail",
-    `source ${JSON.stringify(hookPath)}`,
+    'source "$1"',
     'nproc_limit="$(builtin ulimit -u)"',
     'nofile_limit="$(builtin ulimit -n)"',
     "set +e",
@@ -112,8 +80,9 @@ function expectSystemRlimitHookEnforcesLimits(hookPath: string): void {
     'printf "raise_nproc=%s\\n" "$raise_nproc"',
     'printf "raise_nofile=%s\\n" "$raise_nofile"',
   ].join("\n");
-  const result = spawnSync("bash", ["--noprofile", "--norc", "-c", probe], {
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-s", "--", hookPath], {
     encoding: "utf-8",
+    input: probe,
     timeout: 5000,
   });
 
@@ -139,13 +108,14 @@ function expectSystemRlimitHookBypassesShadowedUlimit(hookPath: string): void {
     "  esac",
     "  return 0",
     "}",
-    `source ${JSON.stringify(hookPath)}`,
+    'source "$1"',
     'printf "shadow=%s\\n" "$(type -t ulimit)"',
     'printf "nproc=%s\\n" "$(builtin ulimit -u)"',
     'printf "nofile=%s\\n" "$(builtin ulimit -n)"',
   ].join("\n");
-  const result = spawnSync("bash", ["--noprofile", "--norc", "-c", probe], {
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-s", "--", hookPath], {
     encoding: "utf-8",
+    input: probe,
     timeout: 5000,
   });
 
@@ -173,11 +143,10 @@ function expectSystemRlimitHookIsSilentWhenVerificationFails(
       "}",
     ].join("\n"),
   );
-  const probe = ["set -euo pipefail", `source ${JSON.stringify(hookPath)}`, 'printf "OK\\n"'].join(
-    "\n",
-  );
-  const result = spawnSync("bash", ["--noprofile", "--norc", "-c", probe], {
+  const probe = ["set -euo pipefail", 'source "$1"', 'printf "OK\\n"'].join("\n");
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-s", "--", hookPath], {
     encoding: "utf-8",
+    input: probe,
     timeout: 5000,
   });
 
@@ -186,10 +155,53 @@ function expectSystemRlimitHookIsSilentWhenVerificationFails(
   expect(result.stderr).toBe("");
 }
 
+function expectDcodeRlimitHookWarnsWhenVerificationFails(
+  hookPath: string,
+  rlimitLib: string,
+): void {
+  fs.chmodSync(rlimitLib, 0o644);
+  fs.writeFileSync(
+    rlimitLib,
+    [
+      "harden_resource_limits() { :; }",
+      "verify_resource_limits() { :; }",
+      "verify_resource_limits_exact() { return 1; }",
+    ].join("\n"),
+  );
+  const probe = ["set -euo pipefail", 'source "$1"', 'printf "OK\\n"'].join("\n");
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-s", "--", hookPath], {
+    encoding: "utf-8",
+    input: probe,
+    timeout: 5000,
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toBe("OK\n");
+  expect(result.stderr).toContain(
+    "[SECURITY] Sandbox resource limits were NOT hardened for this shell.",
+  );
+}
+
+function expectDcodeRlimitHookWarnsWhenHelperIsMissing(hookPath: string, rlimitLib: string): void {
+  fs.rmSync(rlimitLib, { force: true });
+  const probe = ["set -euo pipefail", 'source "$1"', 'printf "OK\\n"'].join("\n");
+  const result = spawnSync("bash", ["--noprofile", "--norc", "-s", "--", hookPath], {
+    encoding: "utf-8",
+    input: probe,
+    timeout: 5000,
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stdout).toBe("OK\n");
+  expect(result.stderr).toContain(
+    "[SECURITY] Sandbox resource limits were NOT hardened for this shell.",
+  );
+}
+
 function expectRlimitLibIsPosixShSafe(rlimitLib: string): void {
   const probe = [
     "set -e",
-    `. ${JSON.stringify(rlimitLib)}`,
+    '. "$1"',
     'current_nproc="$(command ulimit -u 2>/dev/null || printf "%s" 512)"',
     'case "$current_nproc" in "" | *[!0-9]*) current_nproc=512 ;; esac',
     'current_nofile="$(command ulimit -n 2>/dev/null || printf "%s" 256)"',
@@ -205,8 +217,9 @@ function expectRlimitLibIsPosixShSafe(rlimitLib: string): void {
     'printf "target_nofile=%s\\n" "$target_nofile"',
     'printf "effective_nofile=%s\\n" "$effective_nofile"',
   ].join("\n");
-  const result = spawnSync("sh", ["-c", probe], {
+  const result = spawnSync("sh", ["-s", "--", rlimitLib], {
     encoding: "utf-8",
+    input: probe,
     timeout: 5000,
   });
 
@@ -218,10 +231,48 @@ function expectRlimitLibIsPosixShSafe(rlimitLib: string): void {
   expect(Number(values.effective_nofile)).toBeLessThan(Number(values.current_nofile));
 }
 
+function expectExactRlimitVerifierRejectsLowerNofile(rlimitLib: string): void {
+  const probe = [
+    "set -e",
+    '. "$1"',
+    "_nemoclaw_ulimit() {",
+    '  case "$1" in',
+    '    -Su | -Hu) printf "%s" 512 ;;',
+    '    -Sn) printf "%s" 1024 ;;',
+    '    -Hn) printf "%s" 65536 ;;',
+    "    *) return 1 ;;",
+    "  esac",
+    "}",
+    "set +e",
+    "verify_resource_limits --quiet",
+    'maximum_status="$?"',
+    'exact_output="$(verify_resource_limits_exact 2>&1)"',
+    'exact_status="$?"',
+    "set -e",
+    'printf "maximum_status=%s\\n" "$maximum_status"',
+    'printf "exact_status=%s\\n" "$exact_status"',
+    'printf "exact_output=%s\\n" "$exact_output"',
+  ].join("\n");
+  const result = spawnSync("sh", ["-s", "--", rlimitLib], {
+    encoding: "utf-8",
+    input: probe,
+    timeout: 5000,
+  });
+
+  expect(result.status, result.stderr).toBe(0);
+  expect(result.stderr).toBe("");
+  const values = parseProbeOutput(result.stdout);
+  expect(values.maximum_status).toBe("0");
+  expect(values.exact_status).toBe("1");
+  expect(values.exact_output).toContain(
+    "Effective soft nofile limit is 1024; expected exactly 65536",
+  );
+}
+
 function expectRlimitLibRejectsUnboundedPosixShNoFile(rlimitLib: string): void {
   const probe = [
     "set -e",
-    `. ${JSON.stringify(rlimitLib)}`,
+    '. "$1"',
     // This probe isolates nofile validation. Host nproc hard/soft defaults vary
     // (notably on macOS), so do not let an unrelated nproc diagnostic mask the
     // deliberately unbounded nofile result asserted below.
@@ -242,8 +293,9 @@ function expectRlimitLibRejectsUnboundedPosixShNoFile(rlimitLib: string): void {
     'printf "effective_nofile=%s\\n" "$(command ulimit -n)"',
     'printf "verify_output=%s\\n" "$verify_output"',
   ].join("\n");
-  const result = spawnSync("sh", ["-c", probe], {
+  const result = spawnSync("sh", ["-s", "--", rlimitLib], {
     encoding: "utf-8",
+    input: probe,
     timeout: 5000,
   });
 
@@ -258,7 +310,7 @@ function expectRlimitLibRejectsUnboundedPosixShNoFile(rlimitLib: string): void {
 function expectUnsupportedNprocDoesNotMaskPosixShNoFile(rlimitLib: string): void {
   const probe = [
     "set -e",
-    `. ${JSON.stringify(rlimitLib)}`,
+    '. "$1"',
     '_nemoclaw_ulimit() { case "$1" in -Su | -Hu) return 2 ;; esac; command ulimit "$@"; }',
     'current_nofile="$(command ulimit -n 2>/dev/null || printf "%s" 0)"',
     'case "$current_nofile" in "" | *[!0-9]*) current_nofile=0 ;; esac',
@@ -280,8 +332,9 @@ function expectUnsupportedNprocDoesNotMaskPosixShNoFile(rlimitLib: string): void
     'printf "verify_status=%s\\n" "$verify_status"',
     'printf "verify_output=%s\\n" "$verify_output"',
   ].join("\n");
-  const result = spawnSync("sh", ["-c", probe], {
+  const result = spawnSync("sh", ["-s", "--", rlimitLib], {
     encoding: "utf-8",
+    input: probe,
     timeout: 5000,
   });
 
@@ -301,6 +354,22 @@ describe("sandbox rlimit system hooks (#2173)", () => {
     expect(fs.readFileSync(SANDBOX_RLIMITS, "utf-8")).toMatch(
       /^NEMOCLAW_SANDBOX_NPROC_LIMIT=512$/m,
     );
+  });
+
+  it("distinguishes the exact DCode defaults from maximum-cap verification (#6545)", () => {
+    expectExactRlimitVerifierRejectsLowerNofile(SANDBOX_RLIMITS);
+  });
+
+  it("treats the rlimit helper path as data when invoking shell probes", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-$(printf injected)-"));
+    const rlimitLib = path.join(tmp, "sandbox-rlimits.sh");
+
+    try {
+      fs.copyFileSync(SANDBOX_RLIMITS, rlimitLib);
+      expectExactRlimitVerifierRejectsLowerNofile(rlimitLib);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
   });
 
   it("rlimit helper enforces supported nofile limits under POSIX sh", () => {
@@ -340,7 +409,7 @@ describe("sandbox rlimit system hooks (#2173)", () => {
         .replaceAll("/etc/profile.d/nemoclaw-proxy.sh", profileHook)
         .replaceAll("/etc/bash.bashrc", bashrc);
 
-      const result = runLoggedDockerShell(command, tmp);
+      const { result } = runLoggedDockerShell(command, tmp);
       expect(result.status, result.stderr).toBe(0);
       expect(fs.readFileSync(rlimitHook, "utf-8")).toContain(expectedRlimitShim);
       expect(fs.readFileSync(bashrc, "utf-8")).toContain(expectedRlimitShim);
@@ -348,6 +417,42 @@ describe("sandbox rlimit system hooks (#2173)", () => {
       expectSystemRlimitHookEnforcesLimits(bashrc);
       expectSystemRlimitHookBypassesShadowedUlimit(rlimitHook);
       expectSystemRlimitHookIsSilentWhenVerificationFails(rlimitHook, rlimitLib);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("Deep Agents Code base image selects exact verification for connect and login shells", () => {
+    const dockerfile = fs.readFileSync(DCODE_DOCKERFILE_BASE, "utf-8");
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dcode-rlimit-hooks-"));
+    const rlimitHook = path.join(tmp, "profile.d", "nemoclaw-rlimits.sh");
+    const rlimitLib = path.join(tmp, "sandbox-rlimits.sh");
+    const bashrc = path.join(tmp, "bash.bashrc");
+    const expectedRlimitShim = dcodeRlimitShim(rlimitLib);
+
+    try {
+      fs.mkdirSync(path.dirname(rlimitHook), { recursive: true });
+      copyRlimitFixture(rlimitLib);
+      fs.writeFileSync(bashrc, "# existing dcode bashrc\n");
+      const command = dockerRunCommandBetween(
+        dockerfile,
+        "# System-wide RLIMIT hooks for Deep Agents Code",
+        "COPY agents/langchain-deepagents-code/requirements.lock",
+      )
+        .replaceAll("/usr/local/lib/nemoclaw/sandbox-rlimits.sh", rlimitLib)
+        .replaceAll("/etc/profile.d/nemoclaw-rlimits.sh", rlimitHook)
+        .replaceAll("/etc/bash.bashrc", bashrc);
+
+      const { result } = runLoggedDockerShell(command, tmp);
+      expect(result.status, result.stderr).toBe(0);
+      expect(fs.readFileSync(rlimitHook, "utf-8")).toContain(expectedRlimitShim);
+      expect(fs.readFileSync(bashrc, "utf-8")).toContain(expectedRlimitShim);
+      expect(fs.readFileSync(bashrc, "utf-8")).toContain("# existing dcode bashrc");
+      expectSystemRlimitHookEnforcesLimits(rlimitHook);
+      expectSystemRlimitHookEnforcesLimits(bashrc);
+      expectSystemRlimitHookBypassesShadowedUlimit(rlimitHook);
+      expectDcodeRlimitHookWarnsWhenVerificationFails(rlimitHook, rlimitLib);
+      expectDcodeRlimitHookWarnsWhenHelperIsMissing(rlimitHook, rlimitLib);
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -385,7 +490,7 @@ describe("sandbox rlimit system hooks (#2173)", () => {
         .replaceAll("/etc/profile.d/nemoclaw-proxy.sh", profileHook)
         .replaceAll("/etc/bash.bashrc", bashrc);
 
-      const result = runLoggedDockerShell(command, tmp);
+      const { result } = runLoggedDockerShell(command, tmp);
       expect(result.status, result.stderr).toBe(0);
       const bashrcBody = fs.readFileSync(bashrc, "utf-8");
       expect(occurrenceCount(bashrcBody, expectedProxyShim)).toBe(1);
@@ -407,22 +512,36 @@ describe("sandbox rlimit system hooks (#2173)", () => {
     const initLib = path.join(localLib, "sandbox-init.sh");
     const validator = path.join(localLib, "validate-hermes-env-secret-boundary.py");
     const sessionListPreviewPatcher = path.join(localLib, "patch-hermes-session-list-preview.py");
+    const sqliteTempStorePatcher = path.join(localLib, "patch-hermes-sqlite-temp-store.py");
+    const discordRecoveryPatcher = path.join(
+      localLib,
+      "patch-hermes-discord-recovery-permissions.py",
+    );
+    const profilePolicyPatcher = path.join(localLib, "patch-hermes-profile-policy-defaults.py");
+    const managedPolicyReader = path.join(localLib, "managed_policy.py");
+    const langfuseCredentialPatcher = path.join(localLib, "patch-hermes-langfuse-credentials.mts");
     const dashboardSeeder = path.join(localLib, "seed-hermes-dashboard-config.py");
     const runtimeGuard = path.join(localLib, "hermes-runtime-config-guard.py");
+    const tirithMarkerFinalizer = path.join(localLib, "finalize-tirith-marker.py");
     const buildMcpDigest = path.join(localLib, "build-hermes-mcp-digest.py");
     const mcpTransaction = path.join(localLib, "hermes-mcp-config-transaction.py");
     const mcpCredentialBoundary = path.join(
       localLib,
-      "openshell-child-visible-credentials.v0.0.72.json",
+      "openshell-child-visible-credentials.v0.0.101.json",
     );
     const preloadDir = path.join(localLib, "preloads");
     const safetyNet = path.join(preloadDir, "sandbox-safety-net.js");
     const ciaoGuard = path.join(preloadDir, "ciao-network-guard.js");
     const gatewaySupervisor = path.join(localLib, "gateway-supervisor.sh");
     const stateDirGuard = path.join(localLib, "state-dir-guard.py");
+    const stateLockPlan = path.join(tmp, "state-lock-plan.json");
     const managedGatewayControl = path.join(localLib, "managed-gateway-control.py");
+    const hermesCronRestoreControl = path.join(localLib, "hermes-cron-restore-control.py");
     const startBin = path.join(tmp, "nemoclaw-start");
+    const managedStartupHold = path.join(tmp, "nemoclaw-managed-startup-hold");
+    const managedBootstrap = path.join(tmp, "nemoclaw-managed-bootstrap");
     const gatewayControl = path.join(tmp, "nemoclaw-gateway-control");
+    const entrypointEnvWrapper = path.join(localLib, "entrypoint-env-wrapper.sh");
     const bashrc = path.join(tmp, "bash.bashrc");
     const expectedRlimitShim = rlimitShim(rlimitLib);
 
@@ -433,8 +552,14 @@ describe("sandbox rlimit system hooks (#2173)", () => {
       fs.writeFileSync(initLib, "# init fixture\n");
       fs.writeFileSync(validator, "# validator fixture\n");
       fs.writeFileSync(sessionListPreviewPatcher, "# session list preview patcher fixture\n");
+      fs.writeFileSync(sqliteTempStorePatcher, "# SQLite temp store patcher fixture\n");
+      fs.writeFileSync(discordRecoveryPatcher, "# Discord recovery patcher fixture\n");
+      fs.writeFileSync(profilePolicyPatcher, "# profile policy patcher fixture\n");
+      fs.writeFileSync(managedPolicyReader, "# managed policy reader fixture\n");
+      fs.writeFileSync(langfuseCredentialPatcher, "# Langfuse credential patcher fixture\n");
       fs.writeFileSync(dashboardSeeder, "# dashboard seeder fixture\n");
       fs.writeFileSync(runtimeGuard, "# runtime guard fixture\n");
+      fs.writeFileSync(tirithMarkerFinalizer, "# Tirith marker finalizer fixture\n");
       fs.writeFileSync(buildMcpDigest, "# build MCP digest fixture\n");
       fs.writeFileSync(mcpTransaction, "# MCP transaction fixture\n");
       fs.writeFileSync(mcpCredentialBoundary, "{}\n");
@@ -446,18 +571,26 @@ describe("sandbox rlimit system hooks (#2173)", () => {
       fs.chmodSync(ciaoGuard, 0o666);
       fs.writeFileSync(gatewaySupervisor, "# gateway supervisor fixture\n");
       fs.writeFileSync(stateDirGuard, "# state-dir guard fixture\n");
+      fs.writeFileSync(stateLockPlan, "{}\n");
       fs.writeFileSync(managedGatewayControl, "# managed gateway control fixture\n");
+      fs.writeFileSync(hermesCronRestoreControl, "# Hermes cron restore control fixture\n");
       fs.writeFileSync(startBin, "#!/usr/bin/env bash\n");
+      fs.writeFileSync(managedStartupHold, "#!/usr/bin/env bash\n");
+      fs.writeFileSync(managedBootstrap, "#!/usr/bin/env bash\n");
       fs.writeFileSync(gatewayControl, "#!/usr/bin/env sh\n");
+      fs.writeFileSync(entrypointEnvWrapper, "# entrypoint env wrapper fixture\n");
       fs.writeFileSync(bashrc, "# stale hermes bashrc\n");
       const fixtureOwner = fs.statSync(startBin);
       const replay = dockerRunCommandBetween(
         dockerfile,
-        "# Copy startup script and the secret-boundary validator.",
+        "# Apply runtime modes to the startup script and secret-boundary validator.",
         "# Wrap the hermes CLI",
       )
         .replaceAll("/usr/local/bin/nemoclaw-start", startBin)
+        .replaceAll("/usr/local/bin/nemoclaw-managed-startup-hold", managedStartupHold)
+        .replaceAll("/usr/local/bin/nemoclaw-managed-bootstrap", managedBootstrap)
         .replaceAll("/usr/local/bin/nemoclaw-gateway-control", gatewayControl)
+        .replaceAll("/usr/local/lib/nemoclaw/entrypoint-env-wrapper.sh", entrypointEnvWrapper)
         .replaceAll("/usr/local/lib/nemoclaw/sandbox-init.sh", initLib)
         .replaceAll("/usr/local/lib/nemoclaw/gateway-supervisor.sh", gatewaySupervisor)
         .replaceAll("/usr/local/lib/nemoclaw/validate-hermes-env-secret-boundary.py", validator)
@@ -465,19 +598,42 @@ describe("sandbox rlimit system hooks (#2173)", () => {
           "/usr/local/lib/nemoclaw/patch-hermes-session-list-preview.py",
           sessionListPreviewPatcher,
         )
+        .replaceAll(
+          "/usr/local/lib/nemoclaw/patch-hermes-sqlite-temp-store.py",
+          sqliteTempStorePatcher,
+        )
+        .replaceAll(
+          "/usr/local/lib/nemoclaw/patch-hermes-discord-recovery-permissions.py",
+          discordRecoveryPatcher,
+        )
+        .replaceAll(
+          "/usr/local/lib/nemoclaw/patch-hermes-profile-policy-defaults.py",
+          profilePolicyPatcher,
+        )
+        .replaceAll("/usr/local/lib/nemoclaw/managed_policy.py", managedPolicyReader)
+        .replaceAll(
+          "/usr/local/lib/nemoclaw/patch-hermes-langfuse-credentials.mts",
+          langfuseCredentialPatcher,
+        )
         .replaceAll("/usr/local/lib/nemoclaw/seed-hermes-dashboard-config.py", dashboardSeeder)
         .replaceAll("/usr/local/lib/nemoclaw/hermes-runtime-config-guard.py", runtimeGuard)
+        .replaceAll("/usr/local/lib/nemoclaw/finalize-tirith-marker.py", tirithMarkerFinalizer)
         .replaceAll("/usr/local/lib/nemoclaw/build-hermes-mcp-digest.py", buildMcpDigest)
         .replaceAll("/usr/local/lib/nemoclaw/hermes-mcp-config-transaction.py", mcpTransaction)
         .replaceAll(
-          "/usr/local/lib/nemoclaw/openshell-child-visible-credentials.v0.0.72.json",
+          "/usr/local/lib/nemoclaw/openshell-child-visible-credentials.v0.0.101.json",
           mcpCredentialBoundary,
         )
         .replaceAll("/usr/local/lib/nemoclaw/preloads/sandbox-safety-net.js", safetyNet)
         .replaceAll("/usr/local/lib/nemoclaw/preloads/ciao-network-guard.js", ciaoGuard)
         .replaceAll("/usr/local/lib/nemoclaw/preloads", preloadDir)
         .replaceAll("/usr/local/lib/nemoclaw/state-dir-guard.py", stateDirGuard)
+        .replaceAll("/usr/local/share/nemoclaw/state-lock-plan.json", stateLockPlan)
         .replaceAll("/usr/local/lib/nemoclaw/managed-gateway-control.py", managedGatewayControl)
+        .replaceAll(
+          "/usr/local/lib/nemoclaw/hermes-cron-restore-control.py",
+          hermesCronRestoreControl,
+        )
         .replaceAll("/usr/local/lib/nemoclaw/sandbox-rlimits.sh", rlimitLib)
         .replaceAll("/etc/profile.d/nemoclaw-rlimits.sh", profileHook)
         .replaceAll("/etc/profile.d", path.dirname(profileHook))
@@ -486,7 +642,7 @@ describe("sandbox rlimit system hooks (#2173)", () => {
       // "wheel", so stub chown while preserving every chmod and hook write.
       const command = ["chown() { :; }", replay].join("\n");
 
-      const result = runLoggedDockerShell(command, tmp);
+      const { result } = runLoggedDockerShell(command, tmp);
       expect(result.status, result.stderr).toBe(0);
       expect(fs.readFileSync(profileHook, "utf-8")).toContain(expectedRlimitShim);
       expect(fs.readFileSync(bashrc, "utf-8")).toContain(expectedRlimitShim);
@@ -499,8 +655,13 @@ describe("sandbox rlimit system hooks (#2173)", () => {
       expect(hardenedDir.mode & 0o777).toBe(0o755);
       expect(hardenedSafetyNet.mode & 0o777).toBe(0o444);
       expect(hardenedCiaoGuard.mode & 0o777).toBe(0o444);
+      expect(fs.statSync(discordRecoveryPatcher).mode & 0o777).toBe(0o755);
+      expect(fs.statSync(profilePolicyPatcher).mode & 0o777).toBe(0o755);
+      expect(fs.statSync(langfuseCredentialPatcher).mode & 0o777).toBe(0o444);
       expect(fs.statSync(mcpCredentialBoundary).mode & 0o777).toBe(0o444);
       expect(fs.statSync(buildMcpDigest).mode & 0o777).toBe(0o444);
+      expect(fs.statSync(stateLockPlan).mode & 0o777).toBe(0o444);
+      expect(fs.statSync(hermesCronRestoreControl).mode & 0o777).toBe(0o700);
       expect(hardenedDir.uid).toBe(fixtureOwner.uid);
       expect(hardenedDir.gid).toBe(fixtureOwner.gid);
       expect(hardenedSafetyNet.uid).toBe(fixtureOwner.uid);

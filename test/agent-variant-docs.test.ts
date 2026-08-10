@@ -5,14 +5,12 @@ import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
-import { renderAgentVariantPage } from "../scripts/sync-agent-variant-docs";
+import { renderAgentVariantPage } from "../scripts/sync-agent-variant-docs.mts";
 
 const source = `---
 title: "Example"
 description-agent: "Use when looking up $$nemoclaw commands."
 ---
-import { AgentCli, AgentOnly } from "../_components/AgentGuide";
-
 <AgentOnly variant="openclaw">
 OpenClaw only.
 </AgentOnly>
@@ -30,7 +28,7 @@ Gateway agents only.
 $$nemoclaw list
 \`\`\`
 
-Use <AgentCli /> for the current variant.
+Use \`$$nemoclaw\` for the current variant.
 `;
 
 describe("agent variant docs", () => {
@@ -75,9 +73,108 @@ describe("agent variant docs", () => {
     expect(rendered).not.toContain("<AgentOnly");
   });
 
+  it("keeps adjacent list items together after variant filtering", () => {
+    const rendered = renderAgentVariantPage(
+      `---
+title: "Example"
+---
+## Prerequisites
+
+<AgentOnly variant="openclaw">
+
+- NemoClaw installed.
+
+</AgentOnly>
+<AgentOnly variant="hermes">
+
+- NemoHermes installed.
+
+</AgentOnly>
+- A local model server running.
+`,
+      "openclaw",
+    );
+
+    expect(rendered).toContain("- NemoClaw installed.\n- A local model server running.");
+    expect(rendered).not.toContain("- NemoClaw installed.\n\n- A local model server running.");
+    expect(rendered).not.toContain("NemoHermes installed.");
+  });
+
+  it("preserves paragraph boundaries around retained variant prose", () => {
+    const rendered = renderAgentVariantPage(
+      `---
+title: "Example"
+---
+Shared paragraph.
+
+<AgentOnly variant="openclaw">
+
+OpenClaw paragraph.
+
+</AgentOnly>
+Following paragraph.
+`,
+      "openclaw",
+    );
+
+    expect(rendered).toContain("Shared paragraph.\n\nOpenClaw paragraph.");
+    expect(rendered).toContain("OpenClaw paragraph.\n\nFollowing paragraph.");
+  });
+
+  it("rejects nested AgentOnly blocks before they leak into generated variants", () => {
+    const nested = `---
+title: "Example"
+---
+<AgentOnly variant="openclaw,hermes">
+Shared gateway content.
+<AgentOnly variant="openclaw">
+OpenClaw content.
+</AgentOnly>
+</AgentOnly>
+`;
+
+    expect(() => renderAgentVariantPage(nested, "openclaw")).toThrow("nested AgentOnly block");
+  });
+
+  it("rejects inline AgentOnly directives before they reach Fern", () => {
+    const inline = `---
+title: "Example"
+---
+<AgentOnly variant="openclaw">OpenClaw only.</AgentOnly>
+`;
+
+    expect(() => renderAgentVariantPage(inline, "openclaw")).toThrow(
+      "unresolved AgentOnly directive",
+    );
+  });
+
+  it("rejects runtime agent components before they reach Fern", () => {
+    const runtimeComponent = `---
+title: "Example"
+---
+Use <AgentCli /> for the current variant.
+`;
+
+    expect(() => renderAgentVariantPage(runtimeComponent, "hermes")).toThrow(
+      "unresolved runtime agent component",
+    );
+  });
+
+  it("rejects AgentGuide imports before they reach Fern", () => {
+    const runtimeImport = `---
+title: "Example"
+---
+import { AgentOnly } from "../_components/AgentGuide";
+`;
+
+    expect(() => renderAgentVariantPage(runtimeImport, "deepagents")).toThrow(
+      "unresolved AgentGuide import",
+    );
+  });
+
   it("rewrites relative imports but preserves Fern route links for generated build output", () => {
     const rendered = renderAgentVariantPage(
-      `${source}\nSee [Commands](../reference/commands#$$nemoclaw-list).\nSee [Backup](backup-restore).\n![Diagram](images/diagram.png)\n`,
+      `${source}\nimport { Example } from "../_components/Example";\n\nSee [Commands](../reference/commands#$$nemoclaw-list).\nSee [Backup](backup-restore).\n![Diagram](images/diagram.png)\n`,
       "hermes",
       {
         outputPath:
@@ -86,9 +183,7 @@ describe("agent variant docs", () => {
       },
     );
 
-    expect(rendered).toContain(
-      'import { AgentCli, AgentOnly } from "../../../_components/AgentGuide";',
-    );
+    expect(rendered).toContain('import { Example } from "../../../_components/Example";');
     expect(rendered).toContain("[Commands](../reference/commands#nemohermes-list)");
     expect(rendered).toContain("[Backup](backup-restore)");
     expect(rendered).toContain("![Diagram](../../../manage-sandboxes/images/diagram.png)");
@@ -150,5 +245,130 @@ describe("agent variant docs", () => {
     expect(openclaw).not.toContain(
       "Deep Agents does not have a NemoClaw-managed web-search feature.",
     );
+  });
+
+  it("lists only implemented commands in manifest iteration guidance (#7308)", () => {
+    const manifest = readFileSync(
+      new URL("../docs/inference/declarative-agents-manifest.mdx", import.meta.url),
+      "utf8",
+    );
+    const rendered = renderAgentVariantPage(manifest, "openclaw", {
+      sourcePath: "/repo/docs/inference/declarative-agents-manifest.mdx",
+    });
+    const iteratingStart = rendered.indexOf("## Iterating");
+    const iteratingEnd = rendered.indexOf("## Apply to an Existing Sandbox", iteratingStart);
+    const iterating = rendered.slice(iteratingStart, iteratingEnd);
+
+    expect(iteratingStart).toBeGreaterThanOrEqual(0);
+    expect(iteratingEnd).toBeGreaterThan(iteratingStart);
+    expect(iterating).toContain("agents add|delete|list");
+    expect(iterating).toContain("agents apply -f <agents.yaml>");
+    expect(iterating).not.toContain("agents show");
+  });
+
+  it("renders provider-switch instructions for the applicable agent variants (#7309)", () => {
+    const source = readFileSync(
+      new URL("../docs/inference/switch-providers.mdx", import.meta.url),
+      "utf8",
+    );
+    const render = (variant: "openclaw" | "hermes" | "deepagents") =>
+      renderAgentVariantPage(source, variant, {
+        sourcePath: "/repo/docs/inference/switch-providers.mdx",
+      });
+    const openclaw = render("openclaw");
+    const hermes = render("hermes");
+    const deepAgents = render("deepagents");
+    const recreationHeading = "## Recreate a Deep Agents Sandbox";
+    const namedSandboxSyntax =
+      "The `shields` commands take a positional name. `inference set` takes `--sandbox <name>`.";
+
+    expect(openclaw).toContain(namedSandboxSyntax);
+    expect(openclaw).toContain("nemoclaw <name> shields down");
+    expect(openclaw).not.toContain(recreationHeading);
+    expect(hermes).toContain(namedSandboxSyntax);
+    expect(hermes).toContain("nemohermes <name> shields down");
+    expect(hermes).not.toContain(recreationHeading);
+    expect(deepAgents).toContain(recreationHeading);
+    expect(deepAgents).not.toContain(namedSandboxSyntax);
+  });
+
+  it("excludes OpenClaw gateway behavior from Hermes provider switching (#7902)", () => {
+    const source = readFileSync(
+      new URL("../docs/inference/switch-providers.mdx", import.meta.url),
+      "utf8",
+    );
+    const render = (variant: "openclaw" | "hermes") =>
+      renderAgentVariantPage(source, variant, {
+        sourcePath: "/repo/docs/inference/switch-providers.mdx",
+      });
+    const openclaw = render("openclaw");
+    const hermes = render("hermes");
+    const openClawGatewayBehavior = "restarts only the OpenClaw gateway and verifies its health";
+
+    expect(openclaw).toContain(openClawGatewayBehavior);
+    expect(hermes).not.toContain(
+      "updates the provider namespace and selected model in the running configuration",
+    );
+    expect(hermes).not.toContain(
+      "Changes within the current API family hot-reload without replacing the gateway process",
+    );
+    expect(hermes).not.toContain(openClawGatewayBehavior);
+    expect(hermes).toContain("a normal runtime route change does not rebuild or restart Hermes");
+  });
+
+  it("renders the Hermes baseline-policy explanation once (#7903)", () => {
+    const source = readFileSync(
+      new URL("../docs/reference/network-policies.mdx", import.meta.url),
+      "utf8",
+    );
+    const hermes = renderAgentVariantPage(source, "hermes", {
+      sourcePath: "/repo/docs/reference/network-policies.mdx",
+    });
+    const baselineExplanation =
+      "Hermes sandboxes use an agent-specific baseline policy in `agents/hermes/policy-additions.yaml`";
+
+    expect(hermes.split(baselineExplanation)).toHaveLength(2);
+  });
+
+  it("keeps the Hermes WhatsApp repair inside a shields maintenance window (#8184)", () => {
+    const whatsapp = readFileSync(
+      new URL("../docs/manage-sandboxes/set-up-whatsapp.mdx", import.meta.url),
+      "utf8",
+    );
+    const hermes = renderAgentVariantPage(whatsapp, "hermes", {
+      sourcePath: "/repo/docs/manage-sandboxes/set-up-whatsapp.mdx",
+    });
+    const shieldsDown = hermes.indexOf(
+      'nemohermes <sandbox> shields down --reason "repair Hermes WhatsApp session path"',
+    );
+    const configSet = hermes.indexOf(
+      "nemohermes <sandbox> config set --key platforms.whatsapp.extra.session_path",
+    );
+    const shieldsUp = hermes.indexOf("nemohermes <sandbox> shields up", configSet);
+
+    expect(shieldsDown).toBeGreaterThanOrEqual(0);
+    expect(configSet).toBeGreaterThan(shieldsDown);
+    expect(shieldsUp).toBeGreaterThan(configSet);
+  });
+
+  it("keeps the troubleshooting security review link within each agent guide (#6558)", () => {
+    const troubleshooting = readFileSync(
+      new URL("../docs/reference/troubleshooting.mdx", import.meta.url),
+      "utf8",
+    );
+
+    for (const variant of ["openclaw", "hermes", "deepagents"] as const) {
+      const rendered = renderAgentVariantPage(troubleshooting, variant, {
+        outputPath: `/repo/docs/_build/agent-variants/reference/troubleshooting.${variant}.generated.mdx`,
+        sourcePath: "/repo/docs/reference/troubleshooting.mdx",
+      });
+
+      expect(rendered).toContain(
+        "[OpenShell gateway compatibility review](../security/openshell-0.0.72-compatibility-review#source-of-truth-boundaries)",
+      );
+      expect(rendered).not.toMatch(
+        /\/user-guide\/(?:openclaw|hermes|deepagents)\/security\/openshell-0\.0\.72-compatibility-review/,
+      );
+    }
   });
 });

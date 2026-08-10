@@ -8,6 +8,8 @@ import path from "node:path";
 import { dockerInfoFormat } from "../adapters/docker";
 import { ROOT } from "../runner";
 import {
+  getNearestVersionedBaseImageTags,
+  getSourceRevisionIds,
   getSourceShortShaTags,
   getVersionedBaseImageTags,
   normalizeBaseImageInputPaths,
@@ -38,12 +40,44 @@ function hashBaseImageInputs(
   return hash.digest("hex");
 }
 
+function hashBuildArgs(buildArgs: Record<string, string> | undefined): string | null {
+  if (!buildArgs || Object.keys(buildArgs).length === 0) return null;
+  const hash = crypto.createHash("sha256");
+  for (const [key, value] of Object.entries(buildArgs).sort(([left], [right]) =>
+    left < right ? -1 : left > right ? 1 : 0,
+  )) {
+    hash.update(key);
+    hash.update("\0");
+    hash.update(value);
+    hash.update("\0");
+  }
+  return hash.digest("hex");
+}
+
 function dockerPlatform(): string {
   const reported = dockerInfoFormat("{{.OSType}}/{{.Architecture}}", {
     ignoreError: true,
     timeout: 2_000,
   }).trim();
   return reported && reported !== "/" ? reported : `${process.platform}/${process.arch}`;
+}
+
+export function createSandboxBaseImageBuildProvenanceKey(options: ResolveBaseImageOptions): string {
+  const env = options.env || process.env;
+  const rootDir = options.rootDir || ROOT;
+  const material = {
+    schema: SANDBOX_BASE_RESOLUTION_SCHEMA,
+    imageName: options.imageName,
+    sourceRevisions: getSourceRevisionIds(rootDir, env),
+    inputFingerprint: hashBaseImageInputs(rootDir, options.dockerfilePath, options.inputPaths),
+
+    buildArgsFingerprint: hashBuildArgs(options.buildArgs),
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(material)).digest("hex");
+}
+
+export function createSandboxBaseImageBuildProvenance(options: ResolveBaseImageOptions): string {
+  return `${createSandboxBaseImageBuildProvenanceKey(options)}.${crypto.randomBytes(32).toString("hex")}`;
 }
 
 export function createSandboxBaseImageResolutionKey(options: ResolveBaseImageOptions): string {
@@ -57,9 +91,12 @@ export function createSandboxBaseImageResolutionKey(options: ResolveBaseImageOpt
     pinnedRemoteRef: options.pinnedRemoteRef || null,
     ...(options.preferPinnedRemoteRef === true ? { preferPinnedRemoteRef: true } : {}),
     versionTags: getVersionedBaseImageTags(rootDir, env),
+    nearestVersionTags: getNearestVersionedBaseImageTags(rootDir, env),
     sourceTags: getSourceShortShaTags(rootDir, env),
     localTag: options.localTag,
     inputFingerprint: hashBaseImageInputs(rootDir, options.dockerfilePath, options.inputPaths),
+
+    buildArgsFingerprint: hashBuildArgs(options.buildArgs),
     platform: dockerPlatform(),
     requireOpenshellSandboxAbi: options.requireOpenshellSandboxAbi === true,
     minGlibcVersion: options.minGlibcVersion || OPENSHELL_SANDBOX_MIN_GLIBC,

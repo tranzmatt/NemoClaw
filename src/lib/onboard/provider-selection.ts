@@ -59,10 +59,38 @@ export interface ResolveRequestedProviderSelectionInput<T extends ProviderOption
   isWindowsHostOllama: boolean;
   windowsHostOllamaSupported: boolean;
   hermesProviderAvailable: boolean;
+  /**
+   * True when the onboard probe already reached a live Ollama daemon, on
+   * whichever candidate host answered first. Absent means the caller has no
+   * probe result, which leaves an install request untouched.
+   */
+  ollamaRunning?: boolean;
+  /**
+   * On a platform where managed vLLM is the approved non-interactive default,
+   * an onboard with no requested/recorded provider should auto-select local
+   * vLLM instead of falling back to cloud `build` (#7293).
+   */
+  preferManagedVllmDefault?: boolean;
 }
 
 function findOption<T extends ProviderOption>(options: T[], key: string): T | undefined {
   return options.find((option) => option.key === key);
+}
+
+/**
+ * On a managed-vLLM-default platform (#7293), pick the available local vLLM menu
+ * option: `vllm` when a server is already running (the menu exposes only that
+ * entry), otherwise the managed install `install-vllm`. Returns null when the
+ * preference is off or neither entry is present, so the caller falls back to
+ * cloud `build`.
+ */
+function resolveManagedVllmDefaultKey<T extends ProviderOption>(
+  input: ResolveRequestedProviderSelectionInput<T>,
+): string | null {
+  if (!input.preferManagedVllmDefault) return null;
+  if (findOption(input.options, "vllm")) return "vllm";
+  if (findOption(input.options, "install-vllm")) return "install-vllm";
+  return null;
 }
 
 function findWindowsHostKey(options: ProviderOption[]): string | null {
@@ -75,6 +103,35 @@ function findWindowsHostKey(options: ProviderOption[]): string | null {
 
 function isWindowsHostOllamaRequest(providerKey: string): boolean {
   return providerKey === "start-windows-ollama" || providerKey === "install-windows-ollama";
+}
+
+/**
+ * A daemon that already answers on the Ollama port makes a Windows-host install
+ * request unnecessary. Express emits `install-windows-ollama` from a Docker-only
+ * check that never probes Ollama (`scripts/install.sh`), so the key arrives even
+ * while the daemon is running. Under WSL mirrored networking the Windows daemon
+ * answers on loopback, `isWindowsHostOllama` reads false, the menu keeps the
+ * install entry, and onboarding reinstalls through PowerShell interop — the same
+ * interop whose failure produced the false "no Windows Ollama" reading (#7472).
+ *
+ * Keyed on the observed daemon rather than on the networking mode, so a future
+ * WSL networking mode needs no new condition here.
+ *
+ * Scoped to the Windows-host key on purpose. This helper does not touch
+ * `install-ollama`: `resolveOllamaInstallMenuEntry` keeps that entry for a
+ * running-but-stale daemon, and collapsing it would skip the Ollama upgrade
+ * path.
+ */
+function collapseWindowsInstallToRunningDaemon<T extends ProviderOption>(
+  input: ResolveRequestedProviderSelectionInput<T>,
+  providerKey: string,
+): T | undefined {
+  if (providerKey !== "install-windows-ollama" || !input.ollamaRunning) return undefined;
+  // A daemon reached on the Windows host still needs Docker Desktop WSL
+  // integration for the sandbox to reach it. Leave that request to the
+  // unsupported-runtime rejection below instead of silently reusing it.
+  if (input.isWindowsHostOllama && !input.windowsHostOllamaSupported) return undefined;
+  return findOption(input.options, "ollama");
 }
 
 export function resolveRequestedProviderSelection<T extends ProviderOption>(
@@ -118,8 +175,15 @@ export function resolveRequestedProviderSelection<T extends ProviderOption>(
       recoveredFromSandbox = true;
       recoveredModel = input.readRecordedModel(input.sandboxName);
     } else {
-      providerKey = "build";
+      // Prefer managed local vLLM when the caller has approved that platform
+      // default; otherwise fall back to cloud NVIDIA Endpoints (#7293).
+      providerKey = resolveManagedVllmDefaultKey(input) ?? "build";
     }
+  }
+
+  const runningDaemon = collapseWindowsInstallToRunningDaemon(input, providerKey);
+  if (runningDaemon) {
+    return { kind: "selected", selected: runningDaemon, recoveredFromSandbox, recoveredModel };
   }
 
   const selected = findOption(input.options, providerKey);

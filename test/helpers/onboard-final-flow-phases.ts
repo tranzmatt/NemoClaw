@@ -41,7 +41,6 @@ export type RecorderOverrides = {
     },
   ) => Promise<void>;
   recordStepComplete?: (stepName: string, updates?: SessionUpdates) => Promise<Session>;
-  recordPostVerifyStarted?: () => Promise<Session>;
   mergePolicyMessagingChannels?: PoliciesStateOptions<
     Agent | null,
     WebSearchConfig
@@ -50,6 +49,7 @@ export type RecorderOverrides = {
     sandboxName: string,
     chain: DashboardDeliveryChain,
   ) => Promise<VerifyDeploymentResult>;
+  isDeploymentHealthy?: (result: VerifyDeploymentResult) => boolean;
   printDashboard?: (
     sandboxName: string,
     model: string,
@@ -103,11 +103,19 @@ export function createRuntimeHarness(initialSession: Session) {
     markStepStarted: () => cloneSession(session),
     markStepComplete: (_stepName, updates: SessionUpdates = {}) =>
       updateSession((current) => Object.assign(current, filterSafeUpdates(updates))),
-    markStepCompleteRecordOnly: (_stepName, updates: SessionUpdates = {}) =>
-      updateSession((current) => Object.assign(current, filterSafeUpdates(updates))),
-    markStepSkipped: () => cloneSession(session),
+    markStepSkipped: (stepName) =>
+      updateSession((current) => {
+        const step = current.steps[stepName];
+        if (!step) return current;
+        if (step.status === "complete" || step.status === "failed" || step.status === "skipped")
+          return current;
+        step.status = "skipped";
+        step.startedAt = null;
+        step.completedAt = null;
+        step.error = null;
+        return current;
+      }),
     markStepFailed: () => cloneSession(session),
-    markStepFailedRecordOnly: () => cloneSession(session),
     completeSession: (updates: SessionUpdates = {}) =>
       updateSession((current) => {
         Object.assign(current, filterSafeUpdates(updates));
@@ -152,6 +160,7 @@ export function context(
     hermesToolGateways: ["local"],
     preferredInferenceApi: "chat",
     compatibleEndpointReasoning: null,
+    compatibleEndpointReasoningEffort: null,
     nimContainer: "nim-test",
     webSearchConfig: null,
     webSearchSupported: true,
@@ -183,6 +192,7 @@ export function createPhases(
         order.push("agent-forward");
         return 45123;
       }),
+      persistDashboardPort: vi.fn(),
       recordStepSkipped: recorders.recordStepSkipped ?? vi.fn(async () => createSession()),
       isOpenclawReady: () => false,
       skippedStepMessage: vi.fn(),
@@ -233,6 +243,7 @@ export function createPhases(
       stagedLegacyKeys: [],
       migratedLegacyKeys: new Set(),
       webSearchEnabled: () => false,
+      webSearchProvider: (config) => (config.provider === "tavily" ? "tavily" : "brave"),
     },
     finalizationDeps: {
       ensureAgentDashboardForward: vi.fn(() => {
@@ -242,14 +253,15 @@ export function createPhases(
       setDefaultSandbox: vi.fn(() => {
         order.push("set-default");
       }),
-      recordPostVerifyStarted:
-        recorders.recordPostVerifyStarted ?? vi.fn(async () => createSession()),
       toSessionUpdates: (updates) => updates as NonNullable<SessionUpdates>,
       removeLegacyCredentialsFile: vi.fn(),
       cleanupStaleHostFiles: vi.fn(),
       checkAndRecoverSandboxProcesses: vi.fn(),
       warmupScopeUpgrade: vi.fn(),
       autoPairScopeApproval: vi.fn(),
+      isDeploymentHealthy:
+        recorders.isDeploymentHealthy ?? ((result: VerifyDeploymentResult) => result.healthy),
+      reportDeploymentReadiness: vi.fn(),
       getChatUiUrl: () => "http://127.0.0.1:45123",
       buildVerifyChain: (): DashboardDeliveryChain => ({
         accessUrl: "http://127.0.0.1:45123",

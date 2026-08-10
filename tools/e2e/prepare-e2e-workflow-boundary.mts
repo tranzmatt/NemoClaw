@@ -7,32 +7,25 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import YAML from "yaml";
+import { SHARED_E2E_JOB_ID } from "./credential-free-tests.mts";
+import { E2E_ACTION_PROVENANCE, E2E_JOB_POLICY } from "./workflow-boundary-policy.mts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DEFAULT_ACTION_PATH = join(REPO_ROOT, ".github", "actions", "prepare-e2e", "action.yaml");
 
-const PREPARE_E2E_ACTION_PROVENANCE = {
-  reference: "NVIDIA/NemoClaw/.github/actions/prepare-e2e@50281ee84c4a6fc759da95ea28fc0b7d9c378a28",
-  contentSha256: "eca1994acd70f4305cddae2990d1604e9fac455b45d3d89dfb4b08a07d7552a1",
-} as const;
+const PREPARE_E2E_ACTION_PROVENANCE = E2E_ACTION_PROVENANCE.prepareWorkspace;
 
 export const PREPARE_E2E_ACTION = PREPARE_E2E_ACTION_PROVENANCE.reference;
 export const PREPARE_E2E_STEP = "Prepare E2E workspace";
 
 const CHECKOUT_LOCAL_PREPARE_E2E_ACTION = "./.github/actions/prepare-e2e";
+export const CLI_ARTIFACT_PRODUCER_JOB = E2E_JOB_POLICY.cliArtifactProducer;
+const PREINSTALLED_E2E_JOBS = new Set(["staging-brev-launchable"]);
+const RETIRED_SELECTOR_COMPATIBILITY_JOB = "retired-selector-compatibility";
 
-const NO_BUILD_JOBS = new Set([
-  "docs-validation",
-  "generate-matrix",
-  "launchable-smoke",
-  "ollama-auth-proxy",
-  "openshell-version-pin",
-  "rebuild-hermes",
-  "rebuild-hermes-stale-base",
-  "shields-config",
-  "snapshot-commands",
-  "spark-install",
-]);
+export const PREPARE_E2E_NO_BUILD_JOBS = new Set<string>(E2E_JOB_POLICY.prepareNoBuild);
+
+export const PREPARE_E2E_TRUSTED_BUILD_JOBS = new Set<string>(E2E_JOB_POLICY.prepareTrustedBuild);
 
 type WorkflowRecord = Record<string, unknown>;
 type WorkflowStep = WorkflowRecord & {
@@ -78,7 +71,7 @@ export function validatePrepareE2eAction(actionPath = DEFAULT_ACTION_PATH): stri
   const expectedSteps = [
     {
       name: "Set up Node",
-      uses: "actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e",
+      uses: "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020",
       with: { "node-version": 22, cache: "npm" },
     },
     {
@@ -107,11 +100,28 @@ export function validatePrepareE2eInvocations(workflow: WorkflowRecord): string[
       .filter(([jobName, value]) => {
         const job = record(value);
         return (
-          jobName === "generate-matrix" || jobName === "live" || record(job.env).E2E_JOB === "1"
+          !PREINSTALLED_E2E_JOBS.has(jobName) &&
+          (jobName === "generate-matrix" ||
+            jobName === "live" ||
+            jobName === RETIRED_SELECTOR_COMPATIBILITY_JOB ||
+            record(job.env).E2E_JOB === "1")
         );
       })
       .map(([jobName]) => jobName),
   );
+  const sharedE2eJob = jobs[SHARED_E2E_JOB_ID];
+  if (sharedE2eJob === undefined) {
+    errors.push(`prepare-e2e shared job is missing: ${SHARED_E2E_JOB_ID}`);
+  } else {
+    expectedJobs.add(SHARED_E2E_JOB_ID);
+    const env = record(record(sharedE2eJob).env);
+    if (Object.hasOwn(env, "E2E_JOB")) {
+      errors.push(`${SHARED_E2E_JOB_ID} must not declare E2E_JOB`);
+    }
+    if (Object.hasOwn(env, "E2E_EXECUTION_PROFILE")) {
+      errors.push(`${SHARED_E2E_JOB_ID} must not declare E2E_EXECUTION_PROFILE`);
+    }
+  }
 
   for (const [jobName, value] of Object.entries(jobs)) {
     const jobSteps = steps(record(value).steps);
@@ -133,9 +143,14 @@ export function validatePrepareE2eInvocations(workflow: WorkflowRecord): string[
       errors.push(`${jobName} prepare-e2e step must be named '${PREPARE_E2E_STEP}'`);
     }
     const withInputs = record(prepare.with);
-    const shouldBuild = !NO_BUILD_JOBS.has(jobName);
+    const shouldBuild =
+      jobName === CLI_ARTIFACT_PRODUCER_JOB || PREPARE_E2E_TRUSTED_BUILD_JOBS.has(jobName);
     if (shouldBuild && Object.keys(withInputs).length !== 0) {
-      errors.push(`${jobName} prepare-e2e must use the default CLI build`);
+      errors.push(
+        jobName === CLI_ARTIFACT_PRODUCER_JOB
+          ? `${jobName} prepare-e2e must own the only default CLI build`
+          : `${jobName} prepare-e2e must use its default trusted CLI build`,
+      );
     }
     if (!shouldBuild && !isDeepStrictEqual(withInputs, { "build-cli": "false" })) {
       errors.push(`${jobName} prepare-e2e must set build-cli to false`);
@@ -161,8 +176,13 @@ export function validatePrepareE2eInvocations(workflow: WorkflowRecord): string[
     }
   }
 
-  for (const jobName of NO_BUILD_JOBS) {
+  for (const jobName of PREPARE_E2E_NO_BUILD_JOBS) {
     if (!expectedJobs.has(jobName)) errors.push(`prepare-e2e no-build job is missing: ${jobName}`);
+  }
+  for (const jobName of PREPARE_E2E_TRUSTED_BUILD_JOBS) {
+    if (!expectedJobs.has(jobName)) {
+      errors.push(`prepare-e2e trusted-build job is missing: ${jobName}`);
+    }
   }
   return errors;
 }

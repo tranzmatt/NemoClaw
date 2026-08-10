@@ -16,7 +16,7 @@ const HERMES_BASE_DOCKERFILE = path.join(
   "Dockerfile.base",
 );
 const HERMES_MANIFEST = path.join(import.meta.dirname, "..", "agents", "hermes", "manifest.yaml");
-const TARGET_TAG = "v2026.6.19";
+const TARGET_TAG = "v2026.7.20";
 
 const CURRENT_INSTALLED_BASE = [
   "# Calver tag v2026.6.5 = Hermes Agent v0.16.0.",
@@ -33,10 +33,10 @@ const CURRENT_INSTALLED_DOCKERFILE = [
   "COPY agents/hermes/build-mcp-digest.py /usr/local/lib/nemoclaw/build-hermes-mcp-digest.py",
   'RUN mcp_digest="$(/opt/hermes/.venv/bin/python -I /usr/local/lib/nemoclaw/build-hermes-mcp-digest.py --guard /usr/local/lib/nemoclaw/hermes-runtime-config-guard.py --config /sandbox/.hermes/config.yaml)"',
   "COPY agents/hermes/mcp-config-transaction.py /usr/local/lib/nemoclaw/hermes-mcp-config-transaction.py",
-  "COPY src/lib/actions/sandbox/openshell-child-visible-credentials.v0.0.72.json /usr/local/lib/nemoclaw/openshell-child-visible-credentials.v0.0.72.json",
+  "COPY src/lib/actions/sandbox/openshell-child-visible-credentials.v0.0.101.json /usr/local/lib/nemoclaw/openshell-child-visible-credentials.v0.0.101.json",
   "RUN HERMES_HOME=/sandbox/.hermes /usr/local/bin/hermes doctor --fix \\",
   "    && node --experimental-strip-types /opt/nemoclaw-hermes-config/generate-config.ts",
-  "RUN mkdir -p /sandbox/.hermes/dashboard-home",
+  "RUN mkdir -p /sandbox/.hermes/profiles/dashboard-home",
   "",
 ].join("\n");
 
@@ -88,7 +88,7 @@ printf 'fake archive' > "$output"
     );
     writeExecutable(
       path.join(fakeBin, "tar"),
-      "#!/usr/bin/env bash\nprintf 'version = \"0.17.0\"\\n'\n",
+      "#!/usr/bin/env bash\nprintf 'version = \"0.19.0\"\\n'\n",
     );
     writeExecutable(path.join(fakeBin, "npm"), "#!/usr/bin/env bash\nprintf 'sha512-test\\n'\n");
     writeExecutable(
@@ -107,7 +107,7 @@ esac
 set -euo pipefail
 printf '%s|%s\\n' "\${NEMOCLAW_HERMES_SANDBOX_BASE_IMAGE_REF:-}" "$*" >> "$FAKE_NEMOHERMES_LOG"
 if [[ "$*" == "hermes exec -- hermes --version" ]]; then
-  printf '0.17.0\\n'
+  printf '0.19.0\\n'
 fi
 `,
     );
@@ -130,7 +130,7 @@ fi
       expect(run.status, `${run.stdout}\n${run.stderr}`).toBe(0);
       expect(fs.readFileSync(dockerLog, "utf8")).toContain(`tag ${baseRef} ${pinnedRef}`);
       expect(fs.readFileSync(nemohermesLog, "utf8")).toContain(`${pinnedRef}|hermes rebuild`);
-      expect(run.stdout).toContain("OK: sandbox reports Hermes Agent v0.17.0");
+      expect(run.stdout).toContain("OK: sandbox reports Hermes Agent v0.19.0");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -275,7 +275,7 @@ fi
     );
     const installedAgentDockerfile = path.join(path.dirname(installedDockerfile), "Dockerfile");
     const preMcpDockerfile = CURRENT_INSTALLED_DOCKERFILE.replace(
-      /^(?:COPY (?:agents\/hermes\/(?:build-mcp-digest|mcp-config-transaction)\.py|src\/lib\/actions\/sandbox\/openshell-child-visible-credentials\.v0\.0\.72\.json) .*|RUN mcp_digest=.*build-hermes-mcp-digest\.py.*)\n/gm,
+      /^(?:COPY (?:agents\/hermes\/(?:build-mcp-digest|mcp-config-transaction)\.py|src\/lib\/actions\/sandbox\/openshell-child-visible-credentials\.v0\.0\.101\.json) .*|RUN mcp_digest=.*build-hermes-mcp-digest\.py.*)\n/gm,
       "",
     );
     fs.mkdirSync(path.dirname(installedDockerfile), { recursive: true });
@@ -300,7 +300,7 @@ fi
       expect(run.status).toBe(1);
       expect(run.stdout).toContain("INVALID: installed copy");
       expect(run.stdout).toContain("marker hermes-mcp-config-transaction.py");
-      expect(run.stdout).toContain("marker openshell-child-visible-credentials.v0.0.72.json");
+      expect(run.stdout).toContain("marker openshell-child-visible-credentials.v0.0.101.json");
       expect(run.stdout).toContain("marker COPY agents/hermes/build-mcp-digest.py");
       expect(run.stdout).toContain("marker /opt/hermes/.venv/bin/python -I");
       expect(fs.readFileSync(installedDockerfile, "utf-8")).toBe(CURRENT_INSTALLED_BASE);

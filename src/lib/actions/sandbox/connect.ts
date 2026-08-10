@@ -13,12 +13,15 @@ import {
   OPENSHELL_OPERATION_TIMEOUT_MS,
   OPENSHELL_PROBE_TIMEOUT_MS,
 } from "../../adapters/openshell/timeouts";
+import type { AgentDefinition } from "../../agent/defs";
 import * as agentRuntime from "../../agent/runtime";
 import { CLI_NAME } from "../../cli/branding";
 import { D, G, R, YW } from "../../cli/terminal-style";
 import { spawnExitCode } from "../../core/process-exit";
+import { shellQuote } from "../../core/shell-quote";
 import { getNamedGatewayLifecycleState } from "../../gateway-runtime-action";
 import {
+  formatInferenceRouteDriftForDisplay,
   parseGatewayInference,
   planInferenceRouteReconcile,
   sanitizeRouteValueForDisplay,
@@ -35,6 +38,7 @@ import {
 import { isWsl } from "../../platform";
 import { ROOT } from "../../runner";
 import * as sandboxVersion from "../../sandbox/version";
+import { redact, redactFull } from "../../security/redact";
 import {
   isSandboxReady,
   isTerminalSandboxPhase,
@@ -49,17 +53,13 @@ import {
   getActiveSandboxSessions,
 } from "../../state/sandbox-session";
 import { runSetupDnsProxy } from "../dns";
-import { runSandboxAutoPairApprovalPass } from "./auto-pair-approval";
-import {
-  CONNECT_AUTO_PAIR_APPROVE_TIMEOUT_S,
-  CONNECT_AUTO_PAIR_LIST_TIMEOUT_S,
-  CONNECT_AUTO_PAIR_MAX_APPROVALS,
-  CONNECT_AUTO_PAIR_TIMEOUT_MS,
-} from "./connect-autopair-budget";
+import { runConnectAutoPairApprovalPass } from "./auto-pair-approval";
 import {
   exitOnMcpReconciliationRefusal,
   exitOnSecretBoundaryRefusal,
+  printGatewayIntegrityRepairGuidance,
 } from "./connect-boundary-refusal";
+import { prepareHermesLightTerminalSkin } from "./connect-hermes-light-skin";
 import {
   assertSandboxGatewayRouteCompatible,
   buildGatewayInferenceGetArgs,
@@ -68,23 +68,46 @@ import {
 import {
   buildSandboxInferenceRouteProbeArgs,
   type InferenceRouteProbeAgent,
+  parseSandboxInferenceRouteProbeResult,
 } from "./connect-inference-route-probe";
 import { preflightVllmModelEnvOrExit } from "./connect-vllm-preflight";
 import { isDockerRuntimeDown, printDockerRuntimeDownGuidance } from "./gateway-failure-classifier";
-import { ensureLiveSandboxOrExit, printGatewayLifecycleHint } from "./gateway-state";
+import {
+  ensureLiveSandboxOrExit,
+  printGatewayLifecycleHint,
+  recoverPortableDemoSandboxLifecycleForConnect,
+} from "./gateway-state";
 import { getSandboxTargetGatewayName } from "./gateway-target";
 import { printGatewayWedgeDiagnostics } from "./gateway-wedge-diagnostics";
 import {
   checkAndRecoverSandboxProcesses,
   executeSandboxExecCommand,
+  type GatewayRestartFailureLayer,
+  type ManagedGatewayControlCompletion,
   resolveSandboxDashboardPort,
+  waitForManagedGatewaySupervisor,
 } from "./process-recovery";
 import { runTerminalAgentConnectProbe } from "./terminal-connect-probe";
 import { applyOpenShellVmDnsMonkeypatch, shouldApplyVmDnsMonkeypatch } from "./vm-dns-monkeypatch";
 
+export { runConnectAutoPairApprovalPass, waitForManagedGatewaySupervisor };
+
 export type SandboxConnectOptions = {
   probeOnly?: boolean;
 };
+
+export type SandboxStartupRecoveryResult = ReturnType<typeof checkAndRecoverSandboxProcesses> & {
+  recoveryFailureDetail?: string | null;
+  recoveryFailureLayer?: GatewayRestartFailureLayer | null;
+};
+
+export function sanitizeSandboxStartupRecoveryDetail(raw: string): string {
+  return redactFull(raw)
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, 240);
+}
 
 type SpawnLikeResult = {
   status: number | null;
@@ -99,6 +122,7 @@ type SandboxListProbe = {
 export type SandboxInferenceRouteProbe = {
   healthy: boolean;
   broken: boolean;
+  httpStatus?: number;
   detail: string;
 };
 
@@ -240,7 +264,16 @@ async function runSandboxConnectProbe(sandboxName: string): Promise<void> {
     return;
   }
 
-  const processCheck = checkAndRecoverSandboxProcesses(sandboxName, { quiet: true });
+  // Managed recovery runs quiet here, so its classified failure layer is the
+  // only way this path can tell a retryable wedge apart from a deterministic
+  // integrity refusal that no restart, recover, or connect can clear (#7801).
+  let recoveryFailureLayer: GatewayRestartFailureLayer | null = null;
+  const processCheck = checkAndRecoverSandboxProcesses(sandboxName, {
+    quiet: true,
+    onRecoveryFailureLayer: (layer) => {
+      recoveryFailureLayer = layer;
+    },
+  });
   if (!processCheck.checked) {
     console.error(
       `  Probe failed: could not inspect the ${agentName} gateway inside sandbox '${sandboxName}'.`,
@@ -266,7 +299,7 @@ async function runSandboxConnectProbe(sandboxName: string): Promise<void> {
     );
   }
   if (processCheck.wasRunning) {
-    await ensureSandboxInferenceRoute(sandboxName, agent, { quiet: true });
+    await ensureSandboxInferenceRouteOrExit(sandboxName, agent);
     // Defense-in-depth scope-upgrade approval on the probe-only / `recover`
     // path (#4504): the gateway is up, so deterministically clear any pending
     // allowlisted CLI/webchat scope upgrade. Best-effort; never throws.
@@ -281,16 +314,27 @@ async function runSandboxConnectProbe(sandboxName: string): Promise<void> {
     return;
   }
   if (processCheck.recovered) {
-    await ensureSandboxInferenceRoute(sandboxName, agent, { quiet: true });
+    await ensureSandboxInferenceRouteOrExit(sandboxName, agent);
     // Same defense-in-depth approval after a recovery (#4504); best-effort.
     runConnectAutoPairApprovalPass(sandboxName);
-    console.log(`  Probe complete: recovered ${agentName} gateway in '${sandboxName}'.`);
+    const managedControlCompletion =
+      "managedControlCompletion" in processCheck
+        ? (processCheck.managedControlCompletion as ManagedGatewayControlCompletion)
+        : null;
+    if (managedControlCompletion?.disposition === "already-running") {
+      console.log(`  Probe complete: ${agentName} gateway is running in '${sandboxName}'.`);
+    } else {
+      console.log(`  Probe complete: recovered ${agentName} gateway in '${sandboxName}'.`);
+    }
     return;
   }
-  await ensureSandboxInferenceRoute(sandboxName, agent, { quiet: true });
+  await ensureSandboxInferenceRouteOrExit(sandboxName, agent);
   console.error(
     `  Probe failed: ${agentName} gateway is not running in '${sandboxName}' and automatic recovery failed.`,
   );
+  if (printGatewayIntegrityRepairGuidance(sandboxName, recoveryFailureLayer)) {
+    process.exit(1);
+  }
   // Surface the #4710 wedge signature: recovery ran with quiet=true, so this
   // is the operator's only window into a gateway that served briefly and
   // then dropped its listener.
@@ -376,13 +420,15 @@ function probeSandboxInferenceRoute(
     // remains an argv value, so no user input is interpolated into the script.
     const probe = captureOpenshell(buildSandboxInferenceRouteProbeArgs(sandboxName, agent), {
       ignoreError: true,
+      includeStreams: true,
       timeout: OPENSHELL_INFERENCE_ROUTE_PROBE_TIMEOUT_MS,
     });
-    const detail = probe.output.trim();
+    const parsed = parseSandboxInferenceRouteProbeResult(probe);
     lastProbe = {
-      healthy: probe.status === 0 && /^OK\s+[0-9]{3}\b/.test(detail),
-      broken: /^BROKEN\s+[0-9]{3}\b/.test(detail),
-      detail: detail || `openshell sandbox exec exited with status ${String(probe.status)}`,
+      healthy: parsed.healthy,
+      broken: parsed.broken,
+      httpStatus: parsed.httpStatus,
+      detail: parsed.detail,
     };
     if (lastProbe.healthy || attempt === boundedAttempts) return lastProbe;
     sleepSync(delayMs);
@@ -432,16 +478,20 @@ export function repairSandboxInferenceRouteWithDeps(
 ): SandboxInferenceRouteRepairResult {
   const log = deps.log ?? console.log;
   const error = deps.error ?? console.error;
-  if (deps.isRepairDisabled?.()) {
-    return { healthy: true, repairAttempted: false, detail: "route repair disabled" };
-  }
   deps.assertRouteCompatible?.(sandboxName, sb);
   const initialProbe = deps.probe(sandboxName);
   if (initialProbe.healthy) {
     return { healthy: true, repairAttempted: false, detail: initialProbe.detail };
   }
+  if (deps.isRepairDisabled?.()) {
+    return {
+      healthy: false,
+      repairAttempted: false,
+      detail: `route repair disabled; ${initialProbe.detail}`,
+    };
+  }
   if (!initialProbe.broken) {
-    return { healthy: true, repairAttempted: false, detail: initialProbe.detail };
+    return { healthy: false, repairAttempted: false, detail: initialProbe.detail };
   }
   if (!shouldUseLegacyDnsProxyRepair(sb)) {
     if (deps.shouldApplyVmDnsMonkeypatch(sb)) {
@@ -502,13 +552,6 @@ export function repairSandboxInferenceRouteWithDeps(
         detail: "missing sandbox provider or model",
       };
     }
-    if (!finalProbe.healthy && !finalProbe.broken) {
-      return {
-        healthy: true,
-        repairAttempted: true,
-        detail: finalProbe.detail,
-      };
-    }
     return {
       healthy: finalProbe.healthy,
       repairAttempted: true,
@@ -543,13 +586,6 @@ export function repairSandboxInferenceRouteWithDeps(
     } else if (repairedProbe.broken) {
       error("  Warning: inference.local is still unavailable after DNS proxy repair.");
     }
-  }
-  if (!repairedProbe.healthy && !repairedProbe.broken) {
-    return {
-      healthy: true,
-      repairAttempted: true,
-      detail: repairedProbe.detail,
-    };
   }
   return {
     healthy: repairedProbe.healthy,
@@ -627,14 +663,24 @@ function printUnrecoverableInferenceRoute(
   sandboxName: string,
   route: string,
   detail: string,
+  { repairAttempted = true }: { repairAttempted?: boolean } = {},
 ): void {
-  console.error(
-    `  Error: inference.local is still unavailable inside '${sandboxName}' after DNS and route repair.`,
-  );
+  const reason = repairAttempted
+    ? `inference.local is still unavailable inside '${sandboxName}' after DNS and route repair.`
+    : `the authoritative inference.local probe inside '${sandboxName}' did not return a trusted result.`;
+  const boundedDetail = sanitizeRouteValueForDisplay(redact(detail))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 240);
+  console.error(`  Error: ${reason}`);
   console.error(`  Route: ${route}`);
-  if (detail) console.error(`  Last probe: ${detail}`);
+  if (boundedDetail) console.error(`  Last probe: ${boundedDetail}`);
   console.error(`  Run:  ${CLI_NAME} ${sandboxName} doctor`);
-  console.error("  Connect is stopping because the sandbox inference route is known to be broken.");
+  console.error(
+    repairAttempted
+      ? "  Connect is stopping because the sandbox inference route is known to be broken."
+      : "  Connect is stopping because the sandbox inference route is not known healthy.",
+  );
 }
 
 export function resetManagedInferenceRouteWithDeps(
@@ -722,6 +768,9 @@ function ensureSandboxInferenceRouteUnlocked(
     assertNoOpenShellGatewayEndpointOverride();
     const { provider, model } = inference;
     const gatewayName = resolveSandboxGatewayName(sb);
+    // The live route exposes only provider/model. Prove the target's durable
+    // custom endpoint/API identity before any route read, probe, or mutation.
+    assertSandboxGatewayRouteCompatible(sandboxName, sb, gatewayName);
     const live = parseGatewayInference(
       captureOpenshell(buildGatewayInferenceGetArgs(gatewayName), {
         ignoreError: true,
@@ -730,23 +779,23 @@ function ensureSandboxInferenceRouteUnlocked(
     );
     const plan = planInferenceRouteReconcile(live, { provider, model });
     if (plan.kind !== "aligned") {
-      assertSandboxGatewayRouteCompatible(sandboxName, sb, gatewayName);
       const recordedRoute = `${sanitizeRouteValueForDisplay(provider)}/${sanitizeRouteValueForDisplay(model)}`;
       if (plan.kind === "diverged") {
         // Shared gateway: re-point loudly (even when quiet) — silent revert was
         // #3726. Values sanitized: registry/gateway strings are untrusted.
-        const liveProvider = sanitizeRouteValueForDisplay(plan.live.provider);
-        const liveModel = sanitizeRouteValueForDisplay(plan.live.model);
-        console.error(
-          `  ${YW}Warning: gateway inference route (${liveProvider}/${liveModel}) ` +
-            `differs from the recorded route for sandbox '${sandboxName}' (${recordedRoute}).${R}`,
+        const display = formatInferenceRouteDriftForDisplay(
+          plan.live,
+          plan.recorded,
+          `for sandbox '${sandboxName}'`,
         );
+        const { liveProvider, liveModel } = display;
+        console.error(`  ${YW}Warning: ${display.warning}${R}`);
         console.error(
           `  ${YW}Aligning the gateway to ${recordedRoute}. To keep ` +
             `${liveProvider}/${liveModel}, set it the supported way:${R}`,
         );
         console.error(
-          `    ${CLI_NAME} inference set --provider ${liveProvider} --model ${liveModel} --sandbox ${sandboxName}`,
+          `    ${CLI_NAME} inference set --provider ${shellQuote(liveProvider)} --model ${shellQuote(liveModel)} --sandbox ${shellQuote(sandboxName)}`,
         );
       } else if (!quiet) {
         // plan.kind === "repair": empty gateway, genuine repair — quiet-aware.
@@ -765,14 +814,52 @@ function ensureSandboxInferenceRouteUnlocked(
     const repairResult = repairSandboxInferenceRouteIfNeeded(sandboxName, sb, agent, gatewayName, {
       quiet,
     });
-    if (!repairResult.healthy && repairResult.repairAttempted) {
-      const resetResult = resetManagedInferenceRoute(sandboxName, sb, agent, gatewayName, {
+    if (!repairResult.healthy && !repairResult.repairAttempted) {
+      // Unavailable or malformed probe output is a permanent fail-closed
+      // classification at the OpenShell exec/DNS/TLS/proxy boundary. There is
+      // no trustworthy failure state to repair, so stop without mutating the
+      // route and preserve the bounded probe evidence for doctor diagnostics.
+      if (!quiet) {
+        printUnrecoverableInferenceRoute(
+          sandboxName,
+          `${sanitizeRouteValueForDisplay(provider)}/${sanitizeRouteValueForDisplay(model)}`,
+          repairResult.detail,
+          { repairAttempted: false },
+        );
+      }
+      return { sandbox: sb, routeHealthy: false };
+    }
+    let routeReady = repairResult.healthy;
+    if (!routeReady && repairResult.repairAttempted) {
+      routeReady = resetManagedInferenceRoute(sandboxName, sb, agent, gatewayName, {
         detail: repairResult.detail,
         quiet,
       });
-      return { sandbox: sb, routeHealthy: resetResult };
+      if (!routeReady) return { sandbox: sb, routeHealthy: false };
     }
-    return { sandbox: sb, routeHealthy: repairResult.healthy };
+    if (provider === "ollama-local") {
+      if (!verifyLocalInferenceRouteDependencies(provider, { quiet })) {
+        return { sandbox: sb, routeHealthy: false };
+      }
+      const finalProbe = probeSandboxInferenceRoute(sandboxName, agent);
+      const strictRouteHealthy =
+        finalProbe.healthy &&
+        finalProbe.httpStatus !== undefined &&
+        finalProbe.httpStatus >= 200 &&
+        finalProbe.httpStatus < 300;
+      if (!strictRouteHealthy) {
+        if (!quiet) {
+          printUnrecoverableInferenceRoute(
+            sandboxName,
+            `${sanitizeRouteValueForDisplay(provider)}/${sanitizeRouteValueForDisplay(model)}`,
+            `inference.local/v1/models must return HTTP 2xx; ${finalProbe.detail}`,
+            { repairAttempted: repairResult.repairAttempted },
+          );
+        }
+        return { sandbox: sb, routeHealthy: false };
+      }
+    }
+    return { sandbox: sb, routeHealthy: routeReady };
   } catch (error) {
     if (!sb || inference?.kind !== "configured") return { sandbox: sb, routeHealthy: null };
     if (error instanceof OpenShellGatewayEndpointOverrideError) {
@@ -790,6 +877,7 @@ function ensureSandboxInferenceRouteUnlocked(
         sandboxName,
         `${sanitizeRouteValueForDisplay(inference.provider)}/${sanitizeRouteValueForDisplay(inference.model)}`,
         detail,
+        { repairAttempted: false },
       );
     }
     return { sandbox: sb, routeHealthy: false };
@@ -834,24 +922,6 @@ async function ensureSandboxInferenceRouteOrExit(
   return result.sandbox;
 }
 
-// Connect/probe/finalization budget for the shared auto-pair approval pass
-// (#4504). The bounded single-request budget, timeout rationale, and invariant
-// live in the dependency-free ./connect-autopair-budget leaf so tests assert the
-// real values without importing this heavy module. The doctor recovery surface
-// (#4616) keeps the wider default budget in ./auto-pair-approval.
-const CONNECT_AUTO_PAIR_BUDGET = {
-  maxApprovals: CONNECT_AUTO_PAIR_MAX_APPROVALS,
-  listTimeoutS: CONNECT_AUTO_PAIR_LIST_TIMEOUT_S,
-  approveTimeoutS: CONNECT_AUTO_PAIR_APPROVE_TIMEOUT_S,
-  timeoutMs: CONNECT_AUTO_PAIR_TIMEOUT_MS,
-} as const;
-
-// Thin wrapper so the connect/probe/finalization surfaces share one budget
-// without each caller restating it. Best-effort; never throws (#4263/#4504).
-export function runConnectAutoPairApprovalPass(sandboxName: string): void {
-  runSandboxAutoPairApprovalPass(sandboxName, { budget: CONNECT_AUTO_PAIR_BUDGET });
-}
-
 function maybeEnsureHermesToolGatewayBroker(sb: SandboxEntry | null): void {
   if (
     !sb ||
@@ -867,6 +937,19 @@ function maybeEnsureHermesToolGatewayBroker(sb: SandboxEntry | null): void {
   } catch {
     /* non-fatal — managed-tool calls will surface broker guidance if needed */
   }
+}
+
+export function restoreSandboxStartupState(sandboxName: string): SandboxStartupRecoveryResult {
+  let recoveryFailureDetail: string | null = null;
+  let recoveryFailureLayer: GatewayRestartFailureLayer | null = null;
+  const processCheck = checkAndRecoverSandboxProcesses(sandboxName, {
+    quiet: true,
+    onRecoveryFailureLayer: (layer, detail) => {
+      recoveryFailureLayer = layer;
+      recoveryFailureDetail = detail ?? null;
+    },
+  });
+  return { ...processCheck, recoveryFailureDetail, recoveryFailureLayer };
 }
 
 function restoreInteractiveTerminal(): void {
@@ -905,9 +988,137 @@ function exitWithConnectSpawnResult(sandboxName: string, result: SpawnLikeResult
   process.exit(spawnExitCode(result));
 }
 
-export async function connectSandbox(
+type WaitForSandboxReadyOptions = {
+  defaultTimeoutSec?: number;
+  retryCommand?: string;
+  successLogs?: readonly string[];
+};
+
+function waitForSandboxReadyOrExit(
   sandboxName: string,
-  { probeOnly = false }: SandboxConnectOptions = {},
+  {
+    defaultTimeoutSec = 120,
+    retryCommand = "connect",
+    successLogs = [],
+  }: WaitForSandboxReadyOptions = {},
+): void {
+  const rawTimeout = process.env.NEMOCLAW_CONNECT_TIMEOUT;
+  let timeout = defaultTimeoutSec;
+  if (rawTimeout !== undefined) {
+    const parsed = parseInt(rawTimeout, 10);
+    if (Number.isNaN(parsed) || parsed <= 0) {
+      console.warn(
+        `  Warning: invalid NEMOCLAW_CONNECT_TIMEOUT="${rawTimeout}", using default ${defaultTimeoutSec}s`,
+      );
+    } else {
+      timeout = parsed;
+    }
+  }
+  const interval = 3;
+  const startedAt = Date.now();
+  const deadline = startedAt + timeout * 1000;
+  const gatewayName = getSandboxTargetGatewayName(sandboxName);
+  const elapsedSec = () => Math.floor((Date.now() - startedAt) / 1000);
+  const remainingMs = () => Math.max(1, deadline - Date.now());
+  const runSandboxList = (): SandboxListProbe => {
+    // Gateway selection is process-global and another CLI can change it while
+    // this command waits. Pin each poll to the registry-recorded owner so a
+    // same-named sandbox on a sibling gateway cannot satisfy readiness.
+    const result = captureOpenshell(["sandbox", "list", "-g", gatewayName], {
+      ignoreError: true,
+      timeout: remainingMs(),
+    });
+    return { status: result.status, output: result.output };
+  };
+
+  const listProbe = runSandboxList();
+  const listCommandFailed = listProbe.status !== 0;
+  if (listCommandFailed && outputShowsGatewayUnavailable(listProbe.output)) {
+    failConnectReadinessGatewayUnavailable(sandboxName, listProbe.output);
+  }
+  const list = listProbe.output;
+  if (isSandboxReady(list, sandboxName)) return;
+
+  const status = parseSandboxStatus(list, sandboxName);
+  if (!listCommandFailed && status && /^unknown$/i.test(status)) {
+    failIfGatewayBlocksConnectReadiness(sandboxName);
+  }
+  if (status && TERMINAL_SANDBOX_PHASES.has(status)) {
+    console.error("");
+    console.error(`  Sandbox '${sandboxName}' is in '${status}' state.`);
+    console.error(`  Run:  ${CLI_NAME} ${sandboxName} logs --follow`);
+    console.error(`  Run:  ${CLI_NAME} ${sandboxName} status`);
+    process.exit(1);
+  }
+  if (isDockerRuntimeDown(sandboxName)) {
+    failConnectReadinessDockerRuntimeDown(sandboxName);
+  }
+
+  console.log(`  Waiting for sandbox '${sandboxName}' to be ready...`);
+  let ready = false;
+  let everSeen = status !== null;
+  while (Date.now() < deadline) {
+    const sleepFor = Math.min(interval, remainingMs() / 1000);
+    if (sleepFor <= 0) break;
+    spawnSync("sleep", [String(sleepFor)]);
+    const pollProbe = runSandboxList();
+    const pollCommandFailed = pollProbe.status !== 0;
+    if (pollCommandFailed && outputShowsGatewayUnavailable(pollProbe.output)) {
+      failConnectReadinessGatewayUnavailable(sandboxName, pollProbe.output);
+    }
+    const poll = pollProbe.output;
+    const elapsed = elapsedSec();
+    if (isSandboxReady(poll, sandboxName)) {
+      ready = true;
+      break;
+    }
+    const parsedCur = parseSandboxStatus(poll, sandboxName);
+    const cur = parsedCur || "unknown";
+    if (!pollCommandFailed && parsedCur && /^unknown$/i.test(parsedCur)) {
+      failIfGatewayBlocksConnectReadiness(sandboxName);
+    }
+    if (cur !== "unknown") everSeen = true;
+    if (TERMINAL_SANDBOX_PHASES.has(cur)) {
+      console.error("");
+      console.error(`  Sandbox '${sandboxName}' entered '${cur}' state.`);
+      console.error(`  Run:  ${CLI_NAME} ${sandboxName} logs --follow`);
+      console.error(`  Run:  ${CLI_NAME} ${sandboxName} status`);
+      process.exit(1);
+    }
+    if (isDockerRuntimeDown(sandboxName)) {
+      failConnectReadinessDockerRuntimeDown(sandboxName);
+    }
+    if (!everSeen && elapsed >= 30) {
+      console.error("");
+      console.error(`  Sandbox '${sandboxName}' not found after ${elapsed}s.`);
+      console.error("  Check: openshell sandbox list");
+      process.exit(1);
+    }
+    process.stdout.write(`\r    Status: ${cur.padEnd(20)} (${elapsed}s elapsed)`);
+  }
+
+  if (!ready) {
+    const suggestedTimeout = Math.max(300, timeout * 2);
+    console.error("");
+    console.error(`  Timed out after ${timeout}s waiting for sandbox '${sandboxName}'.`);
+    console.error("  Check: openshell sandbox list");
+    console.error(
+      `  Override timeout: NEMOCLAW_CONNECT_TIMEOUT=${suggestedTimeout} ${CLI_NAME} ${sandboxName} ${retryCommand}`,
+    );
+    process.exit(1);
+  }
+  console.log(`\r    Status: ${"Ready".padEnd(20)} (${elapsedSec()}s elapsed)`);
+  for (const line of successLogs) console.log(line);
+}
+
+/**
+ * Shared prefix of every connect-style entry point: registry/route validation,
+ * the express-vLLM model preflight, the owning-gateway pin, and the Docker
+ * outage fast-fail. Runs before any probe or interactive work.
+ */
+async function runConnectEntryPreflight(
+  sandboxName: string,
+  { probeOnly }: { probeOnly: boolean },
 ): Promise<void> {
   try {
     assertNoOpenShellGatewayEndpointOverride();
@@ -917,19 +1128,26 @@ export async function connectSandbox(
         `Sandbox '${sandboxName}' is still being created by onboarding. Wait for onboarding to finish or remove the incomplete sandbox before connecting.`,
       );
     }
-    if (registered && registry.getSandboxEntryInference(registered).kind === "configured") {
+    if (registered) {
       const gatewayName = resolveSandboxGatewayName(registered);
-      assertSandboxGatewayRouteCompatible(sandboxName, registered, gatewayName);
+      if (registry.getSandboxEntryInference(registered).kind === "configured") {
+        assertSandboxGatewayRouteCompatible(sandboxName, registered, gatewayName);
+      }
+      recoverPortableDemoSandboxLifecycleForConnect(sandboxName, registered, gatewayName);
     }
   } catch (error) {
     console.error(`  Error: ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
-  // probe-only / recover never install or serve a model, so skip the
-  // express-vLLM model preflight for them (it only steers the install path
-  // and would otherwise hard-exit a recovery on a stale NEMOCLAW_VLLM_MODEL).
+  // probe-only / recover can restart receipt-owned local inference, but they
+  // never select, install, or pull a model. Skip the express-vLLM model
+  // preflight because it only steers installation and can reject recovery on
+  // a stale NEMOCLAW_VLLM_MODEL.
   if (!probeOnly) preflightVllmModelEnvOrExit();
-  const live = await ensureLiveSandboxOrExit(sandboxName, { allowNonReadyPhase: true });
+  const live = await ensureLiveSandboxOrExit(sandboxName, {
+    allowNonReadyPhase: true,
+    gatewayRecovery: probeOnly ? "observe" : "recover",
+  });
 
   // Fast-fail on a Docker daemon outage before the probe-only health check and
   // the session/recovery probes below (each can spawn 15s `openshell sandbox
@@ -948,10 +1166,20 @@ export async function connectSandbox(
   ) {
     failConnectReadinessDockerRuntimeDown(sandboxName);
   }
+}
 
-  if (probeOnly) {
-    return await runSandboxConnectProbe(sandboxName);
-  }
+/**
+ * Everything an interactive sandbox session needs before SSH is spawned:
+ * the shared connect entry preflight plus process recovery, readiness wait,
+ * inference-route reconcile, and the auto-pair approval pass. Shared by
+ * `connect` and `launch`; both are always non-probe-only. Any
+ * `process.exit(...)` reached here ends the process exactly as it does on the
+ * connect path.
+ */
+export async function prepareInteractiveSession(
+  sandboxName: string,
+): Promise<{ agent: AgentDefinition | null; sb: SandboxEntry | null }> {
+  await runConnectEntryPreflight(sandboxName, { probeOnly: false });
 
   // Version staleness check — warn but don't block
   try {
@@ -995,119 +1223,9 @@ export async function connectSandbox(
 
   let sb: SandboxEntry | null = null;
 
-  const rawTimeout = process.env.NEMOCLAW_CONNECT_TIMEOUT;
-  let timeout = 120;
-  if (rawTimeout !== undefined) {
-    const parsed = parseInt(rawTimeout, 10);
-    if (Number.isNaN(parsed) || parsed <= 0) {
-      console.warn(
-        `  Warning: invalid NEMOCLAW_CONNECT_TIMEOUT="${rawTimeout}", using default 120s`,
-      );
-    } else {
-      timeout = parsed;
-    }
-  }
-  const interval = 3;
-  const startedAt = Date.now();
-  const deadline = startedAt + timeout * 1000;
-  const elapsedSec = () => Math.floor((Date.now() - startedAt) / 1000);
-  const remainingMs = () => Math.max(1, deadline - Date.now());
-  const runSandboxList = (): SandboxListProbe => {
-    const result = captureOpenshell(["sandbox", "list"], {
-      ignoreError: true,
-      timeout: remainingMs(),
-    });
-    return { status: result.status, output: result.output };
-  };
-
-  const listProbe = runSandboxList();
-  const listCommandFailed = listProbe.status !== 0;
-  if (listCommandFailed) {
-    if (outputShowsGatewayUnavailable(listProbe.output)) {
-      failConnectReadinessGatewayUnavailable(sandboxName, listProbe.output);
-    }
-  }
-  const list = listProbe.output;
-  if (!isSandboxReady(list, sandboxName)) {
-    const status = parseSandboxStatus(list, sandboxName);
-    if (!listCommandFailed && status && /^unknown$/i.test(status)) {
-      failIfGatewayBlocksConnectReadiness(sandboxName);
-    }
-    if (status && TERMINAL_SANDBOX_PHASES.has(status)) {
-      console.error("");
-      console.error(`  Sandbox '${sandboxName}' is in '${status}' state.`);
-      console.error(`  Run:  ${CLI_NAME} ${sandboxName} logs --follow`);
-      console.error(`  Run:  ${CLI_NAME} ${sandboxName} status`);
-      process.exit(1);
-    }
-
-    // Probe-disagreement safety net: `sandbox get` may have reported Ready/no
-    // phase (so the early guard was skipped) while `sandbox list` shows a
-    // non-terminal status. Status is non-terminal here, so re-check Docker and
-    // fail fast rather than entering the readiness loop (#4428).
-    if (isDockerRuntimeDown(sandboxName)) {
-      failConnectReadinessDockerRuntimeDown(sandboxName);
-    }
-
-    console.log(`  Waiting for sandbox '${sandboxName}' to be ready...`);
-    let ready = false;
-    let everSeen = status !== null;
-    while (Date.now() < deadline) {
-      const sleepFor = Math.min(interval, remainingMs() / 1000);
-      if (sleepFor <= 0) break;
-      spawnSync("sleep", [String(sleepFor)]);
-      const pollProbe = runSandboxList();
-      const pollCommandFailed = pollProbe.status !== 0;
-      if (pollCommandFailed) {
-        if (outputShowsGatewayUnavailable(pollProbe.output)) {
-          failConnectReadinessGatewayUnavailable(sandboxName, pollProbe.output);
-        }
-      }
-      const poll = pollProbe.output;
-      const elapsed = elapsedSec();
-      if (isSandboxReady(poll, sandboxName)) {
-        ready = true;
-        break;
-      }
-      const parsedCur = parseSandboxStatus(poll, sandboxName);
-      const cur = parsedCur || "unknown";
-      if (!pollCommandFailed && parsedCur && /^unknown$/i.test(parsedCur)) {
-        failIfGatewayBlocksConnectReadiness(sandboxName);
-      }
-      if (cur !== "unknown") everSeen = true;
-      if (TERMINAL_SANDBOX_PHASES.has(cur)) {
-        console.error("");
-        console.error(`  Sandbox '${sandboxName}' entered '${cur}' state.`);
-        console.error(`  Run:  ${CLI_NAME} ${sandboxName} logs --follow`);
-        console.error(`  Run:  ${CLI_NAME} ${sandboxName} status`);
-        process.exit(1);
-      }
-      // Catch a Docker daemon that dies mid-wait so we stop polling instead of
-      // running out the full readiness timeout (#4428).
-      if (isDockerRuntimeDown(sandboxName)) {
-        failConnectReadinessDockerRuntimeDown(sandboxName);
-      }
-      if (!everSeen && elapsed >= 30) {
-        console.error("");
-        console.error(`  Sandbox '${sandboxName}' not found after ${elapsed}s.`);
-        console.error("  Check: openshell sandbox list");
-        process.exit(1);
-      }
-      process.stdout.write(`\r    Status: ${cur.padEnd(20)} (${elapsed}s elapsed)`);
-    }
-
-    if (!ready) {
-      console.error("");
-      console.error(`  Timed out after ${timeout}s waiting for sandbox '${sandboxName}'.`);
-      console.error("  Check: openshell sandbox list");
-      console.error(
-        `  Override timeout: NEMOCLAW_CONNECT_TIMEOUT=300 ${CLI_NAME} ${sandboxName} connect`,
-      );
-      process.exit(1);
-    }
-    console.log(`\r    Status: ${"Ready".padEnd(20)} (${elapsedSec()}s elapsed)`);
-    console.log("  Sandbox is ready. Connecting...");
-  }
+  waitForSandboxReadyOrExit(sandboxName, {
+    successLogs: ["  Sandbox is ready. Connecting..."],
+  });
 
   // ── Inference route swap (#1248, #3390) ───────────────────────────
   // When the user has multiple sandboxes with different providers, the
@@ -1127,6 +1245,28 @@ export async function connectSandbox(
   // (#4616). Uses the tight connect budget (#4504).
   runConnectAutoPairApprovalPass(sandboxName);
 
+  return { agent, sb };
+}
+
+export async function connectSandbox(
+  sandboxName: string,
+  { probeOnly = false }: SandboxConnectOptions = {},
+): Promise<void> {
+  if (probeOnly) {
+    await runConnectEntryPreflight(sandboxName, { probeOnly: true });
+    waitForSandboxReadyOrExit(sandboxName, {
+      defaultTimeoutSec: 300,
+      retryCommand: "connect --probe-only",
+    });
+    // Re-pin and re-observe the owning gateway after a potentially long wait
+    // before any in-sandbox process or host-forward mutation. The readiness
+    // polls are already owner-scoped; this also catches registry changes.
+    await ensureLiveSandboxOrExit(sandboxName, { gatewayRecovery: "observe" });
+    return await runSandboxConnectProbe(sandboxName);
+  }
+
+  const { agent, sb } = await prepareInteractiveSession(sandboxName);
+
   // Print a one-shot hint before dropping the user into the sandbox
   // shell so a fresh user knows the first thing to type. Without this,
   // `nemoclaw <name> connect` lands on a bare bash prompt and users
@@ -1137,9 +1277,9 @@ export async function connectSandbox(
     !["1", "true"].includes(String(process.env.NEMOCLAW_NO_CONNECT_HINT || ""))
   ) {
     console.log("");
-    const agentName = sb?.agent || "openclaw";
-    const terminalCommand = agentRuntime.getTerminalCommand(agent, "interactive");
-    const agentCmd = terminalCommand ?? (agentName === "openclaw" ? "openclaw tui" : agentName);
+    // Same resolver `launch` uses, so the hint cannot drift from the command
+    // that `nemoclaw launch <name>` actually runs (#6006).
+    const agentCmd = agentRuntime.getInteractiveAgentCommand(agent, sb?.agent);
     console.log(`  ${G}✓${R} Connecting to sandbox '${sandboxName}'`);
     console.log(
       `  ${D}Inside the sandbox, run \`${agentCmd}\` to start chatting with the agent.${R}`,
@@ -1155,10 +1295,11 @@ export async function connectSandbox(
     // OPENSHELL_SANDBOX) and covers every other interactive entry path too.
     console.log("");
   }
+  prepareHermesLightTerminalSkin(sandboxName, agent, process.env);
   const result = spawnSync(getOpenshellBinary(), ["sandbox", "connect", sandboxName], {
     stdio: "inherit",
     cwd: ROOT,
-    env: process.env,
+    env: { ...process.env },
   });
   exitWithConnectSpawnResult(sandboxName, result);
 }

@@ -13,22 +13,20 @@ import {
 } from "../../src/lib/actions/sandbox/connect-autopair-budget";
 import { testTimeoutOptions } from "../helpers/timeouts";
 import {
-  decodeWrappedSandboxScript,
   extractApprovalPassScript,
   runApprovalPassScript,
   runConnect,
   setupFixture,
 } from "./helpers";
 
-function findApprovalExec(sandboxExecCalls: string[][]): string[] | undefined {
-  // The approval-pass payload is base64-wrapped so it survives OpenShell exec's
-  // no-newline-in-args rule (wrapSandboxShellScript), so identify the call by
-  // its decoded payload rather than literal segments.
-  return sandboxExecCalls.find((call) => {
-    if (!call.includes("--")) return false;
-    const inner = decodeWrappedSandboxScript(call[call.length - 1] || "");
-    return inner.includes("openclaw") && inner.includes("devices") && inner.includes("approve");
-  });
+function findApprovalExec(state: {
+  sandboxExecCalls: string[][];
+  sandboxExecInputs: string[];
+}): string[] | undefined {
+  const approvalIndex = state.sandboxExecInputs.findIndex(
+    (input) => input.includes("openclaw") && input.includes("devices") && input.includes("approve"),
+  );
+  return state.sandboxExecCalls[approvalIndex];
 }
 
 function findGatewayControlExec(dockerCalls: string[][]): string[] | undefined {
@@ -55,7 +53,7 @@ describe("sandbox connect auto-pair approval pass (#4263)", () => {
     () => {
       const { tmpDir, stateFile, sandboxName } = setupFixture(
         {
-          name: "approval-pass-sandbox",
+          name: "approval-pass-sb",
           model: "claude-sonnet-4-20250514",
           provider: "anthropic-prod",
           gpuEnabled: false,
@@ -100,7 +98,7 @@ describe("sandbox connect auto-pair approval pass (#4263)", () => {
     () => {
       const { tmpDir, stateFile, sandboxName } = setupFixture(
         {
-          name: "approval-pass-policy",
+          name: "approval-pass-pol",
           model: "claude-sonnet-4-20250514",
           provider: "anthropic-prod",
           gpuEnabled: false,
@@ -163,7 +161,7 @@ describe("sandbox connect auto-pair approval pass (#4263)", () => {
   it("does not import approval policy from PYTHONPATH", testTimeoutOptions(20_000), () => {
     const { tmpDir, stateFile, sandboxName } = setupFixture(
       {
-        name: "approval-pass-tmp-tamper",
+        name: "approval-tmp-tamper",
         model: "claude-sonnet-4-20250514",
         provider: "anthropic-prod",
         gpuEnabled: false,
@@ -214,7 +212,7 @@ describe("sandbox connect auto-pair approval pass (#4263)", () => {
     () => {
       const { tmpDir, stateFile, sandboxName } = setupFixture(
         {
-          name: "approval-pass-tolerant",
+          name: "approval-tolerant",
           model: "claude-sonnet-4-20250514",
           provider: "anthropic-prod",
           gpuEnabled: false,
@@ -235,12 +233,7 @@ describe("sandbox connect auto-pair approval pass (#4263)", () => {
       const state = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
       // Approval-pass exec was attempted (and the fake openshell exited
       // non-zero for it, per the hook above).
-      const approvalExec = (state.sandboxExecCalls as string[][]).find((call) => {
-        if (!call.includes("--")) return false;
-        // The payload is base64-wrapped for OpenShell exec; decode to identify it.
-        const inner = decodeWrappedSandboxScript(call[call.length - 1] || "");
-        return inner.includes("openclaw") && inner.includes("devices") && inner.includes("approve");
-      });
+      const approvalExec = findApprovalExec(state);
       expect(approvalExec).toBeDefined();
       // Despite the approval-pass failure, SSH handoff still happens.
       expect(state.sandboxConnectCalls).toContainEqual(["sandbox", "connect", sandboxName]);
@@ -266,7 +259,7 @@ describe("sandbox connect scope-upgrade approval on recover/probe (#4504)", () =
       // SSH session.
       const { tmpDir, stateFile, sandboxName } = setupFixture(
         {
-          name: "probe-approval-sandbox",
+          name: "probe-approval-sb",
           model: "claude-sonnet-4-20250514",
           provider: "anthropic-prod",
           gpuEnabled: false,
@@ -295,7 +288,7 @@ describe("sandbox connect scope-upgrade approval on recover/probe (#4504)", () =
       expect(controlExec).toContain("PYTHONNOUSERSITE=1");
       expect(controlExec?.[userIndex + 5]).toMatch(/^[0-9a-f]{64}$/);
       expect(state.gatewayRunning).toBe(true);
-      const approvalExec = findApprovalExec(state.sandboxExecCalls as string[][]);
+      const approvalExec = findApprovalExec(state);
       expect(approvalExec).toBeDefined();
       expect(approvalExec).toContain("sandbox");
       expect(approvalExec).toContain("exec");
@@ -314,7 +307,7 @@ describe("sandbox connect scope-upgrade approval on recover/probe (#4504)", () =
       // probe-only flow must still succeed.
       const { tmpDir, stateFile, sandboxName } = setupFixture(
         {
-          name: "probe-approval-tolerant",
+          name: "probe-approval-tol",
           model: "claude-sonnet-4-20250514",
           provider: "anthropic-prod",
           gpuEnabled: false,
@@ -331,7 +324,7 @@ describe("sandbox connect scope-upgrade approval on recover/probe (#4504)", () =
       expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
 
       const state = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
-      const approvalExec = findApprovalExec(state.sandboxExecCalls as string[][]);
+      const approvalExec = findApprovalExec(state);
       expect(approvalExec).toBeDefined();
     },
   );
@@ -362,7 +355,7 @@ describe("sandbox connect scope-upgrade approval on recover/probe (#4504)", () =
       expect(result.status).toBe(1);
 
       const state = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
-      const approvalExec = findApprovalExec(state.sandboxExecCalls as string[][]);
+      const approvalExec = findApprovalExec(state);
       expect(approvalExec).toBeUndefined();
       // And it never opens an SSH session on the failure path.
       expect(state.sandboxConnectCalls).toEqual([]);
@@ -380,7 +373,7 @@ describe("sandbox connect scope-upgrade approval on recover/probe (#4504)", () =
       // saw none of the triplet.
       const { tmpDir, stateFile, sandboxName } = setupFixture(
         {
-          name: "probe-env-strip-sandbox",
+          name: "probe-env-strip-sb",
           model: "claude-sonnet-4-20250514",
           provider: "anthropic-prod",
           gpuEnabled: false,
@@ -419,7 +412,7 @@ describe("sandbox connect scope-upgrade approval on recover/probe (#4504)", () =
     () => {
       const { tmpDir, stateFile, sandboxName } = setupFixture(
         {
-          name: "approve-budget-sandbox",
+          name: "approve-budget-sb",
           model: "claude-sonnet-4-20250514",
           provider: "anthropic-prod",
           gpuEnabled: false,

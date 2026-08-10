@@ -37,6 +37,7 @@ function createInput(
       return null;
     },
     providerExistsInGateway: () => false,
+    providerMatchesGatewayCredential: () => false,
     ...overrides,
   };
 }
@@ -73,6 +74,70 @@ describe("prepareCreateSandboxMessaging", () => {
     );
   });
 
+  it("reuses an existing gateway bridge provider when the bridge secret is not resolvable", () => {
+    // Deferred rebuild in a fresh process: the pasted secret is env-only and
+    // gone, so no bridge token def exists — but the gateway still durably
+    // holds the refresh material, so the provider only needs re-attaching.
+    const providerExistsInGateway = vi.fn((name: string) => name === "demo-googlechat-bridge");
+
+    const result = prepareCreateSandboxMessaging(
+      createInput({
+        enabledChannels: ["googlechat"],
+        providerExistsInGateway,
+      }),
+    );
+
+    expect(result.messagingTokenDefs.some((def) => def.name === "demo-googlechat-bridge")).toBe(
+      false,
+    );
+    expect(result.reusableMessagingProviders).toContain("demo-googlechat-bridge");
+    expect(result.reusableMessagingChannels).toContain("googlechat");
+    expect(providerExistsInGateway).toHaveBeenCalledWith("demo-googlechat-bridge");
+  });
+
+  it("routes the bridge through upsert instead of reuse when the secret is resolvable", () => {
+    const result = prepareCreateSandboxMessaging(
+      createInput({
+        enabledChannels: ["googlechat"],
+        env: {
+          GOOGLECHAT_SERVICE_ACCOUNT: JSON.stringify({
+            client_email: "bot@p.iam.gserviceaccount.com",
+            private_key: "fake-test-private-key-material",
+          }),
+        },
+        providerExistsInGateway: () => true,
+      }),
+    );
+
+    const def = result.messagingTokenDefs.find((d) => d.name === "demo-googlechat-bridge");
+    expect(def?.token).toBeTruthy();
+    expect(result.reusableMessagingProviders).not.toContain("demo-googlechat-bridge");
+  });
+
+  it("does not reuse a bridge provider that is absent from the gateway", () => {
+    const result = prepareCreateSandboxMessaging(
+      createInput({
+        enabledChannels: ["googlechat"],
+        providerExistsInGateway: () => false,
+      }),
+    );
+
+    expect(result.reusableMessagingProviders).toEqual([]);
+    expect(result.reusableMessagingChannels).toEqual([]);
+  });
+
+  it("does not reuse the bridge provider of a disabled channel", () => {
+    const result = prepareCreateSandboxMessaging(
+      createInput({
+        enabledChannels: ["googlechat"],
+        disabledChannels: ["googlechat"],
+        providerExistsInGateway: () => true,
+      }),
+    );
+
+    expect(result.reusableMessagingProviders).toEqual([]);
+  });
+
   it("reports missing Brave API keys before registering extra placeholder providers", () => {
     const registerExtraPlaceholderProviders = vi.fn(() => ["BRAVE_API_KEY_AGENT_A"]);
 
@@ -90,6 +155,30 @@ describe("prepareCreateSandboxMessaging", () => {
       false,
     );
     expect(registerExtraPlaceholderProviders).not.toHaveBeenCalled();
+  });
+
+  it("reuses an exact Brave gateway provider when the raw key is unavailable (#6743)", () => {
+    const providerMatchesGatewayCredential = vi.fn(
+      (name: string, type: string, credentialEnv: string) =>
+        name === "demo-brave-search" && type === "brave" && credentialEnv === BRAVE_API_KEY_ENV,
+    );
+
+    const result = prepareCreateSandboxMessaging(
+      createInput({
+        webSearchConfig: { fetchEnabled: true },
+        requireExactProviderBinding: true,
+        providerMatchesGatewayCredential,
+      }),
+    );
+
+    expect(result.missingWebSearchCredentialEnv).toBeNull();
+    expect(result.messagingTokenDefs).toContainEqual({
+      name: "demo-brave-search",
+      envKey: BRAVE_API_KEY_ENV,
+      token: null,
+      providerType: "brave",
+    });
+    expect(result.reusableMessagingProviders).toEqual(["demo-brave-search"]);
   });
 
   it("reports a missing Tavily key using the selected provider credential", () => {
@@ -182,12 +271,12 @@ describe("prepareCreateSandboxMessaging", () => {
   });
 
   it("includes all static token-backed channels by default without probing reusable providers", () => {
-    const providerExistsInGateway = vi.fn(() => true);
+    const providerMatchesGatewayCredential = vi.fn(() => true);
 
     const result = prepareCreateSandboxMessaging(
       createInput({
         enabledChannels: null,
-        providerExistsInGateway,
+        providerMatchesGatewayCredential,
       }),
     );
 
@@ -201,7 +290,7 @@ describe("prepareCreateSandboxMessaging", () => {
     ]);
     expect(result.reusableMessagingProviders).toEqual([]);
     expect(result.reusableMessagingChannels).toEqual([]);
-    expect(providerExistsInGateway).not.toHaveBeenCalled();
+    expect(providerMatchesGatewayCredential).not.toHaveBeenCalled();
   });
 
   it("uses BRAVE_API_KEY from host env when the credential store has no value", () => {

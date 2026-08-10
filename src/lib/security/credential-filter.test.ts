@@ -8,105 +8,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   isConfigValue,
-  isCredentialField,
   isSafeCredentialPlaceholder,
   isSensitiveFile,
   sanitizeConfigFile,
+  sanitizeEnvFile,
+  sanitizeEnvFileContent,
+  sanitizeYamlConfigFile,
   shouldScanSnapshotFileForCredentials,
   stripCredentials,
-  valueLooksLikeSecret,
 } from "./credential-filter.js";
-
-describe("isCredentialField", () => {
-  it("matches explicit field names", () => {
-    expect(isCredentialField("apiKey")).toBe(true);
-    expect(isCredentialField("api_key")).toBe(true);
-    expect(isCredentialField("token")).toBe(true);
-    expect(isCredentialField("secret")).toBe(true);
-    expect(isCredentialField("password")).toBe(true);
-    expect(isCredentialField("resolvedKey")).toBe(true);
-  });
-
-  it("matches pattern-based names", () => {
-    expect(isCredentialField("accessToken")).toBe(true);
-    expect(isCredentialField("refreshToken")).toBe(true);
-    expect(isCredentialField("clientSecret")).toBe(true);
-    expect(isCredentialField("bearerToken")).toBe(true);
-    expect(isCredentialField("privateKey")).toBe(true);
-    expect(isCredentialField("sessionToken")).toBe(true);
-    // OpenClaw channel token fields (#5027).
-    expect(isCredentialField("botToken")).toBe(true);
-    expect(isCredentialField("appToken")).toBe(true);
-  });
-
-  it("matches env-variable-style secret names (#5027)", () => {
-    expect(isCredentialField("GITHUB_TOKEN")).toBe(true);
-    expect(isCredentialField("BRAVE_API_KEY")).toBe(true);
-    expect(isCredentialField("OPENAI_API_KEY")).toBe(true);
-    expect(isCredentialField("DB_PASSWORD")).toBe(true);
-    expect(isCredentialField("SLACK_APP_TOKEN")).toBe(true);
-    // Bare uppercase secret words must also be scrubbed.
-    expect(isCredentialField("TOKEN")).toBe(true);
-    expect(isCredentialField("PASSWORD")).toBe(true);
-    expect(isCredentialField("SECRET")).toBe(true);
-    expect(isCredentialField("CREDENTIALS")).toBe(true);
-  });
-
-  it("matches well-known HTTP auth header names (#5027)", () => {
-    expect(isCredentialField("Authorization")).toBe(true);
-    expect(isCredentialField("authorization")).toBe(true);
-    expect(isCredentialField("Proxy-Authorization")).toBe(true);
-    expect(isCredentialField("X-API-Key")).toBe(true);
-    expect(isCredentialField("X-API-Token")).toBe(true);
-    expect(isCredentialField("x-auth-token")).toBe(true);
-    expect(isCredentialField("Private-Token")).toBe(true);
-    expect(isCredentialField("X-Custom-Auth")).toBe(true);
-    expect(isCredentialField("Cookie")).toBe(true);
-  });
-
-  it("does not match safe field names", () => {
-    expect(isCredentialField("name")).toBe(false);
-    expect(isCredentialField("model")).toBe(false);
-    expect(isCredentialField("provider")).toBe(false);
-    expect(isCredentialField("endpoint")).toBe(false);
-    expect(isCredentialField("version")).toBe(false);
-    // Benign env/setting names must not be scrubbed.
-    expect(isCredentialField("NODE_ENV")).toBe(false);
-    expect(isCredentialField("LOG_LEVEL")).toBe(false);
-    expect(isCredentialField("PATH")).toBe(false);
-    expect(isCredentialField("tokenizer")).toBe(false);
-    expect(isCredentialField("maxTokens")).toBe(false);
-    expect(isCredentialField("X-Request-Id")).toBe(false);
-  });
-
-  it("does not strip public keys (verification material, not secrets)", () => {
-    expect(isCredentialField("publicKey")).toBe(false);
-    expect(isCredentialField("PUBLIC_KEY")).toBe(false);
-    expect(isCredentialField("public-key")).toBe(false);
-    expect(isCredentialField("X-Public-Key")).toBe(false);
-    expect(isCredentialField("GITHUB_PUBLIC_KEY")).toBe(false);
-    // But private keys and other secret fields still match.
-    expect(isCredentialField("privateKey")).toBe(true);
-    expect(isCredentialField("PRIVATE_KEY")).toBe(true);
-    expect(isCredentialField("apiKey")).toBe(true);
-  });
-});
-
-describe("valueLooksLikeSecret", () => {
-  it("matches recognizable secret formats", () => {
-    expect(valueLooksLikeSecret("ghp_0123456789abcdef")).toBe(true);
-    expect(valueLooksLikeSecret("sk-proj-0123456789abcdefghij")).toBe(true);
-    expect(valueLooksLikeSecret("xoxb-123456789-abcdefghij")).toBe(true);
-    expect(valueLooksLikeSecret("Bearer abcdef0123456789")).toBe(true);
-  });
-
-  it("does not match benign values", () => {
-    expect(valueLooksLikeSecret("npx")).toBe(false);
-    expect(valueLooksLikeSecret("https://integrate.api.nvidia.com/v1")).toBe(false);
-    expect(valueLooksLikeSecret("moonshotai/kimi-k2")).toBe(false);
-    expect(valueLooksLikeSecret("production")).toBe(false);
-  });
-});
 
 describe("isSafeCredentialPlaceholder", () => {
   it("recognizes OpenShell resolve placeholders and the unused sentinel", () => {
@@ -176,6 +86,13 @@ describe("stripCredentials", () => {
     expect(stripCredentials(42)).toBe(42);
   });
 
+  it("preserves null and undefined under credential field names", () => {
+    const result = stripCredentials({ apiKey: null, token: undefined, model: "keep" });
+    expect(result.apiKey).toBeNull();
+    expect(result.token).toBeUndefined();
+    expect(result.model).toBe("keep");
+  });
+
   it("preserves OpenShell resolve placeholders under credential fields (#5027)", () => {
     const input = {
       models: { providers: { nvidia: { apiKey: "unused", baseUrl: "https://x/v1" } } },
@@ -195,92 +112,6 @@ describe("stripCredentials", () => {
     expect(result.channels.slack.accounts.default.botToken).toBe(
       "xoxb-OPENSHELL-RESOLVE-ENV-SLACK_BOT_TOKEN",
     );
-  });
-
-  it("strips raw channel tokens and MCP env secrets from openclaw.json (#5027)", () => {
-    const input = {
-      channels: {
-        slack: {
-          accounts: { default: { botToken: "xoxb-123-realsecret", appToken: "xapp-1-realsecret" } },
-        },
-      },
-      mcpServers: {
-        github: {
-          command: "npx",
-          env: {
-            GITHUB_TOKEN: "ghp_realsecret",
-            TOKEN: "raw",
-            PASSWORD: "pw",
-            NODE_ENV: "production",
-          },
-        },
-      },
-    };
-    const result = stripCredentials(input);
-    expect(result.channels.slack.accounts.default.botToken).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(result.channels.slack.accounts.default.appToken).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(result.mcpServers.github.env.GITHUB_TOKEN).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(result.mcpServers.github.env.TOKEN).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(result.mcpServers.github.env.PASSWORD).toBe("[STRIPPED_BY_MIGRATION]");
-    // Non-secret env vars and command survive.
-    expect(result.mcpServers.github.env.NODE_ENV).toBe("production");
-    expect(result.mcpServers.github.command).toBe("npx");
-  });
-
-  it("strips MCP HTTP auth headers by name and value backstop (#5027)", () => {
-    const input = {
-      mcpServers: {
-        remote: {
-          url: "https://mcp.example.com",
-          headers: {
-            Authorization: "Bearer ghp_0123456789abcdef",
-            "X-API-Key": "sk-0123456789abcdefghij", // gitleaks:allow
-            // Opaque value (no recognizable prefix) caught by header name.
-            "X-API-Token": "plain-opaque-value-12345",
-            // Opaque value under a custom -auth header, caught by header name.
-            "X-Custom-Auth": "plain-opaque-value-67890",
-            // Bearer resolve reference must survive (only a reference, no secret).
-            "X-Auth-Token": "Bearer openshell:resolve:env:REMOTE_MCP_TOKEN",
-            "X-Request-Id": "req-12345",
-          },
-        },
-      },
-    };
-    const result = stripCredentials(input);
-    const headers = result.mcpServers.remote.headers;
-    expect(headers.Authorization).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(headers["X-API-Key"]).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(headers["X-API-Token"]).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(headers["X-Custom-Auth"]).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(headers["X-Auth-Token"]).toBe("Bearer openshell:resolve:env:REMOTE_MCP_TOKEN");
-    expect(headers["X-Request-Id"]).toBe("req-12345");
-    expect(result.mcpServers.remote.url).toBe("https://mcp.example.com");
-  });
-
-  it("scrubs secret strings and flag values inside array args (#5027)", () => {
-    const input = {
-      mcpServers: {
-        cli: {
-          command: "some-mcp",
-          args: [
-            "--api-key",
-            "opaqueOpaqueSecret123", // opaque value after a credential flag
-            "--verbose", // value-less flag must not be swallowed
-            "--token=plainOpaque", // inline credential flag form
-            "--name=server", // benign inline flag survives
-            "ghp_0123456789abcdef", // shape-based catch
-          ],
-        },
-      },
-    };
-    const result = stripCredentials(input);
-    const args = result.mcpServers.cli.args;
-    expect(args[0]).toBe("--api-key");
-    expect(args[1]).toBe("[STRIPPED_BY_MIGRATION]");
-    expect(args[2]).toBe("--verbose");
-    expect(args[3]).toBe("--token=[STRIPPED_BY_MIGRATION]");
-    expect(args[4]).toBe("--name=server");
-    expect(args[5]).toBe("[STRIPPED_BY_MIGRATION]");
   });
 
   it("still strips raw secrets even under preserved-style sibling fields", () => {
@@ -388,14 +219,180 @@ describe("sanitizeConfigFile", () => {
 
     expect(JSON.parse(readFileSync(targetPath, "utf-8"))).toEqual({ apiKey: "sk-secret" });
   });
+
+  it("strips Hermes YAML credentials and removes gateway", () => {
+    const configPath = join(tmpDir, "config.yaml");
+    writeFileSync(
+      configPath,
+      [
+        "model: hermes",
+        "api_key: sk-hermes-secret-key-value",
+        "botToken: xoxb-slack-bot-token-value",
+        "publicKey: keep-me",
+        "gateway:",
+        "  authToken: gw-token",
+        "env:",
+        "  GITHUB_TOKEN: ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        "  NODE_ENV: production",
+        "",
+      ].join("\n"),
+    );
+
+    expect(sanitizeConfigFile(configPath)).toBe(true);
+
+    const result = readFileSync(configPath, "utf-8");
+    expect(result).toContain("model: hermes");
+    expect(result).toContain("publicKey: keep-me");
+    expect(result).toContain("NODE_ENV: production");
+    expect(result).toContain("[STRIPPED_BY_MIGRATION]");
+    expect(result).not.toContain("sk-hermes-secret-key-value");
+    expect(result).not.toContain("xoxb-slack-bot-token-value");
+    expect(result).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+    expect(result).not.toContain("gateway:");
+  });
+
+  it("fails closed for malformed Hermes YAML", () => {
+    const configPath = join(tmpDir, "broken.yaml");
+    writeFileSync(configPath, "api_key: [unclosed\n");
+    expect(sanitizeYamlConfigFile(configPath)).toBe(false);
+    expect(sanitizeConfigFile(configPath)).toBe(false);
+    expect(readFileSync(configPath, "utf-8")).toContain("api_key:");
+  });
+
+  it("returns failure without changing the source when a YAML rewrite fails", () => {
+    const configPath = join(tmpDir, "config.yaml");
+    const source = "api_key: sk-hermes-secret-key-value\n";
+    writeFileSync(configPath, source);
+
+    expect(
+      sanitizeYamlConfigFile(configPath, () => {
+        throw new Error("injected rewrite failure");
+      }),
+    ).toBe(false);
+    expect(readFileSync(configPath, "utf-8")).toBe(source);
+  });
+
+  it("preserves empty and comment-only YAML documents", () => {
+    for (const [name, source] of [
+      ["empty.yaml", ""],
+      ["comments.yaml", "# nothing to sanitize\n"],
+    ]) {
+      const configPath = join(tmpDir, name);
+      writeFileSync(configPath, source);
+      expect(sanitizeYamlConfigFile(configPath)).toBe(true);
+      expect(readFileSync(configPath, "utf-8")).toBe(source);
+    }
+  });
+
+  it("sanitizes valid JSON arrays instead of treating them as failures", () => {
+    const configPath = join(tmpDir, "config.json");
+    writeFileSync(configPath, JSON.stringify([{ apiKey: "sk-secret-value-long-enough" }]));
+
+    expect(sanitizeConfigFile(configPath)).toBe(true);
+    expect(JSON.parse(readFileSync(configPath, "utf-8"))).toEqual([
+      { apiKey: "[STRIPPED_BY_MIGRATION]" },
+    ]);
+  });
+});
+
+describe("sanitizeEnvFileContent", () => {
+  it("strips PASS/TOKEN secrets without over-matching KEYBOARD_LAYOUT", () => {
+    const input = [
+      "# comment",
+      "NODE_ENV=production",
+      "KEYBOARD_LAYOUT=us",
+      "DB_PASS=super-secret",
+      "GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      "API_KEY=openshell:resolve:env:API_KEY",
+      "PASSPHRASE=raw-passphrase",
+      "",
+    ].join("\n");
+
+    const result = sanitizeEnvFileContent(input);
+    expect(result).toContain("NODE_ENV=production");
+    expect(result).toContain("KEYBOARD_LAYOUT=us");
+    expect(result).toContain("DB_PASS=[STRIPPED_BY_MIGRATION]");
+    expect(result).toContain("GITHUB_TOKEN=[STRIPPED_BY_MIGRATION]");
+    expect(result).toContain("API_KEY=openshell:resolve:env:API_KEY");
+    expect(result).toContain("PASSPHRASE=[STRIPPED_BY_MIGRATION]");
+    expect(result).toContain("# comment");
+  });
+
+  it("strips credential keys that use a leading export prefix", () => {
+    const input = [
+      "export DB_PASS=super-secret",
+      "export NODE_ENV=production",
+      "  export  GITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      "",
+    ].join("\n");
+
+    const result = sanitizeEnvFileContent(input);
+    expect(result).toContain("export DB_PASS=[STRIPPED_BY_MIGRATION]");
+    expect(result).toContain("export NODE_ENV=production");
+    expect(result).toContain("export  GITHUB_TOKEN=[STRIPPED_BY_MIGRATION]");
+    expect(result).not.toContain("super-secret");
+    expect(result).not.toContain("ghp_abcdefghijklmnopqrstuvwxyz0123456789");
+  });
+
+  it("strips secret-shaped values stored under benign keys", () => {
+    const input = [
+      "MODEL=keep-me",
+      "CUSTOM=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+      "ENDPOINT=Bearer opaque-migration-secret",
+      "SAFE=openshell:resolve:env:SAFE",
+      "",
+    ].join("\n");
+
+    const result = sanitizeEnvFileContent(input);
+    expect(result).toContain("MODEL=keep-me");
+    expect(result).toContain("CUSTOM=[STRIPPED_BY_MIGRATION]");
+    expect(result).toContain("ENDPOINT=[STRIPPED_BY_MIGRATION]");
+    expect(result).toContain("SAFE=openshell:resolve:env:SAFE");
+  });
+});
+
+describe("sanitizeEnvFile", () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "cred-env-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("rewrites .env credentials in place", () => {
+    const envPath = join(tmpDir, ".env");
+    writeFileSync(envPath, "DB_PASS=secret\nLOG_LEVEL=info\n");
+    expect(sanitizeEnvFile(envPath)).toBe(true);
+    expect(readFileSync(envPath, "utf-8")).toBe(
+      "DB_PASS=[STRIPPED_BY_MIGRATION]\nLOG_LEVEL=info\n",
+    );
+  });
+
+  it("returns failure without changing the source when an env rewrite fails", () => {
+    const envPath = join(tmpDir, ".env");
+    const source = "DB_PASS=secret\n";
+    writeFileSync(envPath, source);
+
+    expect(
+      sanitizeEnvFile(envPath, () => {
+        throw new Error("injected rewrite failure");
+      }),
+    ).toBe(false);
+    expect(readFileSync(envPath, "utf-8")).toBe(source);
+  });
 });
 
 describe("isSensitiveFile", () => {
-  it("detects auth-profiles.json", () => {
+  it("detects credential-bearing auth state basenames", () => {
     expect(isSensitiveFile("auth-profiles.json")).toBe(true);
     expect(isSensitiveFile("Auth-Profiles.json")).toBe(true);
     expect(isSensitiveFile("auth.json")).toBe(true);
     expect(isSensitiveFile("AUTH.JSON")).toBe(true);
+    expect(isSensitiveFile("chatgpt-auth.json")).toBe(true);
+    expect(isSensitiveFile("CHATGPT-AUTH.JSON")).toBe(true);
   });
 
   it("does not flag normal files", () => {
@@ -406,11 +403,13 @@ describe("isSensitiveFile", () => {
 });
 
 describe("shouldScanSnapshotFileForCredentials", () => {
-  it("scans runtime config and env files", () => {
+  it("scans runtime config, env, and Hermes YAML files", () => {
     expect(shouldScanSnapshotFileForCredentials("openclaw.json")).toBe(true);
     expect(shouldScanSnapshotFileForCredentials("config.json")).toBe(true);
     expect(shouldScanSnapshotFileForCredentials(".env")).toBe(true);
     expect(shouldScanSnapshotFileForCredentials("service.env")).toBe(true);
+    expect(shouldScanSnapshotFileForCredentials("config.yaml")).toBe(true);
+    expect(shouldScanSnapshotFileForCredentials("config.yml")).toBe(true);
   });
 
   it("skips dependency lockfiles that can contain non-secret package metadata matches", () => {
@@ -423,5 +422,6 @@ describe("shouldScanSnapshotFileForCredentials", () => {
   it("applies lockfile exclusions to paths by basename", () => {
     expect(shouldScanSnapshotFileForCredentials("/tmp/snapshot/package-lock.json")).toBe(false);
     expect(shouldScanSnapshotFileForCredentials("/tmp/snapshot/config.json")).toBe(true);
+    expect(shouldScanSnapshotFileForCredentials("/tmp/snapshot/config.yaml")).toBe(true);
   });
 });

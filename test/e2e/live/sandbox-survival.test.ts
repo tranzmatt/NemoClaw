@@ -13,7 +13,16 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
-import { assertExitZero, resultText, sandboxAccessEnv } from "../fixtures/clients/index.ts";
+import {
+  cleanupWhenCommandAvailable,
+  cleanupWhenOpenShellAvailable,
+} from "../fixtures/cleanup-resources.ts";
+import {
+  assertExitZero,
+  type HostCliClient,
+  resultText,
+  sandboxAccessEnv,
+} from "../fixtures/clients/index.ts";
 import { trustedProviderEndpoint } from "../fixtures/clients/provider.ts";
 import { expect, test } from "../fixtures/e2e-test.ts";
 import { requireHostedInferenceConfig } from "../fixtures/hosted-inference.ts";
@@ -24,6 +33,86 @@ import type { SandboxMarker } from "../fixtures/phases/state-validation.ts";
 const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-survival";
 const MIN_OPENSHELL_VERSION = "0.0.24";
 const MODEL = process.env.NEMOCLAW_MODEL ?? "nvidia/nemotron-3-super-120b-a12b";
+
+const SURVIVAL_DIAGNOSTICS_SCRIPT = String.raw`
+set +e
+sandbox_name="$1"
+
+printf '%s\n' '== OpenShell sandbox status =='
+openshell sandbox get "$sandbox_name" 2>&1
+printf '%s\n' '== OpenShell forwards =='
+openshell forward list 2>&1
+printf '%s\n' '== OpenShell gateway service =='
+systemctl --user status nemoclaw-openshell-gateway --no-pager -l 2>&1
+printf '%s\n' '== OpenShell gateway journal =='
+journalctl --user -u nemoclaw-openshell-gateway -n 200 --no-pager 2>&1
+
+container_ids="$(docker ps -aq \
+  --filter label=openshell.ai/managed-by=openshell \
+  --filter "label=openshell.ai/sandbox-name=$sandbox_name")"
+printf '%s\n' '== matching containers =='
+if [ -n "$container_ids" ]; then
+  docker ps -a --no-trunc \
+    --filter label=openshell.ai/managed-by=openshell \
+    --filter "label=openshell.ai/sandbox-name=$sandbox_name" \
+    --format '{{.ID}} {{.Names}} {{.Status}}'
+else
+  printf '%s\n' 'none'
+fi
+
+for container_id in $container_ids; do
+  printf '%s\n' "== container $container_id inspect =="
+  docker inspect "$container_id" 2>&1 | node -e '
+    const fs = require("node:fs");
+    const row = JSON.parse(fs.readFileSync(0, "utf8"))[0] || {};
+    const prefix = "OPENSHELL_SANDBOX_COMMAND=";
+    const matches = (row.Config?.Env || []).filter((entry) => entry.startsWith(prefix));
+    const command = matches.length === 1 ? matches[0].slice(prefix.length) : "";
+    const tokens = command.trim().split(/\s+/).filter(Boolean);
+    process.stdout.write(JSON.stringify({
+      name: row.Name || "",
+      configUser: row.Config?.User || "",
+      state: {
+        status: row.State?.Status || "",
+        running: Boolean(row.State?.Running),
+        restarting: Boolean(row.State?.Restarting),
+        pid: row.State?.Pid || 0,
+        exitCode: row.State?.ExitCode ?? null,
+        error: row.State?.Error || "",
+        startedAt: row.State?.StartedAt || "",
+        finishedAt: row.State?.FinishedAt || "",
+        health: row.State?.Health?.Status || "",
+      },
+      restartPolicy: row.HostConfig?.RestartPolicy?.Name || "",
+      startupCommandCount: matches.length,
+      startupCommandIsSleepInfinity: tokens.length === 2
+        && tokens[0] === "sleep" && tokens[1] === "infinity",
+      startupCommandEndsWithNemoclawStart: tokens.length > 0
+        && ["nemoclaw-start", "/usr/local/bin/nemoclaw-start"].includes(tokens.at(-1)),
+    }) + "\n");
+  '
+  printf '%s\n' "== container $container_id host process tree =="
+  docker top "$container_id" -eo pid,ppid,user,stat,comm 2>&1
+  printf '%s\n' "== container $container_id runtime state =="
+  docker exec "$container_id" sh -lc '
+    printf "%s\n" "== pid 1 =="
+    cat /proc/1/comm 2>/dev/null || true
+    printf "\n%s\n" "== process tree =="
+    ps -eo user=,pid=,ppid=,stat=,comm= 2>&1 || true
+    printf "%s\n" "== direct gateway health =="
+    curl -q --noproxy "*" -sS -o /dev/null -w "HTTP %{http_code}\n" \
+      --connect-timeout 2 --max-time 5 http://127.0.0.1:18789/health 2>&1 || true
+    printf "%s\n" "== managed controller status =="
+    cat /run/nemoclaw/gateway-control/status 2>&1 || true
+    printf "%s\n" "== startup log =="
+    tail -n 300 /tmp/nemoclaw-start.log 2>&1 || true
+    printf "%s\n" "== gateway log =="
+    tail -n 300 /tmp/gateway.log 2>&1 || true
+  ' 2>&1
+  printf '%s\n' "== container $container_id logs =="
+  docker logs --tail 300 "$container_id" 2>&1
+done
+`;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -57,6 +146,23 @@ function installEnv(hostedEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   };
 }
 
+async function captureSurvivalDiagnostics(
+  host: HostCliClient,
+  stage: string,
+  redactionValues: string[],
+): Promise<void> {
+  await host.command(
+    "sh",
+    ["-lc", SURVIVAL_DIAGNOSTICS_SCRIPT, "sandbox-survival-diagnostics", SANDBOX_NAME],
+    {
+      artifactName: `sandbox-survival-${stage}-diagnostics`,
+      env: buildAvailabilityProbeEnv(),
+      redactionValues,
+      timeoutMs: 60_000,
+    },
+  );
+}
+
 async function expectSandboxExecAlive(
   sandboxName: string,
   exec: (
@@ -70,14 +176,30 @@ async function expectSandboxExecAlive(
   expect(alive.stdout.trim(), resultText(alive)).toBe("alive");
 }
 
+// biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
 test(
   "sandbox survives gateway restart with registry, state, SSH, and live inference intact",
+  {
+    timeout: 30 * 60_000,
+    meta: {
+      e2ePhases: [
+        "confirm Docker and inference prerequisites",
+        "install and register the OpenClaw sandbox",
+        "prove baseline sandbox access and inference",
+        "write persistent OpenClaw markers",
+        "restart the gateway and reconnect the sandbox",
+        "recheck state and inference after restart",
+        "destroy the sandbox and confirm registry removal",
+      ],
+    },
+  },
   async ({
     artifacts,
     cleanup,
     host,
     lifecycle,
     provider,
+    progress,
     runtime,
     sandbox,
     secrets,
@@ -96,7 +218,7 @@ test(
         "OpenShell version supports gateway resume and state persistence",
         "sandbox exec/SSH-equivalent access works before and after gateway restart",
         "inference.local returns a live PONG before and after gateway restart",
-        "markers under /sandbox/.openclaw survive the gateway stop/start cycle",
+        "declared workspace, session, and memory markers survive the gateway stop/start cycle",
         "final destroy removes the sandbox from NemoClaw registry/list state",
       ],
     });
@@ -160,26 +282,53 @@ test(
       force: true,
     });
 
-    cleanup.add(`destroy sandbox ${SANDBOX_NAME}`, async () => {
-      await host.bestEffortCleanupSandbox(SANDBOX_NAME, {
-        artifactName: "cleanup-nemoclaw-destroy-sandbox-survival",
-      });
-    });
-    cleanup.add("destroy shared NemoClaw gateway", async () => {
-      await host.command(
-        "sh",
-        [
-          "-lc",
-          "command -v openshell >/dev/null 2>&1 && openshell gateway destroy -g nemoclaw || true",
-        ],
-        {
-          artifactName: "cleanup-openshell-gateway-destroy",
-          env: buildAvailabilityProbeEnv(),
-          timeoutMs: 120_000,
-        },
-      );
-    });
+    const gatewayCleanupOptions = {
+      artifactName: "cleanup-openshell-gateway-destroy",
+      env: buildAvailabilityProbeEnv(),
+      redactionValues: [apiKey],
+      timeoutMs: 120_000,
+    };
+    cleanup.trackGateway(
+      {
+        cleanupGatewayRegistration: (name: string) =>
+          cleanupWhenOpenShellAvailable(
+            host,
+            {
+              artifactName: "cleanup-probe-openshell-gateway-sandbox-survival",
+              env: gatewayCleanupOptions.env,
+              redactionValues: gatewayCleanupOptions.redactionValues,
+              timeoutMs: 30_000,
+            },
+            () => host.cleanupGatewayRegistration(name, gatewayCleanupOptions),
+          ),
+      },
+      "nemoclaw",
+      gatewayCleanupOptions,
+    );
+    const sandboxCleanupOptions = {
+      artifactName: "cleanup-nemoclaw-destroy-sandbox-survival",
+      redactionValues: [apiKey],
+    };
+    cleanup.trackSandbox(
+      {
+        cleanupSandbox: (name: string) =>
+          cleanupWhenCommandAvailable(
+            host,
+            host.commandPath,
+            {
+              artifactName: "cleanup-probe-nemoclaw-sandbox-survival",
+              env: buildAvailabilityProbeEnv(),
+              redactionValues: sandboxCleanupOptions.redactionValues,
+              timeoutMs: 30_000,
+            },
+            () => host.cleanupSandbox(name, sandboxCleanupOptions),
+          ),
+      },
+      SANDBOX_NAME,
+      sandboxCleanupOptions,
+    );
 
+    progress.phase("install and register the OpenClaw sandbox");
     const install = await host.command("bash", ["install.sh", "--non-interactive"], {
       artifactName: "install-sh-sandbox-survival",
       cwd: REPO_ROOT,
@@ -222,6 +371,7 @@ test(
       artifactName: "post-install-nemoclaw-status",
     });
 
+    progress.phase("prove baseline sandbox access and inference");
     const execShell = (script: string, artifactName: string) =>
       sandbox.exec(SANDBOX_NAME, ["sh", "-lc", script], {
         artifactName,
@@ -238,32 +388,40 @@ test(
       redactionValues: [apiKey],
     });
 
+    progress.phase("write persistent OpenClaw markers");
     const markerValue = `nemoclaw-survival-${Date.now()}`;
     const markers: SandboxMarker[] = [
       {
-        path: "/sandbox/.openclaw/.survival-marker-workspace",
+        path: "/sandbox/.openclaw/workspace/.survival-workspace-marker",
         value: markerValue,
       },
-      { path: "/sandbox/.openclaw/.survival-marker", value: markerValue },
       {
-        path: "/sandbox/.openclaw/test-data/nested-marker.txt",
+        path: "/sandbox/.openclaw/agents/main/sessions/.survival-session-marker",
+        value: markerValue,
+      },
+      {
+        path: "/sandbox/.openclaw/memory/.survival-memory-marker",
         value: markerValue,
       },
     ];
     await stateValidation.writeSandboxMarkers(instance, markers);
     await stateValidation.expectSandboxMarkers(instance, markers, "pre-restart-marker-read");
 
+    progress.phase("restart the gateway and reconnect the sandbox");
+    await captureSurvivalDiagnostics(host, "before-gateway-restart", [apiKey]);
     await lifecycle.restartGatewayRuntime({
       delayMs: 5_000,
       sandboxName: SANDBOX_NAME,
     });
+    await captureSurvivalDiagnostics(host, "after-gateway-restart", [apiKey]);
     await lifecycle.waitForGatewayConnected({
       attempts: 60,
       intervalMs: 5_000,
     });
 
-    await sandbox.expectListed(SANDBOX_NAME, {
-      artifactName: "post-restart-openshell-sandbox-list",
+    progress.phase("recheck state and inference after restart");
+    await lifecycle.assertSandboxReadyAfterGatewayRestart(instance, {
+      artifactNamePrefix: "post-restart-openshell-sandbox-ready",
     });
     stateValidation.expectLocalRegistryContains(SANDBOX_NAME);
     await host.expectListed(SANDBOX_NAME, {
@@ -273,6 +431,7 @@ test(
       artifactName: "post-restart-nemoclaw-status",
       timeoutMs: 120_000,
     });
+    await stateValidation.from("cloud-openclaw-ready", instance);
     await expectSandboxExecAlive(SANDBOX_NAME, execShell, "post-restart-sandbox-exec-alive");
     await stateValidation.expectSandboxMarkers(instance, markers, "post-restart-marker-read");
     await stateValidation.expectSandboxDirectoryPopulated(
@@ -289,6 +448,7 @@ test(
       redactionValues: [apiKey],
     });
 
+    progress.phase("destroy the sandbox and confirm registry removal");
     await host.cleanupSandbox(SANDBOX_NAME, {
       artifactName: "final-destroy-sandbox-survival",
       timeoutMs: 15 * 60_000,
@@ -315,5 +475,4 @@ test(
       },
     });
   },
-  30 * 60_000,
 );

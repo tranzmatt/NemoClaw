@@ -9,13 +9,15 @@ import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
-import { describe, it } from "vitest";
+import { beforeEach, describe, it, vi } from "vitest";
 import YAML from "yaml";
 
 import {
   activeChannelsFromDockerfile,
-  encodeTestMessagingPlan,
+  encodeMessagingPlanForChannels,
+  messagingPlanLiteral,
 } from "./helpers/messaging-plan-fixtures";
+import { writeOkOpenshell } from "./helpers/onboard-openshell-fixture";
 
 type CommandEntry = {
   command: string;
@@ -42,13 +44,10 @@ const yamlModulePath = requireForTest.resolve("yaml");
 const onboardScriptMocksPath = JSON.stringify(
   path.join(repoRoot, "test", "helpers", "onboard-script-mocks.cjs"),
 );
-const inlineMessagingPlanHelper = String.raw`
-function makeMessagingPlan(channelIds, disabledChannels = []) {
-  const disabled = new Set(disabledChannels);
-  return { schemaVersion: 1, sandboxName: "my-assistant", agent: "openclaw", workflow: "onboard", channels: channelIds.map((channelId) => ({ channelId, displayName: channelId, authMode: channelId === "whatsapp" ? "in-sandbox-qr" : "token-paste", active: !disabled.has(channelId), selected: true, configured: true, disabled: disabled.has(channelId), inputs: [], hooks: [] })), disabledChannels, credentialBindings: [], networkPolicy: { presets: [], entries: [] }, agentRender: [], buildSteps: [], stateUpdates: [], healthChecks: [] };
-}
-`.trim();
-
+beforeEach(() => {
+  vi.stubEnv("NEMOCLAW_TEST_MANAGED_IMAGE_FALLBACK", "1");
+  vi.stubEnv("NEMOCLAW_SANDBOX_PREBUILD", "1");
+});
 describe("onboard messaging", () => {
   it("creates providers for messaging tokens and attaches them to the sandbox", {
     timeout: 60_000,
@@ -67,9 +66,7 @@ describe("onboard messaging", () => {
     );
 
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-      mode: 0o755,
-    });
+    writeOkOpenshell(fakeBin);
 
     const script = String.raw`
 const runner = require(${runnerPath});
@@ -80,7 +77,6 @@ const credentials = require(${credentialsPath});
 const childProcess = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
-
 const commands = [];
 runner.run = (command, opts = {}) => {
   commands.push({ command: _n(command), env: opts.env || null });
@@ -89,7 +85,7 @@ runner.run = (command, opts = {}) => {
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   if (_n(command).includes("provider get")) return "Provider: discord-bridge";
   if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
@@ -107,7 +103,6 @@ registry.setDefault = () => true;
 registry.removeSandbox = () => true;
 preflight.checkPortAvailable = async () => ({ ok: true });
 credentials.prompt = async () => "";
-
 childProcess.spawn = (...args) => {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
@@ -131,7 +126,6 @@ childProcess.spawn = (...args) => {
   });
   return child;
 };
-
 const { createSandbox, setupMessagingChannels } = require(${onboardPath});
 
 (async () => {
@@ -337,7 +331,7 @@ const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const YAML = require(${yamlPath});
 const { loadAgent } = require(${agentDefsPath});
-
+require(${JSON.stringify(path.join(repoRoot, "src", "lib", "onboard", "docker-driver-platform.ts"))}).isLinuxDockerDriverGatewayEnabled = () => false;
 const nonSlackMessagingEnvKeys = [
   "DISCORD_BOT_TOKEN",
   "DISCORD_SERVER_ID",
@@ -359,7 +353,7 @@ runner.run = (command, opts = {}) => {
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   if (_n(command).includes("forward list")) return "my-assistant 127.0.0.1 18789 12345 running\nmy-assistant 127.0.0.1 8642 12346 running";
   {
@@ -505,15 +499,10 @@ const { createSandbox } = require(${onboardPath});
     const credentialsPath = JSON.stringify(
       path.join(repoRoot, "src", "lib", "credentials", "store.ts"),
     );
-    const messagingPlanB64 = encodeTestMessagingPlan([
-      { channelId: "discord", active: true },
-      { channelId: "slack", active: true },
-    ]);
+    const messagingPlanB64 = encodeMessagingPlanForChannels(["discord", "slack"]);
 
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-      mode: 0o755,
-    });
+    writeOkOpenshell(fakeBin);
 
     const script = String.raw`
 const runner = require(${runnerPath});
@@ -525,24 +514,23 @@ const childProcess = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 
-const commands = [];
+const commands = []; let dockerfileContent;
 const registerCalls = [];
-${inlineMessagingPlanHelper}
 registry.registerSandbox({
   name: "my-assistant",
-  messaging: { schemaVersion: 1, plan: makeMessagingPlan(["discord", "slack"]) },
+  messaging: { schemaVersion: 1, plan: ${messagingPlanLiteral(["discord", "slack"])} },
 });
 runner.run = (command, opts = {}) => {
   const normalized = _n(command);
   commands.push({ command: normalized, env: opts.env || null });
-  if (normalized.includes("provider get -g nemoclaw my-assistant-discord-bridge")) return { status: 0 };
-  if (normalized.includes("provider get -g nemoclaw my-assistant-slack-bridge")) return { status: 0 };
-  if (normalized.includes("provider get -g nemoclaw my-assistant-slack-app")) return { status: 0 };
+  if (normalized.includes("provider get -g nemoclaw my-assistant-discord-bridge")) return { status: 0, stdout: "Name: my-assistant-discord-bridge\nType: generic\nCredential keys: DISCORD_BOT_TOKEN\nConfig keys: <none>\n" };
+  if (normalized.includes("provider get -g nemoclaw my-assistant-slack-bridge")) return { status: 0, stdout: "Name: my-assistant-slack-bridge\nType: generic\nCredential keys: SLACK_BOT_TOKEN\nConfig keys: <none>\n" };
+  if (normalized.includes("provider get -g nemoclaw my-assistant-slack-app")) return { status: 0, stdout: "Name: my-assistant-slack-app\nType: generic\nCredential keys: SLACK_APP_TOKEN\nConfig keys: <none>\n" };
   if (normalized.includes("provider get")) return { status: 1 };
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   {
     const mockedCapture = require(${onboardScriptMocksPath}).mockOnboardRunCapture(command);
@@ -569,15 +557,15 @@ childProcess.spawn = (...args) => {
   child.pid = 4242;
   const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
   const entry = { command, env: args[2]?.env || null };
-  const dockerfileMatch = command.match(/--from ([^ ]+Dockerfile)/);
+  const dockerfileMatch = command.match(/(?:--from|-f) ([^ ]+Dockerfile)/);
   if (dockerfileMatch) {
     try {
-      entry.dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
+      entry.dockerfileContent = dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
     } catch (error) {
       entry.dockerfileReadError = String(error);
     }
   }
-  commands.push(entry);
+  commands.push({ ...entry, dockerfileContent: entry.dockerfileContent ?? dockerfileContent });
   process.nextTick(() => {
     child.stdout.emit("data", Buffer.from("Created sandbox: my-assistant\n"));
     child.emit("close", 0);
@@ -593,7 +581,7 @@ const { createSandbox } = require(${onboardPath});
   delete process.env.SLACK_BOT_TOKEN;
   delete process.env.SLACK_APP_TOKEN;
   delete process.env.TELEGRAM_BOT_TOKEN;
-  process.env.NEMOCLAW_MESSAGING_PLAN_B64 = Buffer.from(JSON.stringify(makeMessagingPlan(["discord", "slack"]))).toString("base64");
+  process.env.NEMOCLAW_MESSAGING_PLAN_B64 = Buffer.from(JSON.stringify(${messagingPlanLiteral(["discord", "slack"])})).toString("base64");
   const sandboxName = await createSandbox(
     null, "gpt-5.4", "nvidia-prod", null, "my-assistant", null, ["discord", "slack"],
   );
@@ -641,7 +629,6 @@ const { createSandbox } = require(${onboardPath});
     assert.match(createCommand.command, /--provider my-assistant-discord-bridge/);
     assert.match(createCommand.command, /--provider my-assistant-slack-bridge/);
     assert.match(createCommand.command, /--provider my-assistant-slack-app/);
-
     assert.deepEqual(activeChannelsFromDockerfile(createCommand.dockerfileContent), [
       "discord",
       "slack",
@@ -672,12 +659,10 @@ const { createSandbox } = require(${onboardPath});
     const credentialsPath = JSON.stringify(
       path.join(repoRoot, "src", "lib", "credentials", "store.ts"),
     );
-    const messagingPlanB64 = encodeTestMessagingPlan([{ channelId: "telegram", active: false }]);
+    const messagingPlanB64 = encodeMessagingPlanForChannels(["telegram"], ["telegram"]);
 
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-      mode: 0o755,
-    });
+    writeOkOpenshell(fakeBin);
 
     const script = String.raw`
 const runner = require(${runnerPath});
@@ -689,22 +674,21 @@ const childProcess = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 
-const commands = [];
+const commands = []; let dockerfileContent;
 const registerCalls = [];
-${inlineMessagingPlanHelper}
 registry.registerSandbox({
   name: "my-assistant",
-  messaging: { schemaVersion: 1, plan: makeMessagingPlan(["telegram"], ["telegram"]) },
+  messaging: { schemaVersion: 1, plan: ${messagingPlanLiteral(["telegram"], ["telegram"])} },
 });
 runner.run = (command, opts = {}) => {
   const normalized = _n(command);
   commands.push({ command: normalized, env: opts.env || null });
-  if (normalized.includes("provider get -g nemoclaw my-assistant-telegram-bridge")) return { status: 0 };
+  if (normalized.includes("provider get -g nemoclaw my-assistant-telegram-bridge")) return { status: 0, stdout: "Name: my-assistant-telegram-bridge\nType: generic\nCredential keys: TELEGRAM_BOT_TOKEN\nConfig keys: <none>\n" };
   if (normalized.includes("provider get")) return { status: 1 };
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   {
     const mockedCapture = require(${onboardScriptMocksPath}).mockOnboardRunCapture(command);
@@ -731,15 +715,15 @@ childProcess.spawn = (...args) => {
   child.pid = 4242;
   const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
   const entry = { command, env: args[2]?.env || null };
-  const dockerfileMatch = command.match(/--from ([^ ]+Dockerfile)/);
+  const dockerfileMatch = command.match(/(?:--from|-f) ([^ ]+Dockerfile)/);
   if (dockerfileMatch) {
     try {
-      entry.dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
+      entry.dockerfileContent = dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
     } catch (error) {
       entry.dockerfileReadError = String(error);
     }
   }
-  commands.push(entry);
+  commands.push({ ...entry, dockerfileContent: entry.dockerfileContent ?? dockerfileContent });
   process.nextTick(() => {
     child.stdout.emit("data", Buffer.from("Created sandbox: my-assistant\n"));
     child.emit("close", 0);
@@ -752,7 +736,7 @@ const { createSandbox } = require(${onboardPath});
 (async () => {
   process.env.OPENSHELL_GATEWAY = "nemoclaw";
   delete process.env.TELEGRAM_BOT_TOKEN;
-  process.env.NEMOCLAW_MESSAGING_PLAN_B64 = Buffer.from(JSON.stringify(makeMessagingPlan(["telegram"], ["telegram"]))).toString("base64");
+  process.env.NEMOCLAW_MESSAGING_PLAN_B64 = Buffer.from(JSON.stringify(${messagingPlanLiteral(["telegram"], ["telegram"])})).toString("base64");
   const sandboxName = await createSandbox(
     null, "gpt-5.4", "nvidia-prod", null, "my-assistant", null, ["telegram"],
   );
@@ -828,12 +812,10 @@ const { createSandbox } = require(${onboardPath});
       const credentialsPath = JSON.stringify(
         path.join(repoRoot, "src", "lib", "credentials", "store.ts"),
       );
-      const messagingPlanB64 = encodeTestMessagingPlan([{ channelId: "whatsapp", active: true }]);
+      const messagingPlanB64 = encodeMessagingPlanForChannels(["whatsapp"]);
 
       fs.mkdirSync(fakeBin, { recursive: true });
-      fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-        mode: 0o755,
-      });
+      writeOkOpenshell(fakeBin);
 
       const script = String.raw`
 const runner = require(${runnerPath});
@@ -845,9 +827,8 @@ const childProcess = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 
-const commands = [];
+const commands = []; let dockerfileContent;
 const registerCalls = [];
-${inlineMessagingPlanHelper}
 runner.run = (command, opts = {}) => {
   const normalized = _n(command);
   commands.push({ command: normalized, env: opts.env || null });
@@ -855,7 +836,7 @@ runner.run = (command, opts = {}) => {
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   {
     const mockedCapture = require(${onboardScriptMocksPath}).mockOnboardRunCapture(command);
@@ -882,15 +863,15 @@ childProcess.spawn = (...args) => {
   child.pid = 4242;
   const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
   const entry = { command, env: args[2]?.env || null };
-  const dockerfileMatch = command.match(/--from ([^ ]+Dockerfile)/);
+  const dockerfileMatch = command.match(/(?:--from|-f) ([^ ]+Dockerfile)/);
   if (dockerfileMatch) {
     try {
-      entry.dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
+      entry.dockerfileContent = dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
     } catch (error) {
       entry.dockerfileReadError = String(error);
     }
   }
-  commands.push(entry);
+  commands.push({ ...entry, dockerfileContent: entry.dockerfileContent ?? dockerfileContent });
   process.nextTick(() => {
     child.stdout.emit("data", Buffer.from("Created sandbox: my-assistant\n"));
     child.emit("close", 0);
@@ -907,7 +888,7 @@ const { createSandbox } = require(${onboardPath});
       delete process.env[key];
     }
   }
-  process.env.NEMOCLAW_MESSAGING_PLAN_B64 = Buffer.from(JSON.stringify(makeMessagingPlan(["whatsapp"]))).toString("base64");
+  process.env.NEMOCLAW_MESSAGING_PLAN_B64 = Buffer.from(JSON.stringify(${messagingPlanLiteral(["whatsapp"])})).toString("base64");
   const sandboxName = await createSandbox(
     null, "gpt-5.4", "nvidia-prod", null, "my-assistant", null, ["whatsapp"],
   );
@@ -981,12 +962,10 @@ const { createSandbox } = require(${onboardPath});
       const credentialsPath = JSON.stringify(
         path.join(repoRoot, "src", "lib", "credentials", "store.ts"),
       );
-      const messagingPlanB64 = encodeTestMessagingPlan([{ channelId: "whatsapp", active: false }]);
+      const messagingPlanB64 = encodeMessagingPlanForChannels(["whatsapp"], ["whatsapp"]);
 
       fs.mkdirSync(fakeBin, { recursive: true });
-      fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-        mode: 0o755,
-      });
+      writeOkOpenshell(fakeBin);
 
       const script = String.raw`
 const runner = require(${runnerPath});
@@ -998,13 +977,12 @@ const childProcess = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 
-${inlineMessagingPlanHelper}
 registry.registerSandbox({
   name: "my-assistant",
-  messaging: { schemaVersion: 1, plan: makeMessagingPlan(["whatsapp"], ["whatsapp"]) },
+  messaging: { schemaVersion: 1, plan: ${messagingPlanLiteral(["whatsapp"], ["whatsapp"])} },
 });
 
-const commands = [];
+const commands = []; let dockerfileContent;
 const registerCalls = [];
 runner.run = (command, opts = {}) => {
   const normalized = _n(command);
@@ -1013,7 +991,7 @@ runner.run = (command, opts = {}) => {
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   {
     const mockedCapture = require(${onboardScriptMocksPath}).mockOnboardRunCapture(command);
@@ -1040,15 +1018,15 @@ childProcess.spawn = (...args) => {
   child.pid = 4242;
   const command = _n([args[0], ...(Array.isArray(args[1]) ? args[1] : [])]);
   const entry = { command, env: args[2]?.env || null };
-  const dockerfileMatch = command.match(/--from ([^ ]+Dockerfile)/);
+  const dockerfileMatch = command.match(/(?:--from|-f) ([^ ]+Dockerfile)/);
   if (dockerfileMatch) {
     try {
-      entry.dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
+      entry.dockerfileContent = dockerfileContent = fs.readFileSync(dockerfileMatch[1], "utf-8");
     } catch (error) {
       entry.dockerfileReadError = String(error);
     }
   }
-  commands.push(entry);
+  commands.push({ ...entry, dockerfileContent: entry.dockerfileContent ?? dockerfileContent });
   process.nextTick(() => {
     child.stdout.emit("data", Buffer.from("Created sandbox: my-assistant\n"));
     child.emit("close", 0);
@@ -1065,7 +1043,7 @@ const { createSandbox } = require(${onboardPath});
       delete process.env[key];
     }
   }
-  process.env.NEMOCLAW_MESSAGING_PLAN_B64 = Buffer.from(JSON.stringify(makeMessagingPlan(["whatsapp"], ["whatsapp"]))).toString("base64");
+  process.env.NEMOCLAW_MESSAGING_PLAN_B64 = Buffer.from(JSON.stringify(${messagingPlanLiteral(["whatsapp"], ["whatsapp"])})).toString("base64");
   const sandboxName = await createSandbox(
     null, "gpt-5.4", "nvidia-prod", null, "my-assistant", null, ["whatsapp"],
   );
@@ -1226,7 +1204,7 @@ runner.run = (command, opts = {}) => {
 };
 runner.runCapture = (command) => {
   // Existing sandbox that is ready
-  if (_n(command).includes("sandbox get my-assistant")) return "my-assistant";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "my-assistant";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   // All messaging providers already exist in gateway
   if (_n(command).includes("provider get")) return "Provider: exists";
@@ -1309,9 +1287,7 @@ const { createSandbox } = require(${onboardPath});
     );
 
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-      mode: 0o755,
-    });
+    writeOkOpenshell(fakeBin);
 
     const script = String.raw`
 const runner = require(${runnerPath});
@@ -1330,7 +1306,7 @@ runner.run = (command, opts = {}) => {
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   {
     const mockedCapture = require(${onboardScriptMocksPath}).mockOnboardRunCapture(command);
@@ -1442,9 +1418,7 @@ const { createSandbox } = require(${onboardPath});
     );
 
     fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-      mode: 0o755,
-    });
+    writeOkOpenshell(fakeBin);
 
     const script = String.raw`
 const runner = require(${runnerPath});
@@ -1461,7 +1435,7 @@ runner.run = (command, opts = {}) => {
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   {
     const mockedCapture = require(${onboardScriptMocksPath}).mockOnboardRunCapture(command);

@@ -13,18 +13,167 @@ import {
 } from "./helpers/langchain-deepagents-code-headless.ts";
 
 describe("LangChain Deep Agents Code headless runtime contracts", () => {
-  it("requires exit zero and PONG from Deep Agents Code headless inference (#6191)", () => {
+  it("binds bare connect to every observed OpenShell sandbox exec target (#7034)", () => {
+    const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dcode-connect-target-"));
+    const cliFixture = path.join(fixtureDir, "nemoclaw");
+    const openshellFixture = path.join(fixtureDir, "openshell");
+    const cliCallLog = path.join(fixtureDir, "cli-calls.log");
+    const openshellCallLog = path.join(fixtureDir, "openshell-calls.log");
+
+    try {
+      fs.writeFileSync(
+        cliFixture,
+        [
+          "#!/bin/bash",
+          "set -euo pipefail",
+          '[ "${SANDBOX_NAME+x}" != x ]',
+          '[ "${NEMOCLAW_SANDBOX_NAME+x}" != x ]',
+          '[ "${NEMOCLAW_SANDBOX+x}" != x ]',
+          'printf "%s\\n" "$*" >>"$TEST_CLI_CALL_LOG"',
+          '[ "$#" -eq 2 ] && [ "$1" = connect ] && [ "$2" = --probe-only ]',
+          "for target in $TEST_CONNECT_TARGETS; do",
+          '  "$NEMOCLAW_OPENSHELL_BIN" sandbox exec -n "$target" -- true',
+          "done",
+          'printf "%s\\n" NEMOCLAW_DCODE_CONNECT_OK',
+          'exit "$TEST_CONNECT_EXIT"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      fs.writeFileSync(
+        openshellFixture,
+        [
+          "#!/bin/bash",
+          "set -euo pipefail",
+          'printf "%s\\n" "$*" >>"$TEST_OPENSHELL_CALL_LOG"',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      fs.chmodSync(cliFixture, 0o755);
+      fs.chmodSync(openshellFixture, 0o755);
+
+      const runCommandProbe = (targets: string, connectExit = 0) => {
+        fs.writeFileSync(cliCallLog, "", "utf8");
+        fs.writeFileSync(openshellCallLog, "", "utf8");
+        const output = runHeadlessCheckSnippet(
+          [
+            'if output="$(nemoclaw_connect_probe 2>&1)"; then',
+            '  printf "pass:%s" "$output"',
+            "else",
+            "  status=$?",
+            '  printf "fail:%s:%s" "$status" "$output"',
+            "fi",
+          ].join("\n"),
+          {
+            NEMOCLAW_CLI_BIN: cliFixture,
+            NEMOCLAW_SANDBOX: "legacy-environment-shortcut",
+            NEMOCLAW_SANDBOX_NAME: "environment-shortcut",
+            PATH: `${fixtureDir}:/usr/bin:/bin`,
+            SANDBOX_NAME: "dcode-managed",
+            TEST_CLI_CALL_LOG: cliCallLog,
+            TEST_CONNECT_EXIT: String(connectExit),
+            TEST_CONNECT_TARGETS: targets,
+            TEST_OPENSHELL_CALL_LOG: openshellCallLog,
+            TMPDIR: fixtureDir,
+          },
+        );
+        const readCalls = (file: string) => {
+          const text = fs.readFileSync(file, "utf8").trim();
+          return text ? text.split("\n") : [];
+        };
+        expect(
+          fs.readdirSync(fixtureDir).filter((entry) => entry.startsWith("nemoclaw-dcode-connect.")),
+        ).toEqual([]);
+        return {
+          cliCalls: readCalls(cliCallLog),
+          openshellCalls: readCalls(openshellCallLog),
+          output,
+        };
+      };
+
+      const matchingTarget = runCommandProbe("dcode-managed");
+      expect(matchingTarget).toEqual({
+        cliCalls: ["connect --probe-only"],
+        openshellCalls: ["sandbox exec -n dcode-managed -- true"],
+        output: "pass:NEMOCLAW_DCODE_CONNECT_OK",
+      });
+      const repeatedMatchingTarget = runCommandProbe("dcode-managed dcode-managed");
+      expect(repeatedMatchingTarget).toEqual({
+        cliCalls: ["connect --probe-only"],
+        openshellCalls: [
+          "sandbox exec -n dcode-managed -- true",
+          "sandbox exec -n dcode-managed -- true",
+        ],
+        output: "pass:NEMOCLAW_DCODE_CONNECT_OK",
+      });
+      const wrongTarget = runCommandProbe("another-sandbox");
+      expect(wrongTarget).toEqual({
+        cliCalls: ["connect --probe-only"],
+        openshellCalls: ["sandbox exec -n another-sandbox -- true"],
+        output: "fail:1:NEMOCLAW_DCODE_CONNECT_OK\nNEMOCLAW_DCODE_CONNECT_TARGET_FAIL:mismatch",
+      });
+      const missingTarget = runCommandProbe("");
+      expect(missingTarget).toEqual({
+        cliCalls: ["connect --probe-only"],
+        openshellCalls: [],
+        output: "fail:1:NEMOCLAW_DCODE_CONNECT_OK\nNEMOCLAW_DCODE_CONNECT_TARGET_FAIL:missing",
+      });
+      const mixedTargets = runCommandProbe("dcode-managed another-sandbox");
+      expect(mixedTargets).toEqual({
+        cliCalls: ["connect --probe-only"],
+        openshellCalls: [
+          "sandbox exec -n dcode-managed -- true",
+          "sandbox exec -n another-sandbox -- true",
+        ],
+        output: "fail:1:NEMOCLAW_DCODE_CONNECT_OK\nNEMOCLAW_DCODE_CONNECT_TARGET_FAIL:mismatch",
+      });
+      const failedConnect = runCommandProbe("dcode-managed", 72);
+      expect(failedConnect).toEqual({
+        cliCalls: ["connect --probe-only"],
+        openshellCalls: ["sandbox exec -n dcode-managed -- true"],
+        output: "fail:72:NEMOCLAW_DCODE_CONNECT_OK",
+      });
+      const failedConnectToWrongTarget = runCommandProbe("another-sandbox", 72);
+      expect(failedConnectToWrongTarget).toEqual({
+        cliCalls: ["connect --probe-only"],
+        openshellCalls: ["sandbox exec -n another-sandbox -- true"],
+        output: "fail:1:NEMOCLAW_DCODE_CONNECT_OK\nNEMOCLAW_DCODE_CONNECT_TARGET_FAIL:mismatch",
+      });
+    } finally {
+      fs.rmSync(fixtureDir, { force: true, recursive: true });
+    }
+  });
+
+  it("requires an exit-zero JSON success envelope containing PONG (#6191, #7773)", () => {
     const classify = (exitCode: string, output: string) =>
       runHeadlessCheckHelper("classify-output", {
         DCODE_EXIT: exitCode,
         HEADLESS_OUTPUT: output,
       });
+    const envelope = (response = "PONG") =>
+      JSON.stringify({
+        schema_version: 1,
+        command: "non-interactive",
+        data: {
+          status: "success",
+          exit_code: 0,
+          response,
+          completion: {
+            thread_id: "thread-1",
+            duration_ms: 12,
+            response_bytes: Buffer.byteLength(response),
+          },
+        },
+      });
 
-    expect(classify("0", "startup log\n  PONG  \nDCODE_EXIT:0")).toBe("pass:pong");
+    expect(classify("0", `startup log\n${envelope()}\nDCODE_EXIT:0`)).toBe(
+      "fail:invalid-json-envelope",
+    );
     expect(
       classify("1", "OpenAI provider returned HTTP 401 for inference.local\nDCODE_EXIT:1"),
     ).toBe("fail:actionable-inference-error");
-    expect(classify("1", "PONG\nDCODE_EXIT:1")).toBe("fail:nonzero-exit");
+    expect(classify("1", `${envelope()}\nDCODE_EXIT:1`)).toBe("fail:nonzero-exit");
     expect(classify("1", "openai.APIConnectionError\nDCODE_EXIT:1")).toBe(
       "fail:inference-connection-failure",
     );
@@ -48,20 +197,22 @@ describe("LangChain Deep Agents Code headless runtime contracts", () => {
     expect(classify("1", "No module named deepagents_code\nDCODE_EXIT:1")).toBe(
       "fail:wrapper-missing",
     );
-    // The word 'dcode' appearing in a non-error context (e.g. a version
-    // banner) must not be misclassified as a wrapper-missing failure. The
-    // is_dcode_wrapper_failure regex requires a specific error indicator
-    // ("command not found", "No such file or directory", "Permission denied",
-    // or "No module named deepagents_code") after the dcode path segment.
-    // See PR #6206 / advisor PRA-2.
-    expect(classify("0", "  PONG  \nDCODE_EXIT:0")).toBe("pass:pong");
-    expect(classify("0", "dcode version 0.1.12\nPONG\nDCODE_EXIT:0")).toBe("pass:pong");
-    expect(classify("0", "something happened\nDCODE_EXIT:0")).toBe("fail:ambiguous-output");
-    expect(classify("0", "Reply with exactly one word: PONG\nDCODE_EXIT:0")).toBe(
-      "fail:ambiguous-output",
+    expect(classify("0", `${envelope()}\nDCODE_EXIT:0`)).toBe("pass:json-pong");
+    expect(classify("0", `dcode version 0.1.12\n${envelope()}\nDCODE_EXIT:0`)).toBe(
+      "fail:invalid-json-envelope",
     );
-    expect(classify("0", "PONG because the route works\nDCODE_EXIT:0")).toBe(
-      "fail:ambiguous-output",
+    expect(classify("0", `${envelope()}\ntrailing banner\nDCODE_EXIT:0`)).toBe(
+      "fail:invalid-json-envelope",
+    );
+    expect(classify("0", "something happened\nDCODE_EXIT:0")).toBe("fail:invalid-json-envelope");
+    expect(classify("0", "Reply with exactly one word: PONG\nDCODE_EXIT:0")).toBe(
+      "fail:invalid-json-envelope",
+    );
+    expect(classify("0", `${envelope("PONG because the route works")}\nDCODE_EXIT:0`)).toBe(
+      "fail:invalid-json-envelope",
+    );
+    expect(classify("0", `${envelope()}\n${envelope()}\nDCODE_EXIT:0`)).toBe(
+      "fail:invalid-json-envelope",
     );
     expect(classify("1", "something happened\nDCODE_EXIT:1")).toBe("fail:nonzero-exit");
   });

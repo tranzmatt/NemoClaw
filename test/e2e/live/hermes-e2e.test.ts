@@ -5,17 +5,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-
+import { HERMES_E2E_TEST_TIMEOUT_MS } from "../../../tools/e2e/hermes-timeout-contract.mts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import { resultText, shellQuote } from "../fixtures/clients/command.ts";
-import { trustedProviderEndpoint } from "../fixtures/clients/provider.ts";
 import { trustedSandboxShellScript, validateSandboxName } from "../fixtures/clients/sandbox.ts";
 import { expect, test } from "../fixtures/e2e-test.ts";
-import { exportHermesSession, hermesLastActive } from "../fixtures/hermes-session.ts";
-import {
-  DEFAULT_HOSTED_INFERENCE_MODEL,
-  requireHostedInferenceConfig,
-} from "../fixtures/hosted-inference.ts";
 import { REPO_ROOT } from "../fixtures/paths.ts";
 import {
   assertSecurityPosture,
@@ -23,6 +17,10 @@ import {
   securityPostureModeEnv,
 } from "../fixtures/security-posture.ts";
 import type { ShellProbeResult } from "../fixtures/shell-probe.ts";
+import { assertHermesCliAdapterLiveContract, stripAnsi } from "./hermes-cli-adapter-live.ts";
+import { HERMES_E2E_PHASES } from "./hermes-e2e-phases.ts";
+import { runLaunchAgentTurn } from "./launch-agent-turn.ts";
+import { expectPackageDatabaseReadOnly } from "./package-database-read-only.ts";
 
 const SANDBOX_NAME = process.env.NEMOCLAW_SANDBOX_NAME ?? "e2e-hermes";
 validateSandboxName(SANDBOX_NAME);
@@ -33,8 +31,6 @@ const HERMES_DASHBOARD_INTERNAL_PORT =
   process.env.NEMOCLAW_HERMES_DASHBOARD_INTERNAL_PORT ?? "19119";
 const SESSION_FILE = path.join(os.homedir(), ".nemoclaw", "onboard-session.json");
 const REGISTRY_FILE = path.join(os.homedir(), ".nemoclaw", "sandboxes.json");
-const LIVE_TIMEOUT_MS = 70 * 60_000;
-const CHAT_MODEL = process.env.NEMOCLAW_MODEL ?? DEFAULT_HOSTED_INFERENCE_MODEL;
 const ONBOARD_VALIDATION_TIMEOUT_SECONDS =
   process.env.NEMOCLAW_ONBOARD_VALIDATION_TIMEOUT_SECONDS ?? "60";
 
@@ -62,15 +58,14 @@ function hermesDashboardE2eEnabled(): boolean {
   );
 }
 
-function commandEnv(hostedEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+function commandEnv(inferenceEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     ...buildAvailabilityProbeEnv(),
-    ...hostedEnv,
+    ...inferenceEnv,
     NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE: "1",
     NEMOCLAW_AGENT: "hermes",
     NEMOCLAW_NON_INTERACTIVE: "1",
     NEMOCLAW_RECREATE_SANDBOX: "1",
-    NEMOCLAW_MODEL: hostedEnv.NEMOCLAW_MODEL ?? CHAT_MODEL,
     NEMOCLAW_ONBOARD_VALIDATION_TIMEOUT_SECONDS: ONBOARD_VALIDATION_TIMEOUT_SECONDS,
     NEMOCLAW_SANDBOX_NAME: SANDBOX_NAME,
     ...securityPostureModeEnv(),
@@ -169,20 +164,6 @@ function httpStatusOk(status: string): boolean {
   return /^[23][0-9][0-9]$/.test(status.trim());
 }
 
-function stripAnsi(value: string): string {
-  return value.replace(/\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\)|[@-_])/g, "");
-}
-
-function hermesSessionIds(output: string): Set<string> {
-  return new Set(output.match(/\b[0-9]{8}_[0-9]{6}_[a-zA-Z0-9]+\b/g) ?? []);
-}
-
-function onlyNewHermesSessionId(before: Set<string>, after: Set<string>): string {
-  const created = [...after].filter((id) => !before.has(id));
-  expect(created).toHaveLength(1);
-  return created[0];
-}
-
 function forwardListHasRunningPort(output: string, sandboxName: string, port: string): boolean {
   return output
     .split("\n")
@@ -208,12 +189,28 @@ function parseGatewayProcess(output: string): { owner: string; pid: string; ppid
   return { owner, pid, ppid };
 }
 
-async function bestEffort(run: () => Promise<unknown>): Promise<void> {
+async function preCleanBestEffort(run: () => Promise<unknown>): Promise<void> {
   try {
     await run();
   } catch {
-    // Cleanup is best-effort because the pre-install path may not have
+    // Pre-cleanup is best-effort because the pre-install path may not have
     // nemoclaw/openshell available yet.
+  }
+}
+
+async function captureDiagnosticsBestEffort(run: () => Promise<unknown>): Promise<void> {
+  try {
+    await run();
+  } catch {
+    // Failure diagnostics must not mask the install failure.
+  }
+}
+
+async function postDestroyGatewayBestEffort(run: () => Promise<unknown>): Promise<void> {
+  try {
+    await run();
+  } catch {
+    // The explicit sandbox-destroy assertion remains the primary phase-9 contract.
   }
 }
 
@@ -237,39 +234,39 @@ async function retryHostedInference<T>(
   );
 }
 
+// source-shape-contract: security -- Live execution proves the shipped Hermes manifest remains healthy and credential-safe
 test("hermes-e2e: install.sh onboards Hermes and proves health plus live inference", {
-  timeout: LIVE_TIMEOUT_MS,
-}, async ({ artifacts, cleanup, host, provider, sandbox, secrets }) => {
-  const hosted = requireHostedInferenceConfig(secrets);
-  const apiKey = hosted.apiKey;
-
+  timeout: HERMES_E2E_TEST_TIMEOUT_MS,
+  meta: { e2ePhases: HERMES_E2E_PHASES },
+}, async ({ artifacts, cleanup, host, inference, progress, sandbox }) => {
   await artifacts.target.declare({
     id: "hermes-e2e",
-    boundary: "install.sh --non-interactive --fresh + Hermes sandbox runtime",
+    boundary: `install.sh --non-interactive --fresh + Hermes sandbox runtime + ${inference.mode} inference adapter`,
     sandboxName: SANDBOX_NAME,
     dashboardEnabled: hermesDashboardE2eEnabled(),
+    inferenceMode: inference.mode,
     securityPostureEnabled: securityPostureEnabled(),
   });
 
-  const env = commandEnv(hosted.env);
-  const redactionValues = [apiKey];
+  const env = commandEnv(inference.env());
+  const redactionValues = inference.redactionValues();
 
   const cleanupHermes = async (label: string) => {
-    await bestEffort(() =>
+    await preCleanBestEffort(() =>
       host.command("nemoclaw", [SANDBOX_NAME, "destroy", "--yes"], {
         artifactName: `${label}-nemoclaw-destroy`,
         env: commandEnv(),
         timeoutMs: 120_000,
       }),
     );
-    await bestEffort(() =>
+    await preCleanBestEffort(() =>
       sandbox.openshell(["sandbox", "delete", SANDBOX_NAME], {
         artifactName: `${label}-openshell-sandbox-delete`,
         env: commandEnv(),
         timeoutMs: 60_000,
       }),
     );
-    await bestEffort(() =>
+    await preCleanBestEffort(() =>
       sandbox.openshell(["gateway", "destroy", "-g", "nemoclaw"], {
         artifactName: `${label}-openshell-gateway-destroy`,
         env: commandEnv(),
@@ -278,8 +275,23 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
     );
   };
 
-  cleanup.add(`destroy Hermes sandbox ${SANDBOX_NAME}`, async () => {
-    await cleanupHermes("cleanup");
+  const cleanupEnv = commandEnv();
+  cleanup.trackGateway(host, "nemoclaw", {
+    artifactName: "cleanup-openshell-gateway-destroy",
+    env: cleanupEnv,
+    timeoutMs: 60_000,
+  });
+  cleanup.trackDisposable(`delete OpenShell sandbox ${SANDBOX_NAME}`, () =>
+    sandbox.cleanupSandbox(SANDBOX_NAME, {
+      artifactName: "cleanup-openshell-sandbox-delete",
+      env: cleanupEnv,
+      timeoutMs: 60_000,
+    }),
+  );
+  cleanup.trackSandbox(host, SANDBOX_NAME, {
+    artifactName: "cleanup-nemoclaw-destroy",
+    env: cleanupEnv,
+    timeoutMs: 120_000,
   });
 
   // Phase 0: pre-cleanup, after the secret gate so local skipped runs do not
@@ -296,20 +308,11 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
 
   expect(fs.existsSync(path.join(REPO_ROOT, "agents", "hermes", "manifest.yaml"))).toBe(true);
 
-  const providerReachability = await provider.probeReachability(
-    trustedProviderEndpoint(hosted.endpointUrl, { allowedHosts: ["inference-api.nvidia.com"] }),
-    {
-      artifactName: "phase-1-inference-reachability",
-      env: buildAvailabilityProbeEnv(),
-      redactionValues,
-      timeoutMs: 30_000,
-    },
-  );
-  const reachabilityStatus = providerReachability.stdout.trim();
-  expect(providerReachability.exitCode, resultText(providerReachability)).toBe(0);
-  expect(["000", "401", "403"], resultText(providerReachability)).not.toContain(reachabilityStatus);
-  expect(Number(reachabilityStatus), resultText(providerReachability)).toBeLessThan(500);
+  await expect(inference.probeModels("phase-1-inference-models")).resolves.toMatchObject({
+    data: expect.arrayContaining([expect.objectContaining({ id: inference.model })]),
+  });
 
+  progress.phase("install and onboard Hermes sandbox");
   // Phase 2: real installer + non-interactive Hermes onboard.
   const install = await host.command("bash", ["install.sh", "--non-interactive", "--fresh"], {
     artifactName: "phase-2-install-hermes",
@@ -320,7 +323,7 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
   });
   await (install.exitCode === 0
     ? Promise.resolve()
-    : bestEffort(() =>
+    : captureDiagnosticsBestEffort(() =>
         sandbox.execShell(
           SANDBOX_NAME,
           trustedSandboxShellScript(
@@ -367,12 +370,13 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
 
   if (hermesDashboardE2eEnabled()) {
     expect(resultText(install)).toContain(
-      "Deployment verified — gateway and dashboard are healthy.",
+      "Deployment verified — gateway, dashboard, and inference route are healthy.",
     );
     expect(resultText(install)).toContain("Hermes Agent Dashboard");
     expect(resultText(install)).toContain(`http://127.0.0.1:${HERMES_DASHBOARD_PORT}/`);
   }
 
+  progress.phase("validate sandbox layout and health");
   // Phase 3: sandbox verification.
   const list = await host.command("nemoclaw", ["list"], {
     artifactName: "phase-3-nemoclaw-list",
@@ -392,13 +396,21 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
   expect(fs.existsSync(SESSION_FILE), `${SESSION_FILE} missing`).toBe(true);
   expect(readJsonFile(SESSION_FILE)).toMatchObject({ agent: "hermes" });
 
-  const inference = await sandbox.openshell(["inference", "get"], {
-    artifactName: "phase-3-openshell-inference-get",
+  const inferenceGet = await host.command("nemoclaw", ["inference", "get", "--json"], {
+    artifactName: "phase-3-nemoclaw-inference-get",
     env: commandEnv(),
     timeoutMs: 30_000,
   });
-  expect(inference.exitCode, resultText(inference)).toBe(0);
-  expect(resultText(inference)).toContain(hosted.providerName);
+  expect(inferenceGet.exitCode, resultText(inferenceGet)).toBe(0);
+  const inferenceState = JSON.parse(inferenceGet.stdout) as {
+    provider: string | null;
+    model: string | null;
+  };
+  expect(
+    inferenceState.provider,
+    `expected route provider ${inference.expectedRouteProvider}`,
+  ).toBe(inference.expectedRouteProvider);
+  expect(inferenceState.model, `expected model ${inference.model}`).toBe(inference.model);
 
   const policy = await sandbox.openshell(["policy", "get", "--full", SANDBOX_NAME], {
     artifactName: "phase-3-openshell-policy-get",
@@ -407,6 +419,29 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
   });
   expect(policy.exitCode, resultText(policy)).toBe(0);
   expect(resultText(policy)).toMatch(/network_policies/i);
+
+  await expectPackageDatabaseReadOnly({
+    artifactPrefix: "phase-3",
+    env: commandEnv(),
+    host,
+    sandbox,
+    sandboxName: SANDBOX_NAME,
+    timeoutMs: 30_000,
+  });
+
+  const deniedEgress = await sandbox.exec(
+    SANDBOX_NAME,
+    ["curl", "-fsS", "--connect-timeout", "5", "--max-time", "15", "https://example.com/"],
+    {
+      artifactName: "phase-3-unintended-egress-denied",
+      env: commandEnv(),
+      timeoutMs: 30_000,
+    },
+  );
+  expect(deniedEgress.exitCode, resultText(deniedEgress)).not.toBe(0);
+  expect(resultText(deniedEgress)).toMatch(
+    /CONNECT tunnel failed, response 403|The requested URL returned error: 403|policy[_ ]denied|not allowed by any policy/i,
+  );
 
   // Phase 4: Hermes health and sandbox state.
   let health: ShellProbeResult | undefined;
@@ -431,6 +466,26 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
   expect(hermesVersion.exitCode, resultText(hermesVersion)).toBe(0);
   expect(resultText(hermesVersion)).not.toMatch(/MISSING|not found|No such file/i);
 
+  const dependencyVersions = await sandbox.exec(
+    SANDBOX_NAME,
+    [
+      "/opt/hermes/.venv/bin/python",
+      "-I",
+      "-c",
+      "from importlib.metadata import version; expected = {'aiohttp': '3.14.3', 'cryptography': '50.0.0'}; actual = {name: version(name) for name in expected}; assert actual == expected, actual; print('\\n'.join(f'{name}=={actual[name]}' for name in sorted(actual)))",
+    ],
+    {
+      artifactName: "phase-4-hermes-dependency-versions",
+      env: commandEnv(),
+      timeoutMs: 30_000,
+    },
+  );
+  expect(dependencyVersions.exitCode, resultText(dependencyVersions)).toBe(0);
+  expect(dependencyVersions.stdout.trim().split(/\r?\n/u)).toEqual([
+    "aiohttp==3.14.3",
+    "cryptography==50.0.0",
+  ]);
+
   const configProbe = await sandbox.execShell(
     SANDBOX_NAME,
     trustedSandboxShellScript(
@@ -445,88 +500,13 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
   expect(configProbe.exitCode, resultText(configProbe)).toBe(0);
   expect(configProbe.stdout).toContain("OK");
 
-  const runHermesCli = async (args: string[], artifactName: string, timeoutMs = 6 * 60_000) => {
-    const result = await sandbox.exec(SANDBOX_NAME, ["hermes", ...args], {
-      artifactName,
-      env: commandEnv(),
-      redactionValues,
-      timeoutMs,
-    });
-    expect(result.exitCode, resultText(result)).toBe(0);
-    return resultText(result);
-  };
-  const listHermesSessionsText = (artifactName: string) =>
-    runHermesCli(["sessions", "list"], artifactName, 60_000);
-  const listHermesSessions = async (artifactName: string) =>
-    hermesSessionIds(await listHermesSessionsText(artifactName));
-  const sessionLastActive = (id: string, artifactName: string) =>
-    hermesLastActive(sandbox, SANDBOX_NAME, id, artifactName);
-  const expectNoNewHermesSessions = async (
-    before: Set<string>,
-    beforeActivityArtifact: string,
-    expectedSessionId: string,
-    expectedRowToken: string,
-    args: string[],
-    runArtifact: string,
-    afterArtifact: string,
-  ) => {
-    const beforeActivity = await sessionLastActive(expectedSessionId, beforeActivityArtifact);
-    await runHermesCli(args, runArtifact);
-    const afterText = await listHermesSessionsText(afterArtifact);
-    const after = hermesSessionIds(afterText);
-    expect([...after].filter((id) => !before.has(id))).toEqual([]);
-    expect(after.has(expectedSessionId), stripAnsi(afterText)).toBe(true);
-    const row = stripAnsi(afterText)
-      .split("\n")
-      .find((line) => line.includes(expectedSessionId));
-    expect(row, stripAnsi(afterText)).toContain(expectedRowToken);
-    expect(await sessionLastActive(expectedSessionId, `${afterArtifact}-metadata`)).toBeGreaterThan(
-      beforeActivity,
-    );
-  };
-
-  const issue5254Marker = `NEMOCLAW_5254_${Date.now()}`;
-  const beforeSeedSessions = await listHermesSessions("phase-4-issue-5254-sessions-before-seed");
-  const seedPrompt = `Remember this exact token: ${issue5254Marker}. Reply with acknowledged.`;
-  await runHermesCli(["-z", seedPrompt], "phase-4-issue-5254-seed-oneshot");
-  const seedSessionId = onlyNewHermesSessionId(
-    beforeSeedSessions,
-    await listHermesSessions("phase-4-issue-5254-sessions-after-seed"),
-  );
-  const resumePrompt = `N5254_${Date.now().toString(36)}_RESUME`;
-  await expectNoNewHermesSessions(
-    await listHermesSessions("phase-4-issue-5254-sessions-before-resume"),
-    "phase-4-issue-5254-session-before-resume-metadata",
-    seedSessionId,
-    resumePrompt,
-    ["--resume", seedSessionId, "-z", resumePrompt, "--pass-session-id", "--ignore-rules"],
-    "phase-4-issue-5254-resume-oneshot",
-    "phase-4-issue-5254-sessions-after-resume",
-  );
-  const continuePrompt = `N5254_${Date.now().toString(36)}_CONTINUE`;
-  await expectNoNewHermesSessions(
-    await listHermesSessions("phase-4-issue-5254-sessions-before-continue"),
-    "phase-4-issue-5254-session-before-continue-metadata",
-    seedSessionId,
-    continuePrompt,
-    ["-c", seedSessionId, "-z", continuePrompt],
-    "phase-4-issue-5254-continue-oneshot",
-    "phase-4-issue-5254-sessions-after-continue",
-  );
-  const exportPath = `/tmp/nemoclaw-issue-5254-${issue5254Marker}.jsonl`;
-  await exportHermesSession(
+  await assertHermesCliAdapterLiveContract({
+    env: commandEnv(),
+    host,
+    redactionValues,
     sandbox,
-    SANDBOX_NAME,
-    seedSessionId,
-    exportPath,
-    [seedPrompt, resumePrompt, continuePrompt],
-    {
-      artifactName: "phase-4-issue-5254-export-session",
-      env: commandEnv(),
-      redactionValues,
-      timeoutMs: 60_000,
-    },
-  );
+    sandboxName: SANDBOX_NAME,
+  });
 
   if (hermesDashboardE2eEnabled()) {
     const entry = registryEntry(SANDBOX_NAME);
@@ -605,6 +585,7 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
     expect(httpStatusOk(dashboardInternal.stdout)).toBe(true);
   }
 
+  progress.phase("restart Hermes gateway, validate supervision, and launch a turn");
   // Phase 5: host-mediated Hermes gateway restart. This validates the
   // runtime contract behind #2426 against a real OpenShell/Hermes sandbox:
   // The installed supervision tree controls the gateway process, direct
@@ -649,9 +630,9 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
           "set -eu",
           `marker=${shellQuote(envMarker)}`,
           `backup=${shellQuote(envBackup)}`,
-          "command -v gosu >/dev/null 2>&1",
-          'gosu sandbox cp /sandbox/.hermes/.env "$backup"',
-          'gosu sandbox sh -lc \'printf "\\nNEMOCLAW_E2E_RESTART_MARKER=%s\\n" "$1" >> /sandbox/.hermes/.env\' sh "$marker"',
+          "test -x /usr/bin/setpriv",
+          '/usr/bin/setpriv --reuid=sandbox --regid=sandbox --init-groups -- cp /sandbox/.hermes/.env "$backup"',
+          '/usr/bin/setpriv --reuid=sandbox --regid=sandbox --init-groups -- sh -lc \'printf "\\nNEMOCLAW_E2E_RESTART_MARKER=%s\\n" "$1" >> /sandbox/.hermes/.env\' sh "$marker"',
         ].join("; "),
       ),
       {
@@ -690,7 +671,7 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
         [
           "set -eu",
           `backup=${shellQuote(envBackup)}`,
-          'gosu sandbox sh -c \'cat "$1" > /sandbox/.hermes/.env && rm -f "$1"\' sh "$backup"',
+          '/usr/bin/setpriv --reuid=sandbox --regid=sandbox --init-groups -- sh -c \'cat "$1" > /sandbox/.hermes/.env && rm -f "$1"\' sh "$backup"',
           "sha256sum -c /etc/nemoclaw/hermes.config-hash --status",
           "echo ENV_RESTORED",
         ].join("; "),
@@ -1232,33 +1213,34 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
     }
   }
 
+  await (process.platform === "linux"
+    ? runLaunchAgentTurn({
+        artifactName: "phase-5-hermes-launch-turn-after-recovery",
+        cliCommand: "nemoclaw",
+        env,
+        host,
+        redactionValues,
+        sandboxName: SANDBOX_NAME,
+      })
+    : Promise.resolve());
+
+  progress.phase("exercise hosted and inference.local routes");
   // Phase 6: live inference through both the external provider and the
   // sandbox's inference.local route.
-  const directChat = await retryHostedInference("direct NVIDIA Endpoints chat", async (attempt) => {
-    const response = await provider.requestJson(
-      trustedProviderEndpoint("https://inference-api.nvidia.com/v1/chat/completions", {
-        allowedHosts: ["inference-api.nvidia.com"],
-      }),
-      {
-        artifactName: `phase-6-direct-nvidia-chat-attempt-${attempt}`,
-        body: chatPayload(
-          hosted.model,
-          "Reply with exactly one word: PONG",
-          attempt === 1 ? 256 : 1024,
-        ),
-        curlMaxTimeSeconds: 90,
-        headers: ["Content-Type: application/json", `Authorization: Bearer ${apiKey}`],
-        env: buildAvailabilityProbeEnv(),
-        redactionValues,
-        timeoutMs: 120_000,
-      },
-    );
-    if (shouldRetryForReasoningBudget(response.json)) {
-      throw new Error("direct chat exhausted response budget while reasoning before PONG");
-    }
-    return response;
-  });
-  expectPong("direct NVIDIA Endpoints chat", directChat.json);
+  const directChat = await retryHostedInference(
+    `${inference.mode} direct chat`,
+    async (attempt) => {
+      const response = await inference.directChat("Reply with exactly one word: PONG", {
+        artifactName: `phase-6-direct-inference-chat-attempt-${attempt}`,
+        maxTokens: attempt === 1 ? 256 : 1024,
+      });
+      if (shouldRetryForReasoningBudget(response)) {
+        throw new Error("direct chat exhausted response budget while reasoning before PONG");
+      }
+      return response;
+    },
+  );
+  expectPong(`${inference.mode} direct chat`, directChat);
 
   const sandboxChatJson = await retryHostedInference(
     "Hermes sandbox inference.local chat",
@@ -1274,7 +1256,7 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
           "Content-Type: application/json",
           "--data-raw",
           chatPayload(
-            hosted.model,
+            inference.model,
             "Reply with exactly one word: PONG",
             attempt === 1 ? 256 : 1024,
           ),
@@ -1305,6 +1287,7 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
   );
   expectPong("Hermes sandbox inference.local chat", sandboxChatJson);
 
+  progress.phase("validate CLI manifest and locked-config behavior");
   // Phase 7: CLI operations and agent manifest regression.
   const logs = await host.command("nemoclaw", [SANDBOX_NAME, "logs"], {
     artifactName: "phase-7-nemoclaw-logs",
@@ -1433,6 +1416,7 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
     : null;
 
   // Phase 9: explicit cleanup and post-destroy registry proof.
+  progress.phase("finalize Hermes sandbox resources");
   if (process.env.NEMOCLAW_E2E_KEEP_SANDBOX !== "1") {
     const destroy = await host.command("nemoclaw", [SANDBOX_NAME, "destroy", "--yes"], {
       artifactName: "phase-9-nemoclaw-destroy",
@@ -1440,7 +1424,7 @@ test("hermes-e2e: install.sh onboards Hermes and proves health plus live inferen
       timeoutMs: 120_000,
     });
     expect(destroy.exitCode, resultText(destroy)).toBe(0);
-    await bestEffort(() =>
+    await postDestroyGatewayBestEffort(() =>
       sandbox.openshell(["gateway", "destroy", "-g", "nemoclaw"], {
         artifactName: "phase-9-openshell-gateway-destroy",
         env: commandEnv(),

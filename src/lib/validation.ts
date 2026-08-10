@@ -86,6 +86,13 @@ export function classifyValidationFailure({
   if (/unauthorized|forbidden|invalid api key|invalid_auth|permission/i.test(normalized)) {
     return { kind: "credential", retry: "credential" };
   }
+  if (
+    /cannot resolve endpoint host|did not resolve to any address|could not resolve host|name or service not known|enotfound|eai_again|no http response/i.test(
+      normalized,
+    )
+  ) {
+    return { kind: "transport", retry: "retry" };
+  }
   if (/ssl|tls|certificate|handshake/i.test(normalized)) {
     return { kind: "transport", retry: "retry" };
   }
@@ -252,6 +259,16 @@ export function validateNvidiaApiKeyValue(
   return null;
 }
 
+export function validateOpenRouterApiKeyValue(key: string): string | null {
+  if (!key) {
+    return "  OpenRouter API Key is required.";
+  }
+  if (!key.startsWith("sk-or-")) {
+    return "  Invalid OpenRouter API key. Must start with sk-or-";
+  }
+  return null;
+}
+
 export function isSafeModelId(value: string): boolean {
   return /^[A-Za-z0-9._:/-]+$/.test(value);
 }
@@ -300,7 +317,13 @@ export function nvcfFunctionNotFoundMessage(model: string): string {
  * See issue #1601 (Bug 1) and issue #1960.
  */
 export function shouldSkipResponsesProbe(provider: string): boolean {
-  return provider === "nvidia-prod" || provider === "nvidia-nim" || provider === "gemini-api";
+  return (
+    provider === "nvidia-prod" ||
+    provider === "nvidia-nim" ||
+    provider === "gemini-api" ||
+    provider === "openrouter-api" ||
+    provider === "llama-cpp-local"
+  );
 }
 
 /**

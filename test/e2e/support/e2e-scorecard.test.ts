@@ -19,11 +19,11 @@ import { join } from "node:path";
 
 import { describe, expect, it, vi } from "vitest";
 
-import type { ScorecardData } from "../../../scripts/scorecard/build-slack-blocks.ts";
-import type { JobSummary, SummarizeJobsInput } from "../../../scripts/scorecard/summarize-jobs.ts";
+import type { ScorecardData } from "../../../scripts/scorecard/build-slack-blocks.mts";
+import type { JobSummary, SummarizeJobsInput } from "../../../scripts/scorecard/summarize-jobs.mts";
 
 const require = createRequire(import.meta.url);
-const slack = require("../../../scripts/scorecard/build-slack-blocks.ts") as {
+const slack = require("../../../scripts/scorecard/build-slack-blocks.mts") as {
   buildBlocks: (data: ScorecardData) => Array<{
     elements?: Array<{ text?: { text?: string }; url?: string }>;
     text?: { text: string };
@@ -32,7 +32,7 @@ const slack = require("../../../scripts/scorecard/build-slack-blocks.ts") as {
   buildFallbackText: (data: ScorecardData) => string;
   getSlackChannel: (data: ScorecardData) => string;
 };
-const trace = require("../../../scripts/scorecard/analyze-trace-timing.ts") as {
+const trace = require("../../../scripts/scorecard/analyze-trace-timing.mts") as {
   buildPhaseRows: (
     current: Record<string, number>,
     previous: Record<string, number>,
@@ -71,7 +71,7 @@ const trace = require("../../../scripts/scorecard/analyze-trace-timing.ts") as {
   ) => Promise<{ major: number; minor: number; name: string; patch: number; sha: string } | null>;
   selectOnboardTrace: (texts: string[]) => { totalMs: number } | null;
 };
-const scorecardJobs = require("../../../scripts/scorecard/summarize-jobs.ts") as {
+const scorecardJobs = require("../../../scripts/scorecard/summarize-jobs.mts") as {
   isSelectiveDispatch: (eventName: string, rawJobs?: string, rawTargets?: string) => boolean;
   loadWorkflowRunJobs: (deps: {
     context: { repo: { owner: string; repo: string }; runId: number };
@@ -154,7 +154,7 @@ function runSanitizer(source: string, output: string) {
 function scorecardData(overrides: Partial<ScorecardData> = {}): ScorecardData {
   return {
     today: "Jun 29",
-    runMode: "Scheduled E2E",
+    runMode: "Main push",
     actor: "",
     isSelectiveDispatch: false,
     requestedJobs: [],
@@ -184,10 +184,19 @@ describe("E2E scorecard", () => {
   it("loads typed scorecard helpers through the native github-script require boundary", () => {
     const script = `
       const path = require('node:path');
-      for (const file of ['analyze-trace-timing.ts', 'summarize-jobs.ts', 'build-slack-blocks.ts']) {
+      for (const file of [
+        'analyze-runtime-history.mts',
+        'analyze-trace-timing.mts',
+        'summarize-jobs.mts',
+        'build-slack-blocks.mts',
+        'coordinate-scorecard.mts',
+        'read-artifact-zip.mts',
+      ]) {
         const loaded = require(path.join(process.env.GITHUB_WORKSPACE, 'scripts/scorecard', file));
         if (Object.keys(loaded).length === 0) process.exit(2);
       }
+      const runtimeAudit = require(path.join(process.env.GITHUB_WORKSPACE, 'scripts/audit-test-runtime.mts'));
+      if (Object.keys(runtimeAudit).length === 0) process.exit(2);
     `;
     const result = spawnSync(process.execPath, ["--experimental-strip-types", "-e", script], {
       cwd: process.cwd(),
@@ -455,13 +464,13 @@ describe("E2E scorecard", () => {
           { conclusion: "skipped", name: "jetson-nvmap-gpu", status: "completed" },
           {
             conclusion: "success",
-            name: "sandbox-rlimits-connect",
+            name: "mcp-bridge-dev",
             status: "completed",
           },
           { conclusion: "success", name: "report-to-pr", status: "completed" },
         ],
-        explicitOnlyJobNames: ["jetson-nvmap-gpu", "sandbox-rlimits-connect"],
-        explicitlySelected: ["sandbox-rlimits-connect"],
+        explicitOnlyJobNames: ["jetson-nvmap-gpu", "mcp-bridge-dev"],
+        explicitlySelected: ["mcp-bridge-dev"],
         metaJobNames: ["generate-matrix", "report-to-pr", "scorecard"],
         needs: {},
       }),
@@ -472,15 +481,48 @@ describe("E2E scorecard", () => {
       ran: 4,
       skipped: 0,
       success: 3,
+      timingRows: [],
       total: 4,
     });
   });
 
-  it("falls back to needs without counting unselected explicit-only jobs", () => {
+  it("keeps every matrix execution eligible for the timing ranking", () => {
+    const summary = scorecardJobs.summarizeJobs({
+      apiJobs: [
+        {
+          completed_at: "2026-07-24T00:00:20Z",
+          conclusion: "success",
+          created_at: "2026-07-24T00:00:00Z",
+          labels: ["ubuntu-latest"],
+          name: "matrix / fast",
+          started_at: "2026-07-24T00:00:05Z",
+          status: "completed",
+        },
+        {
+          completed_at: "2026-07-24T00:02:00Z",
+          conclusion: "success",
+          created_at: "2026-07-24T00:00:00Z",
+          labels: ["ubuntu-latest"],
+          name: "matrix / slow",
+          started_at: "2026-07-24T00:00:10Z",
+          status: "completed",
+        },
+      ],
+      explicitOnlyJobNames: [],
+      explicitlySelected: [],
+      metaJobNames: [],
+      needs: {},
+    });
+
+    expect(summary).toMatchObject({ success: 1, total: 1 });
+    expect(summary.timingRows.map(({ name }) => name)).toEqual(["matrix / slow", "matrix / fast"]);
+  });
+
+  it("falls back to needs without counting jobs omitted from the run", () => {
     expect(
       scorecardJobs.summarizeJobs({
         apiJobs: null,
-        explicitOnlyJobNames: ["jetson-nvmap-gpu", "sandbox-rlimits-connect"],
+        explicitOnlyJobNames: ["jetson-nvmap-gpu", "mcp-bridge-dev"],
         explicitlySelected: ["jetson-nvmap-gpu"],
         metaJobNames: ["generate-matrix", "report-to-pr", "scorecard"],
         needs: {
@@ -488,7 +530,7 @@ describe("E2E scorecard", () => {
           cloud: { result: "success" },
           malformed: { result: "timed_out" },
           "jetson-nvmap-gpu": { result: "skipped" },
-          "sandbox-rlimits-connect": { result: "skipped" },
+          "mcp-bridge-dev": { result: "skipped" },
           "report-to-pr": { result: "success" },
         },
       }),
@@ -499,6 +541,7 @@ describe("E2E scorecard", () => {
       ran: 2,
       skipped: 1,
       success: 1,
+      timingRows: [],
       total: 3,
     });
   });

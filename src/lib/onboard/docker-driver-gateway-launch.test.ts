@@ -6,7 +6,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
-
+import {
+  gatewayIdForStateDir,
+  NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV,
+} from "./docker-driver-gateway-config";
 import {
   buildDockerDriverGatewayConfigToml,
   buildDockerDriverGatewayLaunch,
@@ -15,6 +18,7 @@ import {
   resolveDriftGatewayBin,
   shouldUseContainerizedGateway,
 } from "./docker-driver-gateway-launch";
+import { gatewayProcessCmdlineMatches } from "./gateway-process-identity";
 
 function withTempBinaries<T>(
   fn: (paths: { dir: string; gatewayBin: string; sandboxBin: string }) => T,
@@ -99,10 +103,34 @@ describe("docker-driver-gateway-launch", () => {
     );
 
     expect(toml).toContain('compute_drivers = ["docker"]');
+    expect(toml).toContain('sandbox_namespace = "nemoclaw"');
     expect(toml).toContain('grpc_endpoint = "https://127.0.0.1:8080"');
     expect(toml).toContain('network_name = "openshell-docker"');
     expect(toml).toContain('supervisor_image = "ghcr.io/nvidia/openshell/supervisor:0.0.44"');
     expect(toml).toContain('supervisor_bin = "/home/shadeform/.local/bin/openshell-sandbox"');
+  });
+
+  it("assigns different sandbox namespaces to different gateway state roots (#8663)", () => {
+    const defaultNamespace = gatewayIdForStateDir("/tmp/openshell-docker-gateway");
+    const alternateNamespace = gatewayIdForStateDir("/tmp/openshell-docker-gateway-18080");
+
+    expect(defaultNamespace).toMatch(/^nemoclaw-openshell-docker-gateway-[a-f0-9]{12}$/);
+    expect(defaultNamespace).not.toBe(alternateNamespace);
+    expect(gatewayIdForStateDir("/tmp/a/gateway")).not.toBe(gatewayIdForStateDir("/tmp/b/gateway"));
+  });
+
+  it("writes the exact rootless socket only for the Podman driver", () => {
+    const toml = buildDockerDriverGatewayConfigToml({
+      OPENSHELL_DRIVERS: "podman",
+      OPENSHELL_GRPC_ENDPOINT: "https://169.254.1.2:8080",
+      OPENSHELL_DOCKER_NETWORK_NAME: "openshell-docker",
+      OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "supervisor:test",
+      OPENSHELL_PODMAN_SOCKET: "/run/user/1001/podman/podman.sock",
+    });
+
+    expect(toml).toContain("[openshell.drivers.podman]");
+    expect(toml).toContain('socket_path = "/run/user/1001/podman/podman.sock"');
+    expect(toml).not.toContain("sandbox_namespace");
   });
 
   it("rejects wildcard binds for direct host gateway launches", () => {
@@ -142,6 +170,9 @@ describe("docker-driver-gateway-launch", () => {
       expect(identity.launch?.mode).toBe("host");
       expect(identity.driftGatewayBin).toBe(gatewayBin);
       expect(identity.desiredEnv.OPENSHELL_DOCKER_SUPERVISOR_BIN).toBe(sandboxBin);
+      expect(identity.desiredEnv[NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV]).toBe(
+        gatewayIdForStateDir(dir),
+      );
       expect(identity.desiredEnv.OPENSHELL_GATEWAY_CONFIG).toBe(
         path.join(dir, "openshell-gateway.toml"),
       );
@@ -177,20 +208,56 @@ describe("docker-driver-gateway-launch", () => {
     });
   });
 
-  it("scrubs stale auth-disable env from direct host gateway launches", () => {
+  it("binds the real no-argument host launch identity to its gateway target", () => {
+    withTempBinaries(({ dir, gatewayBin }) => {
+      const launch = buildDockerDriverGatewayLaunch({
+        gatewayBin,
+        gatewayName: "nemoclaw-8081",
+        stateDir: dir,
+        platform: "linux",
+        env: {},
+        hostGlibcVersion: "2.39",
+        requiredGlibcVersions: ["2.39"],
+        gatewayEnv: {
+          OPENSHELL_DRIVERS: "docker",
+          OPENSHELL_GRPC_ENDPOINT: "https://127.0.0.1:8081",
+        },
+      });
+      const cmdline = [launch.argv0, ...launch.args].filter(Boolean).join(" ");
+
+      expect(launch.args).toEqual([]);
+      expect(launch.argv0).toBe("openshell-gateway[nemoclaw=nemoclaw-8081;port=8081]");
+      expect(
+        gatewayProcessCmdlineMatches(cmdline, gatewayBin, {
+          expectedOpenShellGateway: { name: "nemoclaw-8081", port: 8081 },
+        }),
+      ).toBe(true);
+      expect(
+        gatewayProcessCmdlineMatches(cmdline, gatewayBin, {
+          expectedOpenShellGateway: { name: "nemoclaw", port: 8080 },
+        }),
+      ).toBe(false);
+    });
+  });
+
+  it("scrubs stale internal env from direct host gateway launches", () => {
     withTempBinaries(({ dir, gatewayBin }) => {
       const launch = buildDockerDriverGatewayLaunch({
         gatewayBin,
         stateDir: dir,
         platform: "linux",
-        env: { OPENSHELL_DISABLE_GATEWAY_AUTH: "true" },
+        env: {
+          OPENSHELL_DISABLE_GATEWAY_AUTH: "true",
+          [NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV]: "stale",
+        },
         hostGlibcVersion: "2.39",
         requiredGlibcVersions: ["2.39"],
-        gatewayEnv: { OPENSHELL_DRIVERS: "docker" },
+        gatewayEnv: { OPENSHELL_DRIVERS: "podman" },
       });
 
       expect(launch.mode).toBe("host");
       expect(launch.env.OPENSHELL_DISABLE_GATEWAY_AUTH).toBeUndefined();
+      expect(launch.env[NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV]).toBeUndefined();
     });
   });
 });

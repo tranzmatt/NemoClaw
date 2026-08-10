@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import {
+  type WebSearchConfig,
+  webSearchEnvFor,
+  webSearchLabelFor,
+  webSearchProviderForConfig,
+} from "../../../inference/web-search";
 import type { Session } from "../../../state/onboard-session";
 import type { SandboxEntry } from "../../../state/registry";
 import { normalizeToolDisclosure, toolDisclosureOrDefault } from "../../../tool-disclosure";
@@ -11,11 +17,15 @@ export interface SandboxResumeSignals {
   readonly sandboxStepComplete: boolean;
   readonly sandboxReuseState: string;
   readonly inferenceRouteConfigChanged: boolean;
+  readonly compatibleEndpointReasoningChanged: boolean;
   readonly webSearchConfigChanged: boolean;
   readonly sandboxGpuConfigChanged: boolean;
+  readonly recreateSandboxRequested: boolean;
+  readonly recreateJournalHandoff?: boolean;
   readonly messagingChannelConfigChanged: boolean;
   readonly hermesToolGatewayConfigChanged: boolean;
   readonly observabilityChanged?: boolean;
+  readonly dcodeAutoApprovalChanged?: boolean;
   readonly toolDisclosureMigrationNeeded: boolean;
   readonly toolDisclosureChanged: boolean;
   readonly inferenceSelectionChanged: boolean;
@@ -57,6 +67,23 @@ export function hasHermesCompatibleAnthropicInferenceRouteDrift({
   );
 }
 
+export function hasCompatibleEndpointReasoningDrift({
+  provider,
+  compatibleEndpointReasoning,
+  registryEntry,
+}: {
+  readonly provider: string | null | undefined;
+  readonly compatibleEndpointReasoning: string | null | undefined;
+  readonly registryEntry: SandboxEntry | null;
+}): boolean {
+  if (provider !== "compatible-endpoint") return false;
+  const desired =
+    compatibleEndpointReasoning === "true" || compatibleEndpointReasoning === "false"
+      ? compatibleEndpointReasoning
+      : null;
+  return (registryEntry?.compatibleEndpointReasoning ?? null) !== desired;
+}
+
 export function resolveToolDisclosureResumeSignals(
   registryEntry: SandboxEntry | null,
   session: Session | null,
@@ -83,30 +110,48 @@ export type SandboxResumeDecision =
     }
   | { readonly kind: "repair-and-recreate" };
 
-export interface SandboxResumeDeps {
-  note(message: string): void;
-  removeSandboxFromRegistry(sandboxName: string): void;
-  repairRecordedSandbox(sandboxName: string | null): void;
-  recordRepairEvent(
-    type: "state.repair.started" | "state.repair.completed" | "state.repair.failed",
-    options?: {
-      state?: "sandbox";
-      error?: string | null;
-      metadata?: Record<string, unknown> | null;
-    },
-  ): Promise<unknown>;
+export function replacesSameNameSandbox(decision: SandboxResumeDecision): boolean {
+  if (decision.kind === "repair-and-recreate") return true;
+  return decision.kind === "recreate" && decision.removeRegistryEntry;
+}
+
+export function mcpRegistryRemovalBlockReason(
+  decision: SandboxResumeDecision,
+  sandboxName: string | null,
+  webSearchConfig: WebSearchConfig | null,
+  getSandboxRegistryEntry: (sandboxName: string) => SandboxEntry | null,
+): string | null {
+  if (decision.kind !== "recreate" || !decision.removeRegistryEntry || !sandboxName) return null;
+  const mcpState = getSandboxRegistryEntry(sandboxName)?.mcp;
+  if (!mcpState) return null;
+
+  const selectedProvider = webSearchConfig ? webSearchProviderForConfig(webSearchConfig) : null;
+  if (selectedProvider) {
+    const credentialEnv = webSearchEnvFor(selectedProvider);
+    const collidingBridge = Object.values(mcpState.bridges).find((entry) =>
+      entry.env.includes(credentialEnv),
+    );
+    if (collidingBridge) {
+      return `  Cannot enable ${webSearchLabelFor(selectedProvider)}: MCP server '${collidingBridge.server}' already owns ${credentialEnv}. Use a distinct credential name.`;
+    }
+  }
+
+  return `  Sandbox '${sandboxName}' has managed MCP state. Use the transactional rebuild command before changing settings that recreate the sandbox.`;
 }
 
 function canReuseSandbox(signals: SandboxResumeSignals): boolean {
   return (
     !signals.resumeAgentChanged &&
     !signals.inferenceRouteConfigChanged &&
+    !signals.compatibleEndpointReasoningChanged &&
     !signals.inferenceSelectionChanged &&
     !signals.webSearchConfigChanged &&
     !signals.sandboxGpuConfigChanged &&
+    !signals.recreateSandboxRequested &&
     !signals.messagingChannelConfigChanged &&
     !signals.hermesToolGatewayConfigChanged &&
     !signals.observabilityChanged &&
+    !signals.dcodeAutoApprovalChanged &&
     !signals.toolDisclosureMigrationNeeded &&
     !signals.toolDisclosureChanged &&
     signals.sandboxReuseState === "ready"
@@ -135,6 +180,13 @@ function toolDisclosureResumeDecision(signals: SandboxResumeSignals): SandboxRes
 }
 
 function compatibilityResumeDecision(signals: SandboxResumeSignals): SandboxResumeDecision | null {
+  if (signals.compatibleEndpointReasoningChanged && signals.sandboxReuseState === "ready") {
+    return {
+      kind: "recreate",
+      note: "  [resume] Compatible endpoint reasoning capability changed; recreating sandbox.",
+      removeRegistryEntry: false,
+    };
+  }
   if (signals.inferenceSelectionChanged) {
     return {
       kind: "recreate",
@@ -164,6 +216,13 @@ function compatibilityResumeDecision(signals: SandboxResumeSignals): SandboxResu
 function runtimeConfigurationResumeDecision(
   signals: SandboxResumeSignals,
 ): SandboxResumeDecision | null {
+  if (signals.recreateSandboxRequested) {
+    return {
+      kind: "recreate",
+      note: "  [resume] Recreate sandbox requested; recreating sandbox.",
+      removeRegistryEntry: false,
+    };
+  }
   if (signals.webSearchConfigChanged) {
     return {
       kind: "recreate",
@@ -200,11 +259,44 @@ function runtimeConfigurationResumeDecision(
       removeRegistryEntry: false,
     };
   }
+  if (signals.dcodeAutoApprovalChanged && signals.sandboxReuseState !== "not_ready") {
+    return {
+      kind: "recreate",
+      note: "  [resume] DCode auto-approval capability changed; recreating sandbox.",
+      // Preserve registry-only fidelity until createSandbox captures it.
+      removeRegistryEntry: false,
+    };
+  }
   return null;
 }
 
+function continuesJournaledRecreate(signals: SandboxResumeSignals): boolean {
+  return (
+    signals.resume &&
+    (signals.sandboxReuseState === "missing" || signals.sandboxReuseState === "not_ready") &&
+    signals.recreateSandboxRequested &&
+    Boolean(signals.recreateJournalHandoff)
+  );
+}
+
+function requiresUnownedNotReadyRepair(signals: SandboxResumeSignals): boolean {
+  return (
+    signals.sandboxReuseState === "not_ready" &&
+    signals.recreateSandboxRequested &&
+    !signals.recreateJournalHandoff
+  );
+}
+
 export function decideSandboxResume(signals: SandboxResumeSignals): SandboxResumeDecision {
+  if (continuesJournaledRecreate(signals)) {
+    return {
+      kind: "recreate",
+      note: "  [resume] Continuing journaled sandbox recreation.",
+      removeRegistryEntry: false,
+    };
+  }
   if (!signals.resume || !signals.sandboxStepComplete) return { kind: "create" };
+  if (requiresUnownedNotReadyRepair(signals)) return { kind: "repair-and-recreate" };
   const compatibilityDecision = compatibilityResumeDecision(signals);
   if (compatibilityDecision) return compatibilityDecision;
   if (canReuseSandbox(signals)) return { kind: "reuse" };
@@ -218,38 +310,4 @@ export function decideSandboxResume(signals: SandboxResumeSignals): SandboxResum
     note: "  [resume] Recorded sandbox state is unavailable; recreating it.",
     removeRegistryEntry: true,
   };
-}
-
-async function repairRecordedSandbox(
-  sandboxName: string | null,
-  deps: SandboxResumeDeps,
-): Promise<void> {
-  deps.note(`  [resume] Recorded sandbox '${sandboxName}' exists but is not ready; recreating it.`);
-  const metadata = { repair: "recorded-sandbox-cleanup", sandboxName };
-  await deps.recordRepairEvent("state.repair.started", { state: "sandbox", metadata });
-  try {
-    deps.repairRecordedSandbox(sandboxName);
-  } catch (error) {
-    await deps.recordRepairEvent("state.repair.failed", {
-      state: "sandbox",
-      error: error instanceof Error ? error.message : String(error),
-      metadata,
-    });
-    throw error;
-  }
-  await deps.recordRepairEvent("state.repair.completed", { state: "sandbox", metadata });
-}
-
-export async function applySandboxResumeDecision(
-  decision: SandboxResumeDecision,
-  sandboxName: string | null,
-  deps: SandboxResumeDeps,
-): Promise<void> {
-  if (decision.kind === "repair-and-recreate") {
-    await repairRecordedSandbox(sandboxName, deps);
-    return;
-  }
-  if (decision.kind !== "recreate") return;
-  deps.note(decision.note);
-  if (decision.removeRegistryEntry && sandboxName) deps.removeSandboxFromRegistry(sandboxName);
 }

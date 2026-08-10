@@ -4,7 +4,14 @@
 import type { RebuildSandboxOptions } from "../../domain/lifecycle/options";
 import type { SandboxMessagingPlan } from "../../messaging";
 import { hydrateCredentialEnv } from "../../onboard/credential-env";
+import { DCODE_AUTO_APPROVAL_FEATURE } from "../../onboard/dcode-auto-approval";
+import { managedSandboxFeatureIssue } from "../../onboard/managed-sandbox-feature";
+import {
+  type HermesCronRestorePlan,
+  validateHermesCronRestoreBackup,
+} from "../../state/rebuild/hermes-cron-restore-backup";
 import type { RebuildManifest } from "../../state/sandbox";
+import { assertMcpDestroyNotPending } from "./mcp-bridge-state";
 import {
   preflightRebuildCredentials,
   type RebuildBail,
@@ -17,6 +24,7 @@ import {
   isDcodeRebuildAgent,
 } from "./rebuild-dcode-orchestrator";
 import {
+  disposeRebuildAgentBaseImagePreflight,
   type RebuildAgentBaseImagePreflight,
   type RebuildLiveState,
   type RebuildSandboxEntry,
@@ -34,9 +42,12 @@ import { printRebuildPreflightFailure } from "./rebuild-preflight-error";
 import {
   acquireRebuildOnboardLock,
   assertRebuildEntryUnchanged,
+  blockRebuildOnPendingBaselineTransition,
   checkRebuildGatewaySchemaPreflight,
+  expectedRebuildEntryAfterVersionCheck,
   getRebuildSandboxEntryOrBail,
   isSingleAgentRebuildSupported,
+  type RebuildRoutePreflightReceipt,
   runRebuildGatewayIntentPreflight,
 } from "./rebuild-preflight-guards";
 import { prepareRebuildTargetPreflights } from "./rebuild-preflight-target-phase";
@@ -47,6 +58,8 @@ import {
 } from "./rebuild-prepared-recovery";
 import { checkRebuildGatewayCredentialReuseOrBail } from "./rebuild-provider-preflight";
 import type { RebuildTargetConfig } from "./rebuild-target-preflight";
+
+export { finalizePreparedRebuildImageMessagingPlan } from "./rebuild-custom-image-preflight";
 
 export interface RebuildPreflightPhaseResult {
   sandboxEntry: RebuildSandboxEntry;
@@ -60,9 +73,46 @@ export interface RebuildPreflightPhaseResult {
   recoveryManifest: RebuildManifest | null;
   dcodePreflight: DcodeRebuildOrchestrator;
   preparedImage: PreparedRebuildImage | null;
+  routePreflightReceipt: RebuildRoutePreflightReceipt;
   releaseOnboardLock: () => void;
   log: RebuildLog;
   bail: RebuildBail;
+}
+
+interface HermesCronRestoreBackupPreflightInput {
+  rebuildAgent: string | null;
+  backupPath: string | null;
+  backedUpDirs: readonly string[];
+  log: RebuildLog;
+  bail: RebuildBail;
+}
+
+export function runHermesCronRestoreBackupPreflight({
+  rebuildAgent,
+  backupPath,
+  backedUpDirs,
+  log,
+  bail,
+}: HermesCronRestoreBackupPreflightInput): { plan: HermesCronRestorePlan | null } | null {
+  if (rebuildAgent !== "hermes" || backupPath === null || !backedUpDirs.includes("cron")) {
+    return { plan: null };
+  }
+  try {
+    const plan = validateHermesCronRestoreBackup(backupPath);
+    log(
+      `Hermes cron restore preflight: activeJobs=${String(plan.activeJobs)}, scriptJobs=${String(plan.scriptJobs)}, gate=${String(plan.requiresDispatchGate)}`,
+    );
+    return { plan };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    printRebuildPreflightFailure(
+      `the Hermes cron backup failed script-reference validation: ${detail}`,
+      `Repair or disable the affected job before rebuilding. Backup: ${backupPath}`,
+      "Hermes cron restore preflight failed.",
+      bail,
+    );
+    return null;
+  }
 }
 
 /**
@@ -77,11 +127,36 @@ export async function runRebuildPreflightPhase(
   options: string[] | RebuildSandboxOptions = {},
   opts: RebuildSandboxExecutionOptions = {},
 ): Promise<RebuildPreflightPhaseResult | null> {
-  const { log, bail, requestedToolDisclosure, requestedObservabilityEnabled, skipConfirm } =
-    createRebuildCommandContext(options, opts);
-  const activeSessionCount = countActiveSandboxSessionsForRebuild(sandboxName);
+  const {
+    log,
+    bail,
+    requestedToolDisclosure,
+    requestedDcodeAutoApprovalMode,
+    requestedObservabilityEnabled,
+    skipConfirm,
+  } = createRebuildCommandContext(options, opts);
   const sandboxEntry = getRebuildSandboxEntryOrBail(sandboxName, bail);
   if (!sandboxEntry) return null;
+  if (blockRebuildOnPendingBaselineTransition(sandboxEntry, sandboxName, bail)) return null;
+  const activeSessionCount = countActiveSandboxSessionsForRebuild(sandboxName);
+  // #6376: refuse a stuck MCP destroy transaction up front — before backup,
+  // image prep, or the old-sandbox delete. The only MCP marker check used to
+  // live inside the destroy phase, which runs AFTER the backup phase, so a
+  // stuck sandbox paid destructive/backup cost before the guard fired. Moving
+  // it here fails closed before any destructive work; the guard's message is
+  // phase-aware (prepared -> non-destructive `mcp remove --force`; pending ->
+  // finish the destroy).
+  try {
+    assertMcpDestroyNotPending(sandboxEntry);
+  } catch (error) {
+    printRebuildPreflightFailure(
+      "a pending MCP destroy transaction blocks rebuild.",
+      "Resolve the pending MCP state before retrying rebuild.",
+      error instanceof Error ? error.message : String(error),
+      bail,
+    );
+    return null;
+  }
   const confirmedEntrySnapshot = JSON.stringify(sandboxEntry);
   const allowLegacyManagedImageRecovery =
     opts.recoveryManifest !== undefined && opts.allowLegacyManagedImageRecovery === true;
@@ -95,6 +170,29 @@ export async function runRebuildPreflightPhase(
   if (!isSingleAgentRebuildSupported(sandboxEntry, bail)) return null;
 
   const rebuildAgent = sandboxEntry.agent || null;
+  const dcodeAutoApprovalIssue = managedSandboxFeatureIssue(DCODE_AUTO_APPROVAL_FEATURE, {
+    agent: rebuildAgent,
+    requested: requestedDcodeAutoApprovalMode,
+    registryValue: sandboxEntry.dcodeAutoApprovalMode,
+  });
+  if (dcodeAutoApprovalIssue === "unsupported-request") {
+    printRebuildPreflightFailure(
+      "the DCode auto-approval override is supported only for managed LangChain Deep Agents Code sandboxes.",
+      "Remove --dcode-auto-approval or select a managed Deep Agents Code sandbox.",
+      "Unsupported rebuild DCode auto-approval override",
+      bail,
+    );
+    return null;
+  }
+  if (dcodeAutoApprovalIssue === "recorded-state-on-unsupported-agent") {
+    printRebuildPreflightFailure(
+      "recorded DCode auto-approval is enabled for a sandbox whose agent does not support it.",
+      "Pass --dcode-auto-approval disabled to clear the incompatible state during rebuild.",
+      "Recorded DCode auto-approval state is incompatible with the sandbox agent",
+      bail,
+    );
+    return null;
+  }
   if (requestedObservabilityEnabled !== undefined && !isDcodeRebuildAgent(rebuildAgent)) {
     printRebuildPreflightFailure(
       "the observability override is supported only for managed LangChain Deep Agents Code sandboxes.",
@@ -105,15 +203,36 @@ export async function runRebuildPreflightPhase(
     return null;
   }
   const agentName = getRebuildAgentDisplayName(sandboxName);
+  const versionCheck = await runRebuildGatewayIntentPreflight({
+    checkGatewaySchema: () =>
+      isDcodeRebuildAgent(rebuildAgent) ||
+      checkRebuildGatewaySchemaPreflight(sandboxName, sandboxEntry, bail),
+    confirmIntent: () =>
+      confirmRebuildIntent(
+        sandboxName,
+        agentName,
+        skipConfirm,
+        activeSessionCount,
+        bail,
+        requestedDcodeAutoApprovalMode,
+      ),
+  });
+  if (!versionCheck) return null;
+  const expectedSandboxEntry = expectedRebuildEntryAfterVersionCheck(
+    sandboxEntry,
+    confirmedEntrySnapshot,
+    versionCheck,
+  );
   const dcodePreflight = createDcodeRebuildOrchestrator({
     sandboxName,
-    entry: sandboxEntry,
+    entry: expectedSandboxEntry,
     rebuildAgent,
+    managedWorkloadRebuild: expectedSandboxEntry.workload?.kind === "managed-image",
     log,
     bail,
     deps: {
       checkGatewaySchema: (name, scopedBail) =>
-        checkRebuildGatewaySchemaPreflight(name, sandboxEntry, scopedBail),
+        checkRebuildGatewaySchemaPreflight(name, expectedSandboxEntry, scopedBail),
       preflightCredentials: (_name, entry, scopedLog, scopedBail) =>
         preflightRebuildCredentials(entry, scopedLog, scopedBail),
       // Non-DCode rebuilds stay on the existing typed base-image preflight.
@@ -124,28 +243,23 @@ export async function runRebuildPreflightPhase(
   let retainDcodePreflight = false;
   let preparedImage: PreparedRebuildImage | null = null;
   let retainPreparedImage = false;
+  let baseImagePreflight: RebuildAgentBaseImagePreflight | null = null;
+  let retainBaseImagePreflight = false;
   try {
-    const versionCheck = await runRebuildGatewayIntentPreflight({
-      checkGatewaySchema: () =>
-        isDcodeRebuildAgent(rebuildAgent) ||
-        checkRebuildGatewaySchemaPreflight(sandboxName, sandboxEntry, bail),
-      confirmIntent: () =>
-        confirmRebuildIntent(sandboxName, agentName, skipConfirm, activeSessionCount, bail),
-    });
-    if (!versionCheck) return null;
-
     const releaseOnboardLock = acquireRebuildOnboardLock(sandboxName, bail);
+    if (!releaseOnboardLock) return null;
     let retainOnboardLock = false;
     try {
-      assertRebuildEntryUnchanged(sandboxName, confirmedEntrySnapshot, bail);
+      assertRebuildEntryUnchanged(sandboxName, JSON.stringify(expectedSandboxEntry), bail);
       const preparedTarget = await prepareRebuildTargetPreflights({
         sandboxName,
-        sandboxEntry,
+        sandboxEntry: expectedSandboxEntry,
         rebuildAgent,
         // Reaching this point means either --yes was supplied or confirmation
         // succeeded, matching the previous `skipConfirm || confirmed` contract.
         autoYes: true,
         requestedToolDisclosure,
+        requestedDcodeAutoApprovalMode,
         requestedObservabilityEnabled,
         allowLegacyManagedImageRecovery,
         // A validated prepared backup is the only path allowed to reconstruct
@@ -157,9 +271,10 @@ export async function runRebuildPreflightPhase(
         bail,
       });
       if (!preparedTarget) return null;
+      baseImagePreflight = preparedTarget.baseImagePreflight;
       preparedImage = preparedTarget.preparedImage;
 
-      const liveState = await resolveRebuildLiveState(sandboxName, sandboxEntry, log, bail);
+      const liveState = await resolveRebuildLiveState(sandboxName, expectedSandboxEntry, log, bail);
       if (!liveState) return null;
       if (isDcodeRebuildAgent(rebuildAgent)) {
         const recoveryRecreate = liveState.staleRecovery || recoveryManifest !== null;
@@ -167,11 +282,15 @@ export async function runRebuildPreflightPhase(
           preparedTarget.targetConfig.resumeConfig,
           preparedTarget.targetConfig.durableConfig.webSearchConfig,
           preparedTarget.targetConfig.durableConfig.toolDisclosure,
+          preparedTarget.targetConfig.durableConfig.dcodeAutoApprovalMode,
           recoveryRecreate,
           preparedTarget.recreateOptions.targetGatewayPort,
         );
-        if (!imageReady || !dcodePreflight.preparedReplacement) return null;
-        preparedTarget.recreateOptions.preparedDcodeRebuild = dcodePreflight.preparedReplacement;
+        if (!imageReady) return null;
+        if (!preparedTarget.recreateOptions.managedWorkloadRebuild) {
+          if (!dcodePreflight.preparedReplacement) return null;
+          preparedTarget.recreateOptions.preparedDcodeRebuild = dcodePreflight.preparedReplacement;
+        }
       }
       // Keep credential-reuse validation after DCode's live-route/image proofs,
       // but before shields, backup, or any destructive rebuild work begins.
@@ -193,8 +312,9 @@ export async function runRebuildPreflightPhase(
       retainOnboardLock = true;
       retainDcodePreflight = true;
       retainPreparedImage = true;
+      retainBaseImagePreflight = true;
       return {
-        sandboxEntry,
+        sandboxEntry: expectedSandboxEntry,
         rebuildAgent,
         versionCheck,
         ...preparedTarget,
@@ -214,5 +334,12 @@ export async function runRebuildPreflightPhase(
   } finally {
     if (!retainDcodePreflight) dcodePreflight.cleanup();
     if (!retainPreparedImage && preparedImage) disposePreparedBuildContext(preparedImage);
+    if (
+      !retainBaseImagePreflight &&
+      baseImagePreflight &&
+      !disposeRebuildAgentBaseImagePreflight(baseImagePreflight)
+    ) {
+      console.warn("  Warning: temporary rebuild base-image handoff could not be removed.");
+    }
   }
 }

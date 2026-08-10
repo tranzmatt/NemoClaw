@@ -7,20 +7,28 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 
-import credentialBoundaryManifest from "../src/lib/actions/sandbox/openshell-child-visible-credentials.v0.0.72.json";
-import { buildRebuildHermesChildEnv } from "./e2e/live/rebuild-hermes-env.ts";
+import credentialBoundaryManifest from "../src/lib/actions/sandbox/openshell-child-visible-credentials.v0.0.101.json";
 
 const SCRIPT = path.join(import.meta.dirname, "..", "scripts", "install-openshell.sh");
+const CANDIDATE_RUNTIME = {
+  cli: process.env.OPENSHELL_BIN,
+  gateway: process.env.OPENSHELL_GATEWAY_BIN,
+  resolutionId: process.env.NEMOCLAW_CANDIDATE_RESOLUTION_ID,
+  sandbox: process.env.NEMOCLAW_OPENSHELL_SANDBOX_BIN,
+  version: process.env.NEMOCLAW_CANDIDATE_VERSION,
+};
+const CANDIDATE_RUNTIME_ENABLED = Object.values(CANDIDATE_RUNTIME).every(Boolean);
 const PINNED_OPEN_SHELL_SHA256 = {
-  cliDarwinArm64: "117b5354cc42d80bc4d5e070ea5ac4e341208ff6d3c29b516d8a9c80e2310f8d",
-  cliLinuxArm64: "a5ff01a3240d73c72ec1700eda6cc6c752a86cf50c5dd1b5bdc459f544d03045",
-  cliLinuxX64: "37836c3b50383e03249c5e16512c1806e591fba8451408a84fb2f628ddb318c4",
-  gatewayDarwinArm64: "8c07362107393eb5f4ae4b9ee9f4257fd53862c51ad8dd96f2fe31bb6d8d7ffb",
-  gatewayLinuxArm64: "a97dcb3acb04fb2d1170c1a2170228990c2337e25bb8c18817e5a6e952204108",
-  gatewayLinuxX64: "03225fb9388b682af1a5f1614b26b75f828da6031e3ffc1fd920b6fbe5f70877",
-  sandboxLinuxArm64: "2cf62cbd651e55d0f8750804e2b4025e0d6c8eea4564c87cda47a2c922941db0",
-  sandboxLinuxX64: "811f914b6a6a3a3f4533449ddebebb6422333861a27a5fa848db6cbfdffdd230",
-  sandboxBinaryLinuxX64: "f9f991a24d10772ad5d24ae27a8ea6baad8cac671695bd90fcd0355e0e0ad198",
+  cliDarwinArm64: "9daaccdb9e30e220d56dd6d6bf4bd00ccca8ae4ad2845f5f0d9b9da3eb8ee881",
+  cliLinuxArm64: "b553d3bfc08e9354b990a10fb8abd976e039afeec2d3947f8a112018be40d296",
+  cliLinuxX64: "7d49ab2a5ff0b826bd2bdca5e0244010f832dfc6901c808ea8c8467004c26913",
+  formula: "87fadc7b0c854aa44f71d5b3a206865070117cd27825d59c61da252a99f402a2",
+  gatewayDarwinArm64: "0f9e195b7cde57f4c2080df95159c5e7e72b0248306abc242ae00a3bb6f07f14",
+  gatewayLinuxArm64: "ac842ccc2ab8b5682f7479d71532cc650839250a8a41dbfae2b871cbbdfd3279",
+  gatewayLinuxX64: "eaeb094ccf7dcb1fe00c7e926e6aa9aaaefb89ecbef8343720628b0fd2d84654",
+  sandboxLinuxArm64: "c39b7ba3cf212b88712a00d2a0e3d28e2c1e0e9f47a9a6ca818a8f06ed2140aa",
+  sandboxLinuxX64: "953b90eaa7d2fc1bb7bdf38eb0ada6fad7902b13f9f895ca20b89caeac483a9e",
+  sandboxBinaryLinuxX64: "a2704babbb468fd0a359bfdd9844de71095b730758541b4ca8cbab77d4018920",
 };
 const ZERO_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000";
 const REQUIRED_OPENSHELL_VERSION = credentialBoundaryManifest.openshellVersion;
@@ -55,6 +63,8 @@ function runWithInstalledVersion(
     sandboxBinaryDigest?: string;
     driverVersionExit?: number;
     driverReadable?: boolean;
+    homebrewAvailable?: boolean;
+    homebrewFormula?: boolean;
     os?: string;
     arch?: string;
   } = {},
@@ -166,6 +176,7 @@ exit 1`,
     );
 
     if ((options.os ?? "Linux") === "Darwin") {
+      const homebrewFormula = options.homebrewFormula ?? true;
       writeExecutable(
         path.join(fakeBin, "codesign"),
         `#!/usr/bin/env bash
@@ -184,6 +195,31 @@ if [ -n "$state" ]; then
 fi
 exit 0`,
       );
+      switch (options.homebrewAvailable ?? true) {
+        case true:
+          writeExecutable(
+            path.join(fakeBin, "brew"),
+            `#!/usr/bin/env bash
+case "$*" in
+  "list --formula openshell")
+    exit ${homebrewFormula ? "0" : "1"}
+    ;;
+  "info --json=v2 openshell")
+    printf '%s\n' '{"formulae":[{"name":"openshell","tap":"nvidia/openshell"}]}'
+    exit 0
+    ;;
+  "services restart openshell")
+    exit 0
+    ;;
+  "--prefix")
+    printf '%s\\n' ${JSON.stringify(tmp)}
+    exit 0
+    ;;
+esac
+exit 0`,
+          );
+          break;
+      }
     }
 
     const explicitDriverEnv =
@@ -209,6 +245,28 @@ exit 0`,
 }
 
 describe("install-openshell.sh version check", { timeout: 15_000 }, () => {
+  it.runIf(CANDIDATE_RUNTIME_ENABLED)(
+    "validates the receipt-bound candidate through the installer path (#6691)",
+    () => {
+      const context = `installer:${CANDIDATE_RUNTIME.resolutionId}`;
+      const result = spawnSync("bash", [SCRIPT], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          NEMOCLAW_CANDIDATE_INVOCATION_CONTEXT: context,
+          NEMOCLAW_OPENSHELL_CHANNEL: "stable",
+          NEMOCLAW_OPENSHELL_GATEWAY_BIN: CANDIDATE_RUNTIME.gateway,
+          NEMOCLAW_OPENSHELL_MAX_VERSION: CANDIDATE_RUNTIME.version,
+          NEMOCLAW_OPENSHELL_MIN_VERSION: CANDIDATE_RUNTIME.version,
+          NEMOCLAW_OPENSHELL_PIN_VERSION: CANDIDATE_RUNTIME.version,
+          NEMOCLAW_OPENSHELL_SANDBOX_BIN: CANDIDATE_RUNTIME.sandbox,
+        },
+      });
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      expect(result.stdout).toContain(`openshell already installed: ${CANDIDATE_RUNTIME.version}`);
+    },
+  );
+
   it("exits cleanly when the required OpenShell and driver binaries are already installed", () => {
     const result = runWithInstalledVersion(REQUIRED_OPENSHELL_VERSION);
     expect(result.status).toBe(0);
@@ -405,6 +463,26 @@ describe("install-openshell.sh version check", { timeout: 15_000 }, () => {
     }
   });
 
+  it("reuses the standalone macOS gateway when Homebrew is unavailable", () => {
+    const result = runWithInstalledVersion(
+      REQUIRED_OPENSHELL_VERSION,
+      {},
+      {
+        driverBins: "gateway-vm",
+        homebrewAvailable: false,
+        os: "Darwin",
+        arch: "arm64",
+      },
+    );
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout).toContain(
+      "Homebrew is not installed; reusing the standalone OpenShell gateway without reboot persistence.",
+    );
+    expect(result.stdout).toContain(`already installed: ${REQUIRED_OPENSHELL_VERSION}`);
+    expect(result.stdout).not.toContain("Installing OpenShell from release");
+  });
+
   it("triggers reinstall on macOS when OpenShell is missing required gateway binaries", () => {
     const result = runWithInstalledVersion(
       REQUIRED_OPENSHELL_VERSION,
@@ -422,11 +500,12 @@ describe("install-openshell.sh version check", { timeout: 15_000 }, () => {
     );
   });
 
-  it("downloads the macOS arm64 gateway asset during reinstall", () => {
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openshell-macos-assets-"));
+  it("fails closed when the macOS Homebrew formula does not match the pinned digest", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openshell-macos-formula-"));
     try {
       const fakeBin = path.join(tmp, "bin");
       const downloadLog = path.join(tmp, "downloads.log");
+      const brewLog = path.join(tmp, "brew.log");
       fs.mkdirSync(fakeBin);
 
       writeExecutable(
@@ -440,10 +519,83 @@ if [ "\${1:-}" = "-m" ]; then echo "arm64"; else echo "Darwin"; fi`,
 if [ "\${1:-}" = "--version" ]; then echo "openshell 0.0.36"; exit 0; fi
 exit 99`,
       );
+      writeExecutable(path.join(fakeBin, "gh"), "#!/usr/bin/env bash\nexit 1\n");
       writeExecutable(
-        path.join(fakeBin, "gh"),
+        path.join(fakeBin, "curl"),
         `#!/usr/bin/env bash
-exit 1`,
+echo "$@" >> ${JSON.stringify(downloadLog)}
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then shift; out="$1"; fi
+  shift || true
+done
+[ -n "$out" ] || exit 1
+printf '%s\\n' 'class Openshell < Formula' > "$out"
+exit 0`,
+      );
+      writeExecutable(
+        path.join(fakeBin, "sha256sum"),
+        `#!/usr/bin/env bash
+printf '%s  %s\\n' '${ZERO_SHA256}' "$1"`,
+      );
+      writeExecutable(
+        path.join(fakeBin, "brew"),
+        `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> ${JSON.stringify(brewLog)}
+exit 0`,
+      );
+
+      const result = spawnSync("bash", [SCRIPT], {
+        env: {
+          ...process.env,
+          HOME: tmp,
+          NEMOCLAW_OPENSHELL_CHANNEL: "stable",
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+        },
+        encoding: "utf8",
+      });
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
+      expect(result.stderr).toContain(
+        `OpenShell Homebrew formula checksum does not match NemoClaw-pinned v${REQUIRED_OPENSHELL_VERSION} digest`,
+      );
+      expect(fs.readFileSync(downloadLog, "utf-8")).toContain("openshell.rb");
+      expect(fs.existsSync(brewLog) ? fs.readFileSync(brewLog, "utf-8") : "").toBe("");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("revokes verified macOS Homebrew formula trust after install and reinstall outcomes (#7451)", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openshell-macos-formula-"));
+    try {
+      const fakeBin = path.join(tmp, "bin");
+      const homebrewPrefix = path.join(tmp, "homebrew");
+      const tapRepo = path.join(tmp, "tap");
+      const downloadLog = path.join(tmp, "downloads.log");
+      const brewLog = path.join(tmp, "brew.log");
+      const formulaTmpDir = path.join(tmp, "formula-tmp");
+      const untrustCount = path.join(tmp, "untrust-count");
+      fs.mkdirSync(fakeBin);
+      fs.mkdirSync(path.join(homebrewPrefix, "bin"), { recursive: true });
+
+      writeExecutable(
+        path.join(fakeBin, "uname"),
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "-m" ]; then echo "arm64"; else echo "Darwin"; fi`,
+      );
+      writeExecutable(
+        path.join(fakeBin, "openshell"),
+        `#!/usr/bin/env bash
+if [ "\${1:-}" = "--version" ]; then echo "openshell 0.0.36"; exit 0; fi
+exit 99`,
+      );
+      writeExecutable(path.join(fakeBin, "gh"), "#!/usr/bin/env bash\nexit 1\n");
+      writeExecutable(
+        path.join(fakeBin, "mktemp"),
+        `#!/usr/bin/env bash
+mkdir -p ${JSON.stringify(formulaTmpDir)}
+printf '%s\\n' ${JSON.stringify(formulaTmpDir)}`,
       );
       writeExecutable(
         path.join(fakeBin, "curl"),
@@ -452,88 +604,331 @@ echo "$@" >> ${JSON.stringify(downloadLog)}
 out=""
 while [ "$#" -gt 0 ]; do
   if [ "$1" = "-o" ]; then
-    shift
-    out="$1"
+    shift; out="$1"
   fi
   shift || true
 done
-if [ -n "$out" ]; then
-  case "$(basename "$out")" in
-  openshell-checksums-sha256.txt)
-    printf '%s\n' \
-      '${PINNED_OPEN_SHELL_SHA256.cliDarwinArm64}  openshell-aarch64-apple-darwin.tar.gz' > "$out"
-    ;;
-  openshell-gateway-checksums-sha256.txt)
-    printf '%s\n' \
-      '${PINNED_OPEN_SHELL_SHA256.gatewayDarwinArm64}  openshell-gateway-aarch64-apple-darwin.tar.gz' > "$out"
-    ;;
-  *)
-    : > "$out"
-    ;;
-  esac
-fi
+[ -n "$out" ] || exit 1
+cat > "$out" <<'EOF'
+class Openshell < Formula
+  def post_install
+    entitlements.write <<~XML
+      <plist/>
+    XML
+  end
+end
+EOF
 exit 0`,
       );
       writeExecutable(
         path.join(fakeBin, "sha256sum"),
         `#!/usr/bin/env bash
-cat >/dev/null
-echo "checksum OK"
-exit 0`,
+printf '%s  %s\\n' '${PINNED_OPEN_SHELL_SHA256.formula}' "$1"`,
       );
       writeExecutable(
-        path.join(fakeBin, "tar"),
+        path.join(fakeBin, "brew"),
         `#!/usr/bin/env bash
-outdir=""
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "-C" ]; then
-    outdir="$arg"
-    break
-  fi
-  prev="$arg"
-done
-[ -n "$outdir" ] || exit 1
+printf '%s\\n' "$*" >> ${JSON.stringify(brewLog)}
 case "$*" in
-*openshell-gateway*) name="openshell-gateway" ;;
-*) name="openshell" ;;
-esac
-printf '#!/usr/bin/env bash\nexit 0\n' > "$outdir/$name"
-chmod 755 "$outdir/$name"
-exit 0`,
-      );
-      writeExecutable(
-        path.join(fakeBin, "install"),
-        `#!/usr/bin/env bash
-dest="\${@: -1}"
-mkdir -p "$(dirname "$dest")"
-  cat > "$dest" <<'EOF'
-  #!/usr/bin/env bash
-if [ "\${1:-}" = "--version" ]; then echo "openshell ${REQUIRED_OPENSHELL_VERSION}"; exit 0; fi
+  "tap-info nvidia/openshell")
+    exit 1
+    ;;
+  "tap-new --no-git nvidia/openshell")
+    mkdir -p ${JSON.stringify(path.join(tapRepo, "Formula"))}
+    exit 0
+    ;;
+  "--repository nvidia/openshell")
+    printf '%s\\n' ${JSON.stringify(tapRepo)}
+    exit 0
+    ;;
+  "help trust")
+    exit "\${NEMOCLAW_TEST_BREW_TRUST_HELP_STATUS:-0}"
+    ;;
+  "help untrust")
+    exit "\${NEMOCLAW_TEST_BREW_UNTRUST_HELP_STATUS:-0}"
+    ;;
+  "trust --formula nvidia/openshell/openshell")
+    exit "\${NEMOCLAW_TEST_BREW_TRUST_STATUS:-0}"
+    ;;
+  "untrust --formula nvidia/openshell/openshell")
+    count=0
+    if [ -f ${JSON.stringify(untrustCount)} ]; then
+      count="$(cat ${JSON.stringify(untrustCount)})"
+    fi
+    count=$((count + 1))
+    printf '%s\\n' "$count" > ${JSON.stringify(untrustCount)}
+    if [ "$count" -gt 1 ]; then
+      exit "\${NEMOCLAW_TEST_BREW_UNTRUST_CLEANUP_STATUS:-\${NEMOCLAW_TEST_BREW_UNTRUST_STATUS:-0}}"
+    fi
+    exit "\${NEMOCLAW_TEST_BREW_UNTRUST_STATUS:-0}"
+    ;;
+  "list --formula openshell")
+    exit "\${NEMOCLAW_TEST_BREW_LIST_STATUS:-1}"
+    ;;
+  "install --formula nvidia/openshell/openshell"|"reinstall --formula nvidia/openshell/openshell")
+    if [ "\${NEMOCLAW_TEST_BREW_INSTALL_STATUS:-0}" -ne 0 ]; then
+      exit "$NEMOCLAW_TEST_BREW_INSTALL_STATUS"
+    fi
+    cat > ${JSON.stringify(path.join(homebrewPrefix, "bin", "openshell"))} <<'EOF'
+#!/usr/bin/env bash
+if [ "\${1:-}" = "--version" ]; then echo "openshell \${NEMOCLAW_TEST_INSTALLED_VERSION:-${REQUIRED_OPENSHELL_VERSION}}"; exit 0; fi
 # ${OPENSHELL_FEATURE_MARKERS}
 exit 0
 EOF
-chmod +x "$dest"
-exit 0`,
+    cat > ${JSON.stringify(path.join(homebrewPrefix, "bin", "openshell-gateway"))} <<'EOF'
+#!/usr/bin/env bash
+if [ "\${1:-}" = "--version" ]; then echo "openshell-gateway \${NEMOCLAW_TEST_INSTALLED_VERSION:-${REQUIRED_OPENSHELL_VERSION}}"; exit 0; fi
+exit 0
+EOF
+    chmod 755 ${JSON.stringify(path.join(homebrewPrefix, "bin", "openshell"))} ${JSON.stringify(path.join(homebrewPrefix, "bin", "openshell-gateway"))}
+    exit 0
+    ;;
+  "--prefix")
+    printf '%s\\n' ${JSON.stringify(homebrewPrefix)}
+    exit 0
+    ;;
+esac
+exit 1`,
       );
 
-      const result = spawnSync("bash", [SCRIPT], {
+      const runStable = (overrides: NodeJS.ProcessEnv = {}) =>
+        spawnSync("bash", [SCRIPT], {
+          env: {
+            ...process.env,
+            HOME: tmp,
+            XDG_BIN_HOME: path.join(tmp, "local-bin"),
+            NEMOCLAW_OPENSHELL_CHANNEL: "stable",
+            PATH: `${fakeBin}:/usr/bin:/bin`,
+            ...overrides,
+          },
+          encoding: "utf8",
+        });
+      const result = runStable();
+
+      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      const downloads = fs.readFileSync(downloadLog, "utf-8");
+      expect(downloads).toContain("openshell.rb");
+      expect(downloads).not.toContain("openshell-aarch64-apple-darwin.tar.gz");
+      const brewEvents = fs.readFileSync(brewLog, "utf-8").trim().split("\n");
+      expect(brewEvents).toEqual([
+        "tap-info nvidia/openshell",
+        "tap-new --no-git nvidia/openshell",
+        "--repository nvidia/openshell",
+        "help trust",
+        "trust --formula nvidia/openshell/openshell",
+        "list --formula openshell",
+        "install --formula nvidia/openshell/openshell",
+        "untrust --formula nvidia/openshell/openshell",
+        "--prefix",
+      ]);
+      expect(result.stdout).toContain(
+        "OpenShell Homebrew service staged; onboarding will start it after gateway validation.",
+      );
+      const stagedFormula = fs.readFileSync(path.join(tapRepo, "Formula", "openshell.rb"), "utf-8");
+      expect(stagedFormula).toContain("entitlements.write <<~XML");
+
+      for (const [listStatus, actionStatus, action, expectedStatus] of [
+        ["0", "0", "reinstall", 0],
+        ["1", "1", "install", 1],
+        ["0", "1", "reinstall", 1],
+      ] as const) {
+        fs.writeFileSync(brewLog, "");
+        fs.writeFileSync(untrustCount, "0");
+        const attempt = runStable({
+          NEMOCLAW_TEST_BREW_INSTALL_STATUS: actionStatus,
+          NEMOCLAW_TEST_BREW_LIST_STATUS: listStatus,
+        });
+        expect(attempt.status, `${attempt.stdout}\n${attempt.stderr}`).toBe(expectedStatus);
+        expect(fs.readFileSync(brewLog, "utf-8").trim().split("\n")).toEqual([
+          "tap-info nvidia/openshell",
+          "tap-new --no-git nvidia/openshell",
+          "--repository nvidia/openshell",
+          "help trust",
+          "trust --formula nvidia/openshell/openshell",
+          "list --formula openshell",
+          `${action} --formula nvidia/openshell/openshell`,
+          "untrust --formula nvidia/openshell/openshell",
+          ...(expectedStatus === 0 ? ["--prefix"] : []),
+        ]);
+        expect(fs.readFileSync(untrustCount, "utf-8").trim()).toBe("1");
+        expect(fs.existsSync(formulaTmpDir)).toBe(false);
+      }
+
+      fs.writeFileSync(brewLog, "");
+      const refusedTrust = spawnSync("bash", [SCRIPT], {
         env: {
           ...process.env,
           HOME: tmp,
           XDG_BIN_HOME: path.join(tmp, "local-bin"),
           NEMOCLAW_OPENSHELL_CHANNEL: "stable",
+          NEMOCLAW_TEST_BREW_TRUST_STATUS: "1",
           PATH: `${fakeBin}:/usr/bin:/bin`,
         },
         encoding: "utf8",
       });
 
-      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
-      const downloads = fs.readFileSync(downloadLog, "utf-8");
-      expect(downloads).toContain("openshell-aarch64-apple-darwin.tar.gz");
-      expect(downloads).toContain("openshell-gateway-aarch64-apple-darwin.tar.gz");
-      expect(downloads).not.toContain("openshell-driver-vm-aarch64-apple-darwin.tar.gz");
-      expect(downloads).toContain("openshell-gateway-checksums-sha256.txt");
+      expect(refusedTrust.status, `${refusedTrust.stdout}\n${refusedTrust.stderr}`).toBeGreaterThan(
+        0,
+      );
+      expect(refusedTrust.stderr).toContain(
+        "Homebrew refused to trust the checksum-verified OpenShell formula nvidia/openshell/openshell",
+      );
+      const refusedTrustEvents = fs.readFileSync(brewLog, "utf-8").trim().split("\n");
+      expect(refusedTrustEvents).toContain("help trust");
+      expect(refusedTrustEvents).toContain("trust --formula nvidia/openshell/openshell");
+      expect(refusedTrustEvents).not.toContain("install --formula nvidia/openshell/openshell");
+      expect(refusedTrustEvents).not.toContain("reinstall --formula nvidia/openshell/openshell");
+
+      fs.writeFileSync(brewLog, "");
+      const unsupportedTrust = spawnSync("bash", [SCRIPT], {
+        env: {
+          ...process.env,
+          HOME: tmp,
+          XDG_BIN_HOME: path.join(tmp, "local-bin"),
+          NEMOCLAW_OPENSHELL_CHANNEL: "stable",
+          NEMOCLAW_TEST_BREW_TRUST_HELP_STATUS: "1",
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+        },
+        encoding: "utf8",
+      });
+
+      expect(
+        unsupportedTrust.status,
+        `${unsupportedTrust.stdout}\n${unsupportedTrust.stderr}`,
+      ).toBe(0);
+      const unsupportedTrustEvents = fs.readFileSync(brewLog, "utf-8").trim().split("\n");
+      expect(unsupportedTrustEvents).toContain("help trust");
+      expect(unsupportedTrustEvents).not.toContain("trust --formula nvidia/openshell/openshell");
+      expect(unsupportedTrustEvents).toContain("install --formula nvidia/openshell/openshell");
+      expect(unsupportedTrust.stdout).toContain(
+        "OpenShell Homebrew service staged; onboarding will start it after gateway validation.",
+      );
+
+      fs.writeFileSync(brewLog, "");
+      const missingUntrust = spawnSync("bash", [SCRIPT], {
+        env: {
+          ...process.env,
+          HOME: tmp,
+          XDG_BIN_HOME: path.join(tmp, "local-bin"),
+          NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
+          NEMOCLAW_OPENSHELL_CHANNEL: "dev",
+          NEMOCLAW_TEST_BREW_UNTRUST_HELP_STATUS: "1",
+          NEMOCLAW_TEST_INSTALLED_VERSION: "0.0.101-dev.8+g7bce1223d",
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+        },
+        encoding: "utf8",
+      });
+
+      expect(
+        missingUntrust.status,
+        `${missingUntrust.stdout}\n${missingUntrust.stderr}`,
+      ).toBeGreaterThan(0);
+      expect(missingUntrust.stderr).toContain(
+        "Homebrew supports formula trust but not the required untrust cleanup",
+      );
+      const missingUntrustEvents = fs.readFileSync(brewLog, "utf-8").trim().split("\n");
+      expect(missingUntrustEvents).toContain("help trust");
+      expect(missingUntrustEvents).toContain("help untrust");
+      expect(missingUntrustEvents).not.toContain("untrust --formula nvidia/openshell/openshell");
+      expect(missingUntrustEvents).not.toContain("install --formula nvidia/openshell/openshell");
+
+      fs.writeFileSync(brewLog, "");
+      fs.writeFileSync(untrustCount, "0");
+      const refusedUntrust = spawnSync("bash", [SCRIPT], {
+        env: {
+          ...process.env,
+          HOME: tmp,
+          XDG_BIN_HOME: path.join(tmp, "local-bin"),
+          NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
+          NEMOCLAW_OPENSHELL_CHANNEL: "dev",
+          NEMOCLAW_TEST_BREW_UNTRUST_STATUS: "1",
+          NEMOCLAW_TEST_INSTALLED_VERSION: "0.0.101-dev.8+g7bce1223d",
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+        },
+        encoding: "utf8",
+      });
+
+      expect(
+        refusedUntrust.status,
+        `${refusedUntrust.stdout}\n${refusedUntrust.stderr}`,
+      ).toBeGreaterThan(0);
+      expect(refusedUntrust.stderr).toContain(
+        "Homebrew refused to remove inherited trust for the unverified OpenShell dev formula nvidia/openshell/openshell",
+      );
+      const refusedUntrustEvents = fs.readFileSync(brewLog, "utf-8").trim().split("\n");
+      expect(refusedUntrustEvents).toContain("help trust");
+      expect(refusedUntrustEvents).toContain("help untrust");
+      expect(refusedUntrustEvents).toContain("untrust --formula nvidia/openshell/openshell");
+      expect(refusedUntrustEvents).not.toContain("install --formula nvidia/openshell/openshell");
+
+      fs.writeFileSync(brewLog, "");
+      fs.writeFileSync(untrustCount, "0");
+      const failedCleanupUntrust = spawnSync("bash", [SCRIPT], {
+        env: {
+          ...process.env,
+          HOME: tmp,
+          XDG_BIN_HOME: path.join(tmp, "local-bin"),
+          NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
+          NEMOCLAW_OPENSHELL_CHANNEL: "dev",
+          NEMOCLAW_TEST_BREW_INSTALL_STATUS: "1",
+          NEMOCLAW_TEST_BREW_UNTRUST_CLEANUP_STATUS: "1",
+          NEMOCLAW_TEST_INSTALLED_VERSION: "0.0.101-dev.8+g7bce1223d",
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+        },
+        encoding: "utf8",
+      });
+
+      expect(
+        failedCleanupUntrust.status,
+        `${failedCleanupUntrust.stdout}\n${failedCleanupUntrust.stderr}`,
+      ).toBeGreaterThan(0);
+      expect(failedCleanupUntrust.stdout).toContain(
+        "Homebrew could not remove temporary trust for nvidia/openshell/openshell",
+      );
+      expect(fs.readFileSync(brewLog, "utf-8").trim().split("\n")).toEqual([
+        "tap-info nvidia/openshell",
+        "tap-new --no-git nvidia/openshell",
+        "--repository nvidia/openshell",
+        "help trust",
+        "help untrust",
+        "untrust --formula nvidia/openshell/openshell",
+        "list --formula openshell",
+        "install --formula nvidia/openshell/openshell",
+        "untrust --formula nvidia/openshell/openshell",
+      ]);
+      expect(fs.existsSync(path.join(formulaTmpDir, "openshell.rb"))).toBe(true);
+
+      fs.writeFileSync(brewLog, "");
+      fs.writeFileSync(untrustCount, "0");
+      const devInstall = spawnSync("bash", [SCRIPT], {
+        env: {
+          ...process.env,
+          HOME: tmp,
+          XDG_BIN_HOME: path.join(tmp, "local-bin"),
+          NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
+          NEMOCLAW_OPENSHELL_CHANNEL: "dev",
+          NEMOCLAW_TEST_BREW_TRUST_STATUS: "1",
+          NEMOCLAW_TEST_INSTALLED_VERSION: "0.0.101-dev.8+g7bce1223d",
+          PATH: `${fakeBin}:/usr/bin:/bin`,
+        },
+        encoding: "utf8",
+      });
+
+      expect(devInstall.status, `${devInstall.stdout}\n${devInstall.stderr}`).toBe(0);
+      const devBrewEvents = fs.readFileSync(brewLog, "utf-8").trim().split("\n");
+      expect(devBrewEvents).toEqual([
+        "tap-info nvidia/openshell",
+        "tap-new --no-git nvidia/openshell",
+        "--repository nvidia/openshell",
+        "help trust",
+        "help untrust",
+        "untrust --formula nvidia/openshell/openshell",
+        "list --formula openshell",
+        "install --formula nvidia/openshell/openshell",
+        "untrust --formula nvidia/openshell/openshell",
+        "--prefix",
+      ]);
+      expect(devBrewEvents).not.toContain("trust --formula nvidia/openshell/openshell");
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -596,17 +991,21 @@ printf '%s\n' 'checksum OK'`,
       writeExecutable(
         path.join(fakeBin, "tar"),
         `#!/usr/bin/env bash
+case "$*" in
+*openshell-gateway*) name="openshell-gateway" ;;
+*openshell-sandbox*) name="openshell-sandbox" ;;
+*) name="openshell" ;;
+esac
+case "\${1:-}" in
+-tzf) printf '%s\\n' "$name"; exit 0 ;;
+-tvzf) printf '%s\\n' "-rwxr-xr-x 0/0 1 2026-01-01 00:00 $name"; exit 0 ;;
+esac
 outdir=""
 prev=""
 for arg in "$@"; do
   if [ "$prev" = "-C" ]; then outdir="$arg"; break; fi
   prev="$arg"
 done
-case "$*" in
-*openshell-gateway*) name="openshell-gateway" ;;
-*openshell-sandbox*) name="openshell-sandbox" ;;
-*) name="openshell" ;;
-esac
 printf '#!/usr/bin/env bash\nexit 0\n' > "$outdir/$name"
 chmod 755 "$outdir/$name"`,
       );
@@ -723,6 +1122,15 @@ exit 0`,
       writeExecutable(
         path.join(fakeBin, "tar"),
         `#!/usr/bin/env bash
+case "$*" in
+*openshell-gateway*) name="openshell-gateway" ;;
+*openshell-sandbox*) name="openshell-sandbox" ;;
+*) name="openshell" ;;
+esac
+case "\${1:-}" in
+-tzf) printf '%s\\n' "$name"; exit 0 ;;
+-tvzf) printf '%s\\n' "-rwxr-xr-x 0/0 1 2026-01-01 00:00 $name"; exit 0 ;;
+esac
 outdir=""
 prev=""
 for arg in "$@"; do
@@ -733,11 +1141,6 @@ for arg in "$@"; do
   prev="$arg"
 done
 [ -n "$outdir" ] || exit 1
-case "$*" in
-*openshell-gateway*) name="openshell-gateway" ;;
-*openshell-sandbox*) name="openshell-sandbox" ;;
-*) name="openshell" ;;
-esac
 printf '#!/usr/bin/env bash\\nexit 0\\n' > "$outdir/$name"
 chmod 755 "$outdir/$name"
 exit 0`,
@@ -876,7 +1279,7 @@ exit 0`,
 
       expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(1);
       expect(result.stderr).toContain(
-        "OpenShell release checksum for openshell-x86_64-unknown-linux-musl.tar.gz does not match NemoClaw-pinned v0.0.72 digest",
+        "OpenShell release checksum for openshell-x86_64-unknown-linux-musl.tar.gz does not match NemoClaw-pinned v0.0.101 digest",
       );
       expect(fs.existsSync(tarLog) ? fs.readFileSync(tarLog, "utf-8") : "").toBe("");
       expect(fs.existsSync(installLog) ? fs.readFileSync(installLog, "utf-8") : "").toBe("");
@@ -911,7 +1314,7 @@ exit 0`,
   });
 
   it("reinstalls the pinned release when openshell is above MAX_VERSION", () => {
-    const result = runWithInstalledVersion("0.0.73");
+    const result = runWithInstalledVersion("0.0.102");
     expect(result.status).not.toBe(0);
     expect(result.stdout).toContain(
       `above the maximum (${REQUIRED_OPENSHELL_VERSION}) supported by this NemoClaw release`,
@@ -937,7 +1340,7 @@ exit 0`,
   });
 
   it("accepts an installed OpenShell dev-channel Docker-driver build", () => {
-    const result = runWithInstalledVersion("0.0.72.dev84+g6b2180425", {
+    const result = runWithInstalledVersion("0.0.101.dev84+g6b2180425", {
       NEMOCLAW_OPENSHELL_CHANNEL: "dev",
       NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
     });
@@ -947,7 +1350,7 @@ exit 0`,
   });
 
   it("fails closed for dev-channel installs without explicit risk acceptance", () => {
-    const result = runWithInstalledVersion("0.0.72.dev84+g6b2180425", {
+    const result = runWithInstalledVersion("0.0.101.dev84+g6b2180425", {
       NEMOCLAW_OPENSHELL_CHANNEL: "dev",
     });
     expect(result.status).toBe(1);
@@ -958,12 +1361,12 @@ exit 0`,
 
   it("accepts coherent dev components with different git-prefix lengths", () => {
     const result = runWithInstalledVersion(
-      "0.0.72-dev.8+g7bce1223d",
+      "0.0.101-dev.8+g7bce1223d",
       {
         NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
         NEMOCLAW_OPENSHELL_CHANNEL: "dev",
       },
-      { driverVersion: "0.0.72-dev.8+g7bce1223" },
+      { driverVersion: "0.0.101-dev.8+g7bce1223" },
     );
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout).toMatch(/dev channel/);
@@ -996,9 +1399,9 @@ exit 0`,
     expect(result.stdout).toContain("Installing OpenShell from release 'dev'");
   });
 
-  it("reuses a macOS dev build with its required standalone gateway", () => {
+  it("reuses a macOS dev build with its required Homebrew gateway service", () => {
     const result = runWithInstalledVersion(
-      "0.0.72-dev.8+g7bce1223d",
+      "0.0.101-dev.8+g7bce1223d",
       {
         NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
         NEMOCLAW_OPENSHELL_CHANNEL: "dev",
@@ -1010,7 +1413,7 @@ exit 0`,
   });
 
   it("refreshes an installed dev build when current main is required", () => {
-    const result = runWithInstalledVersion("0.0.72-dev.8+g7bce1223d", {
+    const result = runWithInstalledVersion("0.0.101-dev.8+g7bce1223d", {
       NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
       NEMOCLAW_OPENSHELL_CHANNEL: "dev",
       NEMOCLAW_OPENSHELL_FORCE_INSTALL: "1",
@@ -1030,29 +1433,6 @@ exit 0`,
       `Installing OpenShell from release 'v${REQUIRED_OPENSHELL_VERSION}'`,
     );
     expect(result.stdout).not.toContain("Installing OpenShell from release 'dev'");
-  });
-
-  it("preserves the rebuild Hermes requested channel through the real installer boundary", () => {
-    const childEnv = buildRebuildHermesChildEnv(
-      {
-        HOME: process.env.HOME,
-        PATH: process.env.PATH,
-        NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL: "1",
-        NEMOCLAW_OPENSHELL_CHANNEL: "dev",
-        NVIDIA_API_KEY: "must-not-reach-child",
-      },
-      {},
-    );
-    const result = runWithInstalledVersion("0.0.36", childEnv);
-
-    expect(childEnv.NEMOCLAW_ACCEPT_DEV_UNVERIFIED_INSTALL).toBe("1");
-    expect(childEnv.NEMOCLAW_OPENSHELL_CHANNEL).toBe("dev");
-    expect(childEnv.NVIDIA_API_KEY).toBeUndefined();
-    expect(result.status).not.toBe(0);
-    expect(result.stdout).toContain("Installing OpenShell from release 'dev'");
-    expect(result.stdout).not.toContain(
-      `Installing OpenShell from release 'v${REQUIRED_OPENSHELL_VERSION}'`,
-    );
   });
 
   it("upgrades stable OpenShell when the dev channel is requested", () => {

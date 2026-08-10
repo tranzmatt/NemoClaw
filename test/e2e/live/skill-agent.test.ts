@@ -13,6 +13,7 @@ import {
 } from "../fixtures/clients/sandbox.ts";
 import { expect, test } from "../fixtures/e2e-test.ts";
 import { requireHostedInferenceConfig } from "../fixtures/hosted-inference.ts";
+import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
 import {
   agentSectionContainsToken,
   isAgentVerificationFailClosed,
@@ -20,9 +21,8 @@ import {
   shouldSkipExternalAgentVerificationFailure,
   VERIFY_PHRASE,
 } from "../support/skill-agent-classifiers.ts";
-import { CLI_ENTRYPOINT, REPO_ROOT } from "../fixtures/paths.ts";
 
-// Keep this as a direct live test: the the contract is skill fixture
+// Keep this as a direct live test: the contract is skill fixture
 // injection into a real OpenClaw sandbox plus an agent turn that must read
 // hands off to this live target.
 
@@ -60,8 +60,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 function buildVerifySkillFixtureScript(): string {
-  // OpenShell rejects newline-bearing command args, so keep this readable as
-  // discrete clauses while emitting a single-line `sh -lc` script.
+  // Keep this readable as discrete clauses while emitting one atomic `sh -lc`
+  // expression with consistent error propagation.
   const skillPaths = [
     `/sandbox/.openclaw/skills/${SKILL_ID}/SKILL.md`,
     `\${HOME:-/home/sandbox}/.openclaw/skills/${SKILL_ID}/SKILL.md`,
@@ -102,9 +102,22 @@ async function ignoreCleanupError(run: () => Promise<unknown>): Promise<void> {
   }
 }
 
+// biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
 test(
   "skill-agent: injected sandbox skill is read by a real OpenClaw agent turn",
-  async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
+  {
+    timeout: 30 * 60_000,
+    meta: {
+      e2ePhases: [
+        "confirm Docker and skill tooling",
+        "onboard the OpenClaw skill sandbox",
+        "inject and confirm the skill fixture",
+        "ask the agent to consume the skill",
+        "record the verified skill behavior",
+      ],
+    },
+  },
+  async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
     expect(
       fs.existsSync(CLI_ENTRYPOINT),
       "run `npm run build:cli` before live repo CLI targets",
@@ -147,6 +160,41 @@ test(
 
     let sandboxProvisioned = false;
     const cleanupEnv = buildAvailabilityProbeEnv();
+    type CleanupAttemptState = {
+      outcome: "pending" | "passed" | "failed";
+      error?: string;
+    };
+    const cleanupAttempts: {
+      nemoclaw: CleanupAttemptState;
+      openshell: CleanupAttemptState;
+    } = {
+      nemoclaw: { outcome: "pending" },
+      openshell: { outcome: "pending" },
+    };
+    const cleanupResultEvidence = (artifactName: string) => {
+      const resultArtifact = `shell/${artifactName}.result.json`;
+      try {
+        const result = JSON.parse(fs.readFileSync(artifacts.pathFor(resultArtifact), "utf8")) as {
+          exitCode: number | null;
+          signal: NodeJS.Signals | null;
+          timedOut: boolean;
+        };
+        return {
+          exitCode: result.exitCode,
+          resultArtifact,
+          signal: result.signal,
+          timedOut: result.timedOut,
+        };
+      } catch (error) {
+        return {
+          evidenceError: error instanceof Error ? error.message : String(error),
+          exitCode: null,
+          resultArtifact,
+          signal: null,
+          timedOut: null,
+        };
+      }
+    };
     await ignoreCleanupError(() =>
       host.command("node", [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes"], {
         artifactName: "pre-cleanup-nemoclaw-destroy-skill-agent",
@@ -162,33 +210,59 @@ test(
       }),
     );
 
-    cleanup.add(`destroy skill-agent sandbox ${SANDBOX_NAME}`, async () => {
-      const destroy = await host.command(
-        "node",
-        [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes"],
-        {
-          artifactName: "cleanup-nemoclaw-destroy-skill-agent",
-          env: buildAvailabilityProbeEnv(),
-          timeoutMs: 120_000,
-        },
-      );
-      const deleteSandbox = await sandbox.openshell(["sandbox", "delete", SANDBOX_NAME], {
-        artifactName: "cleanup-openshell-sandbox-delete-skill-agent",
-        env: buildAvailabilityProbeEnv(),
-        timeoutMs: 60_000,
-      });
+    cleanup.trackDisposable("write skill-agent cleanup summary", async () => {
+      const destroyEvidence = cleanupResultEvidence("cleanup-nemoclaw-destroy-skill-agent");
+      const deleteEvidence = cleanupResultEvidence("cleanup-openshell-sandbox-delete-skill-agent");
       await artifacts.writeJson("cleanup-skill-agent-summary.json", {
         sandboxProvisioned,
-        destroyExitCode: destroy.exitCode,
-        deleteExitCode: deleteSandbox.exitCode,
+        destroyExitCode: destroyEvidence.exitCode,
+        deleteExitCode: deleteEvidence.exitCode,
+        resources: ["nemoclaw sandbox", "OpenShell sandbox fallback"],
+        attempts: {
+          nemoclaw: { ...cleanupAttempts.nemoclaw, ...destroyEvidence },
+          openshell: { ...cleanupAttempts.openshell, ...deleteEvidence },
+        },
       });
-      if (sandboxProvisioned && destroy.exitCode !== 0 && deleteSandbox.exitCode !== 0) {
-        throw new Error(
-          `skill-agent cleanup failed\n${resultText(destroy)}\n${resultText(deleteSandbox)}`,
-        );
+    });
+    const openshellCleanupOptions = {
+      artifactName: "cleanup-openshell-sandbox-delete-skill-agent",
+      env: buildAvailabilityProbeEnv(),
+      timeoutMs: 60_000,
+    };
+    cleanup.trackDisposable(`delete OpenShell sandbox ${SANDBOX_NAME}`, async () => {
+      try {
+        await sandbox.cleanupSandbox(SANDBOX_NAME, openshellCleanupOptions);
+        cleanupAttempts.openshell.outcome = "passed";
+      } catch (error) {
+        cleanupAttempts.openshell.outcome = "failed";
+        cleanupAttempts.openshell.error = error instanceof Error ? error.message : String(error);
+        throw error;
       }
     });
+    const nemoclawCleanupOptions = {
+      artifactName: "cleanup-nemoclaw-destroy-skill-agent",
+      env: buildAvailabilityProbeEnv(),
+      redactionValues: [apiKey],
+      timeoutMs: 120_000,
+    };
+    cleanup.trackSandbox(
+      {
+        cleanupSandbox: async (name: string) => {
+          try {
+            await host.cleanupSandbox(name, nemoclawCleanupOptions);
+            cleanupAttempts.nemoclaw.outcome = "passed";
+          } catch (error) {
+            cleanupAttempts.nemoclaw.outcome = "failed";
+            cleanupAttempts.nemoclaw.error = error instanceof Error ? error.message : String(error);
+            throw error;
+          }
+        },
+      },
+      SANDBOX_NAME,
+      nemoclawCleanupOptions,
+    );
 
+    progress.phase("onboard the OpenClaw skill sandbox");
     const onboard = await host.command(
       "node",
       [
@@ -230,6 +304,7 @@ test(
     expect(onboard.exitCode, onboardText).toBe(0);
     sandboxProvisioned = true;
 
+    progress.phase("inject and confirm the skill fixture");
     const addSkill = await host.command("bash", [ADD_SKILL_SCRIPT], {
       artifactName: "add-sandbox-skill-fixture",
       cwd: REPO_ROOT,
@@ -251,6 +326,7 @@ test(
     let lastExitCode: number | null = null;
     const attempts = Math.max(1, Number.isFinite(MAX_ATTEMPTS) ? MAX_ATTEMPTS : 3);
 
+    progress.phase("ask the agent to consume the skill");
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       const verify = await host.command("bash", [VERIFY_SKILL_SCRIPT], {
         artifactName: `verify-sandbox-skill-via-agent-${attempt}`,
@@ -302,6 +378,7 @@ test(
       `Agent did not return ${VERIFY_PHRASE}; last exit ${lastExitCode}\n${lastAgentOutput.slice(-12_000)}`,
     ).toBe(true);
 
+    progress.phase("record the verified skill behavior");
     await artifacts.target.complete({
       id: "skill-agent",
       status: "passed",
@@ -313,5 +390,4 @@ test(
       },
     });
   },
-  30 * 60_000,
 );

@@ -4,7 +4,7 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Mock heavy dependencies that pull in the full module graph
 vi.mock("../adapters/openshell/resolve.js", () => ({
@@ -63,26 +63,44 @@ vi.mock("child_process", async (importOriginal) => {
 import { spawnSync } from "child_process";
 import { captureSandboxSshConfigCommand } from "../adapters/openshell/client.js";
 import { OPENSHELL_PROBE_TIMEOUT_MS } from "../adapters/openshell/timeouts.js";
-import * as registry from "../state/registry.js";
-import { checkAgentVersion, formatStalenessWarning } from "./version.js";
+
+// state/registry captures the registry path at module scope, so HOME must be
+// redirected before it loads. Static ESM imports are hoisted above this
+// assignment, hence the dynamic imports below; reassigning HOME from
+// beforeEach() would be too late and every registerSandbox() would land in the
+// developer's real ~/.nemoclaw/sandboxes.json (#6553).
+const TEST_HOME = mkdtempSync(join(tmpdir(), "sandbox-ver-test-"));
+const ORIGINAL_HOME = process.env.HOME;
+process.env.HOME = TEST_HOME;
+
+const registry = await import("../state/registry.js");
+const { checkAgentVersion, formatStalenessWarning } = await import("./version.js");
+
+const TEST_REGISTRY_FILE = join(TEST_HOME, ".nemoclaw", "sandboxes.json");
+
+function resetTestRegistry(): void {
+  mkdirSync(dirname(TEST_REGISTRY_FILE), { recursive: true });
+  writeFileSync(TEST_REGISTRY_FILE, JSON.stringify({ sandboxes: {}, defaultSandbox: null }));
+}
+
+afterAll(() => {
+  process.env.HOME = ORIGINAL_HOME;
+  rmSync(TEST_HOME, { recursive: true, force: true });
+});
+
+describe("registry isolation", () => {
+  it("resolves the registry inside the test HOME, never the real one (#6553)", () => {
+    expect(registry.REGISTRY_FILE).toBe(TEST_REGISTRY_FILE);
+    expect(registry.REGISTRY_FILE.startsWith(TEST_HOME)).toBe(true);
+  });
+});
 
 describe("checkAgentVersion", () => {
-  let tmpDir: string;
-  const originalHome = process.env.HOME;
-
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "sandbox-ver-test-"));
-    process.env.HOME = tmpDir;
-    mkdirSync(join(tmpDir, ".nemoclaw"), { recursive: true });
-    writeFileSync(
-      join(tmpDir, ".nemoclaw", "sandboxes.json"),
-      JSON.stringify({ sandboxes: {}, defaultSandbox: null }),
-    );
+    resetTestRegistry();
   });
 
   afterEach(() => {
-    process.env.HOME = originalHome;
-    rmSync(tmpDir, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
 
@@ -144,12 +162,17 @@ describe("checkAgentVersion", () => {
     expect(result.detectionMethod).toBe("ssh-exec");
     expect(result.sandboxVersion).toBe("2026.5.27");
     expect(result.isStale).toBe(false);
+    // A row that pre-dates the per-port migration resolves to the canonical
+    // default gateway, and the probe pins to it explicitly rather than
+    // inheriting OpenShell's current selection (#7429).
     expect(captureSandboxSshConfigCommand).toHaveBeenCalledWith(
       "/usr/local/bin/openshell",
       "test-sb",
-      { ignoreError: true, timeout: OPENSHELL_PROBE_TIMEOUT_MS },
+      { ignoreError: true, timeout: OPENSHELL_PROBE_TIMEOUT_MS, gatewayName: "nemoclaw" },
     );
     const sshArgs = vi.mocked(spawnSync).mock.calls[0]?.[1] as string[];
+    expect(sshArgs).toContain("openshell-test-sb.default");
+    expect(sshArgs).not.toContain("openshell-test-sb");
     const configFile = sshArgs[sshArgs.indexOf("-F") + 1];
     const configDir = dirname(configFile);
     expect(configDir).not.toBe(tmpdir());
@@ -160,6 +183,103 @@ describe("checkAgentVersion", () => {
     // Should have cached the version in registry
     const updated = registry.getSandbox("test-sb");
     expect(updated?.agentVersion).toBe("2026.5.27");
+  });
+
+  it("probes the sandbox's own recorded gateway, not OpenShell's ambient selection (#7429)", () => {
+    // A sandbox onboarded under a non-default NEMOCLAW_GATEWAY_PORT is
+    // registered against `nemoclaw-<port>`. `openshell sandbox get` /
+    // `ssh-config` fall back to OpenShell's mutable current selection when no
+    // gateway is given, so an unscoped probe queries the wrong gateway,
+    // returns "not found", and the sandbox is reported as `v?` even though the
+    // gateway-scoped sandbox listing observed it as live.
+    registry.registerSandbox({ name: "test-sb", agent: null, gatewayPort: 18080 });
+
+    vi.mocked(captureSandboxSshConfigCommand).mockReturnValue({
+      status: 0,
+      output: "Host openshell-test-sb\n  HostName 127.0.0.1\n",
+    });
+    vi.mocked(spawnSync).mockReturnValue({
+      status: 0,
+      stdout: "OpenClaw 2026.5.27 (abc123)\n",
+      stderr: "",
+      pid: 1234,
+      output: [],
+      signal: null,
+    });
+
+    const result = checkAgentVersion("test-sb", { forceProbe: true });
+
+    expect(result.detectionMethod).toBe("ssh-exec");
+    expect(captureSandboxSshConfigCommand).toHaveBeenCalledWith(
+      "/usr/local/bin/openshell",
+      "test-sb",
+      {
+        ignoreError: true,
+        timeout: OPENSHELL_PROBE_TIMEOUT_MS,
+        gatewayName: "nemoclaw-18080",
+      },
+    );
+  });
+
+  it("scopes a Hermes sandbox on a non-default gateway to its own gateway (#7429)", () => {
+    // The exact reported topology: a Hermes sandbox onboarded under a
+    // non-default NEMOCLAW_GATEWAY_PORT. Before the fix the probe queried
+    // OpenShell's ambient selection, came back "not found", and
+    // `upgrade-sandboxes --check` printed `v? → v0.18.0`.
+    registry.registerSandbox({ name: "hermes-sb", agent: "hermes", gatewayPort: 18080 });
+
+    vi.mocked(captureSandboxSshConfigCommand).mockReturnValue({
+      status: 0,
+      output: "Host openshell-hermes-sb\n  HostName 127.0.0.1\n",
+    });
+    vi.mocked(spawnSync).mockReturnValue({
+      status: 0,
+      stdout: "Hermes Agent 0.17.0\n",
+      stderr: "",
+      pid: 1234,
+      output: [],
+      signal: null,
+    });
+
+    const result = checkAgentVersion("hermes-sb", { forceProbe: true });
+
+    expect(captureSandboxSshConfigCommand).toHaveBeenCalledWith(
+      "/usr/local/bin/openshell",
+      "hermes-sb",
+      {
+        ignoreError: true,
+        timeout: OPENSHELL_PROBE_TIMEOUT_MS,
+        gatewayName: "nemoclaw-18080",
+      },
+    );
+    // The version resolves instead of landing in the "Unknown version" bucket.
+    expect(result.detectionMethod).toBe("ssh-exec");
+    expect(result.sandboxVersion).toBe("0.17.0");
+    expect(result.verificationFailed).toBe(false);
+    // The Hermes agent definition drives the probe, not the openclaw default.
+    const sshArgs = vi.mocked(spawnSync).mock.calls[0]?.[1] as string[];
+    expect(sshArgs).toContain("hermes --version");
+  });
+
+  it("does not probe at all when the persisted gateway binding is corrupted (#7429)", () => {
+    // resolveSandboxGatewayName fails closed on an invalid binding. Falling
+    // back to an unscoped probe would defeat that: OpenShell would resolve the
+    // name against its ambient selection, so a same-named sandbox on another
+    // gateway could be probed and its version cached onto this row. A row with
+    // no binding fields resolves to the canonical default instead of throwing,
+    // so this path is reached only by genuinely corrupted state.
+    registry.registerSandbox({ name: "test-sb", agent: null, gatewayName: "not-a-nemoclaw-gw" });
+
+    const result = checkAgentVersion("test-sb", { forceProbe: true });
+
+    expect(captureSandboxSshConfigCommand).not.toHaveBeenCalled();
+    expect(spawnSync).not.toHaveBeenCalled();
+    // No probe was attempted, so the contract's `unavailable` applies —
+    // `unknown`/`probe-failed` would claim a probe ran and failed.
+    expect(result.detectionMethod).toBe("unavailable");
+    expect(result.unavailableReason).toBe("invalid-gateway-binding");
+    expect(result.verificationFailed).toBe(true);
+    expect(result.sandboxVersion).toBeNull();
   });
 
   it("returns an unknown verdict when SSH config fails so callers do not read isStale as verified current", () => {
@@ -424,23 +544,9 @@ describe("checkAgentVersion", () => {
 });
 
 describe("formatStalenessWarning", () => {
-  let tmpDir: string;
-  const originalHome = process.env.HOME;
-
   beforeEach(() => {
-    tmpDir = mkdtempSync(join(tmpdir(), "sandbox-warn-test-"));
-    process.env.HOME = tmpDir;
-    mkdirSync(join(tmpDir, ".nemoclaw"), { recursive: true });
-    writeFileSync(
-      join(tmpDir, ".nemoclaw", "sandboxes.json"),
-      JSON.stringify({ sandboxes: {}, defaultSandbox: null }),
-    );
+    resetTestRegistry();
     registry.registerSandbox({ name: "my-sb", agent: null });
-  });
-
-  afterEach(() => {
-    process.env.HOME = originalHome;
-    rmSync(tmpDir, { recursive: true, force: true });
   });
 
   it("includes sandbox name, versions, and rebuild hint", () => {

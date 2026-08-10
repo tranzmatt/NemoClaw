@@ -23,6 +23,9 @@ describe("onboard managed MCP recreation redirect", () => {
     const onboardPath = JSON.stringify(path.join(repoRoot, "src", "lib", "onboard.ts"));
     const runnerPath = JSON.stringify(path.join(repoRoot, "src", "lib", "runner.ts"));
     const registryPath = JSON.stringify(path.join(repoRoot, "src", "lib", "state", "registry.ts"));
+    const dcodePolicyPath = JSON.stringify(
+      path.join(repoRoot, "agents", "langchain-deepagents-code", "policy-additions.yaml"),
+    );
     const mocksPath = JSON.stringify(
       path.join(repoRoot, "test", "helpers", "onboard-script-mocks.cjs"),
     );
@@ -64,7 +67,7 @@ registry.getDefault = () => null;
 const { createSandbox } = require(${onboardPath});
 createSandbox(
   null, "model", "provider", "openai-completions", "alpha", null, null, null,
-  { name: "langchain-deepagents-code" }, null, null, null, [], null,
+  { name: "langchain-deepagents-code", policyAdditionsPath: ${dcodePolicyPath} }, null, null, null, [], null,
   {
     recreate: true,
     toolDisclosure: "progressive",
@@ -84,6 +87,7 @@ createSandbox(
           HOME: tmpDir,
           PATH: `${fakeBin}:${process.env.PATH || ""}`,
           NEMOCLAW_NON_INTERACTIVE: "1",
+          NEMOCLAW_TEST_MANAGED_IMAGE_FALLBACK: "1",
           NEMOCLAW_RECREATE_WITHOUT_BACKUP: "1",
         },
       });

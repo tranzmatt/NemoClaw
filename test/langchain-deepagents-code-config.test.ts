@@ -24,7 +24,7 @@ afterEach(() => {
 });
 
 function runGeneratorProcess(
-  env: Record<string, string>,
+  env: Record<string, string | undefined>,
 ): SpawnSyncReturns<string> & { home: string } {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-dcode-config-"));
   tmpHomes.push(home);
@@ -34,26 +34,34 @@ function runGeneratorProcess(
     "langchain-deepagents-code",
     "generate-config.ts",
   );
+  const definedOverrides = Object.fromEntries(
+    Object.entries(env).filter(([, value]) => value !== undefined),
+  );
+  const childEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: home,
+    NEMOCLAW_MODEL: "nvidia/nemotron-3-super-120b-a12b",
+    NEMOCLAW_INFERENCE_PROVIDER_ID: "inference",
+    NEMOCLAW_UPSTREAM_PROVIDER: "nvidia-prod",
+    NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
+    NEMOCLAW_INFERENCE_API: "openai-completions",
+    NEMOCLAW_REASONING_EFFORT: "",
+    ...definedOverrides,
+  };
+  Object.entries(env)
+    .filter(([, value]) => value === undefined)
+    .forEach(([name]) => Reflect.deleteProperty(childEnv, name));
   return {
     ...spawnSync(process.execPath, ["--experimental-strip-types", script], {
       cwd: process.cwd(),
       encoding: "utf8",
-      env: {
-        ...process.env,
-        HOME: home,
-        NEMOCLAW_MODEL: "nvidia/nemotron-3-super-120b-a12b",
-        NEMOCLAW_PROVIDER_KEY: "inference",
-        NEMOCLAW_UPSTREAM_PROVIDER: "nvidia-prod",
-        NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
-        NEMOCLAW_INFERENCE_API: "openai-completions",
-        ...env,
-      },
+      env: childEnv,
     }),
     home,
   };
 }
 
-function runGenerator(env: Record<string, string>): string {
+function runGenerator(env: Record<string, string | undefined>): string {
   const result = runGeneratorProcess(env);
   expect(result.status).toBe(0);
   return fs.readFileSync(path.join(result.home, ".deepagents", "config.toml"), "utf8");
@@ -70,9 +78,25 @@ describe("LangChain Deep Agents Code config generator", () => {
       "# NemoClaw provider route: inference; upstream provider: nvidia-prod; API: openai-completions.",
     );
     expect(config).toContain("use_responses_api = false");
+    expect(config).not.toContain("force_nonempty_content");
     expect(config).toContain("check = false");
     expect(config).toContain("auto_update = false");
+    expect(config).toContain("[warnings]");
+    expect(config).toContain('suppress = ["tavily"]');
     expect(config).not.toMatch(/NVIDIA_API_KEY|OPENAI_API_KEY=|sk-/);
+  });
+
+  it("keeps the legacy provider key when the renamed route variables are absent", () => {
+    const config = runGenerator({
+      NEMOCLAW_PROVIDER_KEY: "legacy-route",
+      NEMOCLAW_INFERENCE_PROVIDER_ID: undefined,
+      NEMOCLAW_UPSTREAM_PROVIDER: undefined,
+    });
+
+    expect(config).toContain('default = "openai:nvidia/nemotron-3-super-120b-a12b"');
+    expect(config).toContain(
+      "# NemoClaw provider route: legacy-route; upstream provider: legacy-route; API: openai-completions.",
+    );
   });
 
   it("does not double-prefix provider-qualified model names", () => {
@@ -80,6 +104,123 @@ describe("LangChain Deep Agents Code config generator", () => {
 
     expect(config).toContain('default = "openai:gpt-oss-120b"');
     expect(config).toContain('models = ["gpt-oss-120b"]');
+  });
+
+  it("uses the native Deep Agents OpenRouter provider for OpenRouter routes (#6549)", () => {
+    const config = runGenerator({
+      NEMOCLAW_MODEL: "nvidia/nemotron-3-ultra-550b-a55b",
+      NEMOCLAW_UPSTREAM_PROVIDER: "openrouter-api",
+    });
+
+    expect(config).toContain('default = "openrouter:nvidia/nemotron-3-ultra-550b-a55b"');
+    expect(config).toContain("[models.providers.openrouter]");
+    expect(config).toContain('models = ["nvidia/nemotron-3-ultra-550b-a55b"]');
+    expect(config).toContain('api_key_env = "DEEPAGENTS_CODE_OPENAI_API_KEY"');
+    expect(config).toContain('base_url = "https://inference.local/v1"');
+    expect(config).toContain(
+      "# NemoClaw provider route: inference; upstream provider: openrouter-api; API: openai-completions.",
+    );
+    expect(config).not.toContain("[models.providers.openai]");
+    expect(config).not.toContain("use_responses_api");
+    expect(config).not.toContain("force_nonempty_content");
+  });
+
+  it("uses the native OpenRouter provider for compatible-endpoint OpenRouter routes (#6549)", () => {
+    const config = runGenerator({
+      NEMOCLAW_MODEL: "nvidia/nemotron-3-ultra-550b-a55b",
+      NEMOCLAW_UPSTREAM_PROVIDER: "compatible-endpoint",
+      NEMOCLAW_UPSTREAM_ENDPOINT_URL: "https://openrouter.ai/api/v1",
+      NEMOCLAW_INFERENCE_BASE_URL: "https://inference.local/v1",
+    });
+
+    expect(config).toContain('default = "openrouter:nvidia/nemotron-3-ultra-550b-a55b"');
+    expect(config).toContain("[models.providers.openrouter]");
+    expect(config).toContain('api_key_env = "DEEPAGENTS_CODE_OPENAI_API_KEY"');
+    expect(config).toContain('base_url = "https://inference.local/v1"');
+    expect(config).toContain(
+      "# NemoClaw provider route: inference; upstream provider: compatible-endpoint; API: openai-completions.",
+    );
+    expect(config).not.toContain("[models.providers.openai]");
+    expect(config).not.toContain("use_responses_api");
+    expect(config).not.toContain("force_nonempty_content");
+  });
+
+  it("keeps ordinary compatible-endpoint routes on the OpenAI-compatible provider", () => {
+    const config = runGenerator({
+      NEMOCLAW_UPSTREAM_PROVIDER: "compatible-endpoint",
+      NEMOCLAW_UPSTREAM_ENDPOINT_URL: "https://example.test/v1",
+    });
+
+    expect(config).toContain('default = "openai:nvidia/nemotron-3-super-120b-a12b"');
+    expect(config).toContain("[models.providers.openai]");
+    expect(config).not.toContain("[models.providers.openrouter]");
+  });
+
+  it("rejects upstream endpoint URLs with control characters before writing config", () => {
+    const result = runGeneratorProcess({
+      NEMOCLAW_UPSTREAM_PROVIDER: "compatible-endpoint",
+      NEMOCLAW_UPSTREAM_ENDPOINT_URL: "https://example.test/v1\t[update]",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "NEMOCLAW_UPSTREAM_ENDPOINT_URL must not contain control characters.",
+    );
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("[update]");
+    expect(fs.existsSync(path.join(result.home, ".deepagents", "config.toml"))).toBe(false);
+  });
+
+  it.each([
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "nvidia/nvidia/nemotron-3-ultra",
+  ])("adds the required coding-agent request options for %s", (model) => {
+    const config = runGenerator({ NEMOCLAW_MODEL: model });
+
+    expect(config).toContain(`[models.providers.openai.params."${model}"]`);
+    expect(config).toContain(
+      "extra_body = { chat_template_kwargs = { force_nonempty_content = true } }",
+    );
+  });
+
+  it.each([
+    "low",
+    "medium",
+    "high",
+  ])("records the onboarding reasoning effort as a managed request parameter: %s (#7938)", (effort) => {
+    const config = runGenerator({ NEMOCLAW_REASONING_EFFORT: effort });
+
+    expect(config).toContain(
+      '[models.providers.openai.params."nvidia/nemotron-3-super-120b-a12b"]',
+    );
+    expect(config).toContain(`extra_body = { reasoning_effort = "${effort}" }`);
+  });
+
+  it("keeps both managed request parameters for an Ultra model with a reasoning effort (#7938)", () => {
+    const config = runGenerator({
+      NEMOCLAW_MODEL: "nvidia/nemotron-3-ultra-550b-a55b",
+      NEMOCLAW_REASONING_EFFORT: "high",
+    });
+
+    expect(config).toContain(
+      'extra_body = { chat_template_kwargs = { force_nonempty_content = true }, reasoning_effort = "high" }',
+    );
+  });
+
+  it("omits the request parameter table when onboarding recorded no reasoning effort (#7938)", () => {
+    const config = runGenerator({ NEMOCLAW_REASONING_EFFORT: undefined });
+
+    expect(config).not.toContain("reasoning_effort");
+    expect(config).not.toContain("[models.providers.openai.params.");
+  });
+
+  it("rejects an unsupported reasoning effort before writing config (#7938)", () => {
+    const result = runGeneratorProcess({ NEMOCLAW_REASONING_EFFORT: "extreme" });
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toContain(
+      "NEMOCLAW_REASONING_EFFORT must be low, medium, or high.",
+    );
+    expect(fs.existsSync(path.join(result.home, ".deepagents", "config.toml"))).toBe(false);
   });
 
   it("preserves colons that belong to the model ID", () => {
@@ -116,7 +257,7 @@ describe("LangChain Deep Agents Code config generator", () => {
   });
 
   it.each([
-    ["NEMOCLAW_PROVIDER_KEY", "inference\n[update]\nauto_update = true"],
+    ["NEMOCLAW_INFERENCE_PROVIDER_ID", "inference\n[update]\nauto_update = true"],
     ["NEMOCLAW_UPSTREAM_PROVIDER", "nvidia-prod\r[update]\nauto_update = true"],
     ["NEMOCLAW_INFERENCE_API", "openai-completions\n[update]\nauto_update = true"],
   ])("rejects control characters in %s before writing config", (envName, value) => {
@@ -158,7 +299,7 @@ describe("LangChain Deep Agents Code config generator", () => {
     // patched Dockerfile ARG -> ENV -> generate-config chain at image build.
     const config = runGenerator({
       NEMOCLAW_MODEL: "nvidia/nvidia/nemotron-3-super-v3",
-      NEMOCLAW_PROVIDER_KEY: route.providerKey,
+      NEMOCLAW_INFERENCE_PROVIDER_ID: route.providerKey,
       NEMOCLAW_UPSTREAM_PROVIDER: "compatible-anthropic-endpoint",
       NEMOCLAW_INFERENCE_BASE_URL: route.inferenceBaseUrl,
       NEMOCLAW_INFERENCE_API: route.inferenceApi,

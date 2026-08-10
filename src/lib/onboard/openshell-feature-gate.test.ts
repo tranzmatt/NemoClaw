@@ -57,6 +57,54 @@ describe("OpenShell MCP feature gate", () => {
     }
   });
 
+  it("identifies the pinned v0.0.82 sandbox artifacts without executing them", () => {
+    const sandbox = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openshell-features-")),
+      "openshell-sandbox",
+    );
+    try {
+      fs.writeFileSync(
+        sandbox,
+        `#!/bin/sh\nexit 127\n# ${REQUIRED_OPENSHELL_SANDBOX_MCP_FEATURE}\n`,
+        { mode: 0o755 },
+      );
+      const digest = "145246049bd73c60452ac3c2b4b1801663196c8e2f80575af820289c78c1cf09";
+      const arm64Digest = "76bc19b70d9f1e1e9871307045796cd39cc7b8fc4c08ffc90593cc934f36d500";
+
+      expect(pinnedOpenShellSandboxBuildVersion(digest)).toBe("0.0.82");
+      expect(pinnedOpenShellSandboxBuildVersion(arm64Digest)).toBe("0.0.82");
+      expect(resolveOpenShellComponentBuildVersion(sandbox, "sandbox", () => digest)).toBe(
+        "0.0.82",
+      );
+    } finally {
+      fs.rmSync(path.dirname(sandbox), { recursive: true, force: true });
+    }
+  });
+
+  it("identifies the pinned v0.0.101 sandbox artifacts without executing them", () => {
+    const sandbox = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openshell-features-")),
+      "openshell-sandbox",
+    );
+    try {
+      fs.writeFileSync(
+        sandbox,
+        `#!/bin/sh\nexit 127\n# ${REQUIRED_OPENSHELL_SANDBOX_MCP_FEATURE}\n`,
+        { mode: 0o755 },
+      );
+      const digest = "a2704babbb468fd0a359bfdd9844de71095b730758541b4ca8cbab77d4018920";
+      const arm64Digest = "88300e35f153123e4dc3021c537834dd6c0a09665a4a6d3974cd285d512345c4";
+
+      expect(pinnedOpenShellSandboxBuildVersion(digest)).toBe("0.0.101");
+      expect(pinnedOpenShellSandboxBuildVersion(arm64Digest)).toBe("0.0.101");
+      expect(resolveOpenShellComponentBuildVersion(sandbox, "sandbox", () => digest)).toBe(
+        "0.0.101",
+      );
+    } finally {
+      fs.rmSync(path.dirname(sandbox), { recursive: true, force: true });
+    }
+  });
+
   it("finds provider rewrite and MCP L7 markers across OpenShell binaries", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-openshell-features-"));
     try {

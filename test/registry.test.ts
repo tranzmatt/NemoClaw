@@ -7,6 +7,8 @@ import os from "node:os";
 import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 
+import { makeMessagingPlan } from "./helpers/messaging-plan-fixtures";
+
 // Use a temp dir so tests don't touch real ~/.nemoclaw.
 // HOME must be set before loading registry (it reads HOME at require time),
 // so we use createRequire instead of a static import.
@@ -17,38 +19,6 @@ const require = createRequire(import.meta.url);
 const registry = require("../src/lib/state/registry");
 
 const regFile = path.join(tmpDir, ".nemoclaw", "sandboxes.json");
-
-function makeMessagingPlan(
-  name: string,
-  channels: string[] = ["telegram"],
-  disabledChannels: string[] = [],
-) {
-  const disabled = new Set<string>(disabledChannels);
-  return {
-    schemaVersion: 1,
-    sandboxName: name,
-    agent: "openclaw",
-    workflow: "onboard",
-    channels: channels.map((channelId) => ({
-      channelId,
-      displayName: channelId,
-      authMode: "token-paste",
-      active: !disabled.has(channelId),
-      selected: true,
-      configured: true,
-      disabled: disabled.has(channelId),
-      inputs: [],
-      hooks: [],
-    })),
-    disabledChannels,
-    credentialBindings: [],
-    networkPolicy: { presets: [], entries: [] },
-    agentRender: [],
-    buildSteps: [],
-    stateUpdates: [],
-    healthChecks: [],
-  };
-}
 
 beforeEach(() => {
   if (fs.existsSync(regFile)) fs.unlinkSync(regFile);
@@ -105,6 +75,47 @@ describe("registry", () => {
       fromDockerfile: "/tmp/Dockerfile.custom",
       hermesAuthMethod: "oauth",
     });
+  });
+
+  it("round-trips absent, known-empty, populated, and cloned image-plugin provenance", () => {
+    const weatherInstall = {
+      id: "weather",
+      installPath: "/sandbox/.openclaw/extensions/weather",
+      loadPaths: [],
+    };
+    registry.registerSandbox({ name: "legacy", agent: "openclaw" });
+    registry.registerSandbox({
+      name: "known-empty",
+      agent: "openclaw",
+      openclawImagePluginInstalls: [],
+    });
+    registry.registerSandbox({
+      name: "populated",
+      agent: "openclaw",
+      openclawImagePluginInstalls: [weatherInstall],
+    });
+    registry.registerSandbox({
+      ...registry.getSandbox("populated"),
+      name: "populated-clone",
+    });
+    registry.registerSandbox({
+      ...registry.getSandbox("known-empty"),
+      name: "known-empty-clone",
+    });
+
+    const data = JSON.parse(fs.readFileSync(regFile, "utf-8")).sandboxes;
+    expect(registry.getSandbox("legacy").openclawImagePluginInstalls).toBeUndefined();
+    expect(registry.getSandbox("known-empty").openclawImagePluginInstalls).toEqual([]);
+    expect(registry.getSandbox("known-empty-clone").openclawImagePluginInstalls).toEqual([]);
+    expect(registry.getSandbox("populated").openclawImagePluginInstalls).toEqual([weatherInstall]);
+    expect(registry.getSandbox("populated-clone").openclawImagePluginInstalls).toEqual([
+      weatherInstall,
+    ]);
+    expect(data.legacy.openclawImagePluginInstalls).toBeUndefined();
+    expect(data["known-empty"].openclawImagePluginInstalls).toEqual([]);
+    expect(data["known-empty-clone"].openclawImagePluginInstalls).toEqual([]);
+    expect(data.populated.openclawImagePluginInstalls).toEqual([weatherInstall]);
+    expect(data["populated-clone"].openclawImagePluginInstalls).toEqual([weatherInstall]);
   });
 
   it("does not invent observability intent for legacy registry rows", () => {
@@ -209,6 +220,75 @@ describe("registry", () => {
     expect(entry.command).toBeUndefined();
     expect(entry.port).toBeUndefined();
     expect(raw.sandboxes.alpha.mcp.managedServerNames).toEqual(["github"]);
+  });
+
+  it("persists canonical trusted-private MCP intent and exact pins (#8267)", () => {
+    registry.registerSandbox({
+      name: "private-mcp",
+      agent: "hermes",
+      mcp: {
+        bridges: {
+          local: {
+            server: "local",
+            agent: "hermes",
+            adapter: "hermes-config",
+            url: "https://mcp.corp.example/mcp",
+            env: ["LOCAL_MCP_TOKEN"],
+            trustedPrivateHost: "mcp.corp.example",
+            allowedIps: ["10.20.30.40", "fd00::40"],
+            providerName: "private-mcp-mcp-local",
+            providerId: "11111111-2222-4333-8444-555555555555",
+            policyName: "mcp-bridge-local",
+            addedAt: new Date(0).toISOString(),
+          },
+        },
+      },
+    });
+
+    expect(registry.getSandbox("private-mcp").mcp.bridges.local).toMatchObject({
+      trustedPrivateHost: "mcp.corp.example",
+      allowedIps: ["10.20.30.40", "fd00::40"],
+    });
+  });
+
+  it.each([
+    {
+      label: "non-canonical host",
+      trustedPrivateHost: "MCP.CORP.EXAMPLE.",
+      allowedIps: ["10.20.30.40", "fd00::40"],
+    },
+    {
+      label: "non-canonical pin order",
+      trustedPrivateHost: "mcp.corp.example",
+      allowedIps: ["fd00::40", "10.20.30.40"],
+    },
+  ])("rejects $label from durable trusted-private MCP authority (#8267)", ({
+    trustedPrivateHost,
+    allowedIps,
+  }) => {
+    registry.registerSandbox({
+      name: "noncanonical-private-mcp",
+      agent: "hermes",
+      mcp: {
+        bridges: {
+          local: {
+            server: "local",
+            agent: "hermes",
+            adapter: "hermes-config",
+            url: "https://mcp.corp.example/mcp",
+            env: ["LOCAL_MCP_TOKEN"],
+            trustedPrivateHost,
+            allowedIps,
+            providerName: "noncanonical-private-mcp-mcp-local",
+            providerId: "11111111-2222-4333-8444-555555555555",
+            policyName: "mcp-bridge-local",
+            addedAt: new Date(0).toISOString(),
+          },
+        },
+      },
+    });
+
+    expect(registry.getSandbox("noncanonical-private-mcp").mcp?.bridges?.local).toBeUndefined();
   });
 
   it("retains sanitized managed MCP names after the active bridge map is emptied", () => {
@@ -717,7 +797,7 @@ describe("registry", () => {
   });
 
   it("stores messaging plan state at registration time", () => {
-    const basePlan = makeMessagingPlan("messaging", ["telegram"]);
+    const basePlan = makeMessagingPlan({ sandboxName: "messaging", channels: ["telegram"] });
     const plan = {
       ...basePlan,
       channels: [
@@ -811,6 +891,62 @@ describe("registry", () => {
     expect(data.sandboxes.messaging.messagingChannelConfig).toBeUndefined();
   });
 
+  it("drops legacy providerCredentialHashes when rewriting messaging rows (#3631)", () => {
+    const basePlan = makeMessagingPlan({ sandboxName: "messaging", channels: ["telegram"] });
+    const binding = {
+      channelId: "telegram",
+      credentialId: "telegramBotToken",
+      sourceInput: "botToken",
+      providerName: "messaging-telegram-bridge",
+      providerEnvKey: "TELEGRAM_BOT_TOKEN",
+      placeholder: "openshell:resolve:env:TELEGRAM_BOT_TOKEN",
+      credentialAvailable: true,
+      credentialHash: "new-hash",
+    };
+    fs.mkdirSync(path.dirname(regFile), { recursive: true });
+    fs.writeFileSync(
+      regFile,
+      `${JSON.stringify(
+        {
+          sandboxes: {
+            messaging: {
+              name: "messaging",
+              messaging: {
+                schemaVersion: 1,
+                plan: {
+                  ...basePlan,
+                  credentialBindings: [binding],
+                },
+              },
+              providerCredentialHashes: [
+                {
+                  channel: "telegram",
+                  credentialHashes: { TELEGRAM_BOT_TOKEN: "old-hash" },
+                },
+              ],
+            },
+          },
+          defaultSandbox: "messaging",
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    registry.updateSandbox("messaging", { model: "new-model" });
+
+    const data = JSON.parse(fs.readFileSync(regFile, "utf-8"));
+    expect(data.sandboxes.messaging.providerCredentialHashes).toBeUndefined();
+    expect(data.sandboxes.messaging.messaging.plan.credentialBindings).toEqual([
+      {
+        channelId: "telegram",
+        providerEnvKey: "TELEGRAM_BOT_TOKEN",
+        credentialAvailable: true,
+        credentialHash: "new-hash",
+      },
+    ]);
+  });
+
   it("imageTag defaults to null when not provided", () => {
     registry.registerSandbox({ name: "no-tag" });
     const sb = registry.getSandbox("no-tag");
@@ -823,12 +959,44 @@ describe("registry", () => {
     expect(registry.getSandbox("updatable").imageTag).toBe("openshell/sandbox-from:9999");
   });
 
-  it("handles corrupt registry file gracefully", () => {
+  it("reports a registry file that is not JSON instead of reading it as empty", () => {
     fs.mkdirSync(path.dirname(regFile), { recursive: true });
     fs.writeFileSync(regFile, "NOT JSON");
-    // Should not throw, returns empty
-    const { sandboxes } = registry.listSandboxes();
-    expect(sandboxes.length).toBe(0);
+
+    expect(() => registry.listSandboxes()).toThrow(/not valid JSON/);
+  });
+
+  it("rejects an invalid workload receipt while loading the registry", () => {
+    fs.mkdirSync(path.dirname(regFile), { recursive: true });
+    fs.writeFileSync(
+      regFile,
+      JSON.stringify({
+        defaultSandbox: "alpha",
+        sandboxes: {
+          alpha: {
+            name: "alpha",
+            workload: { schemaVersion: 2, kind: "legacy-dockerfile" },
+          },
+        },
+      }),
+    );
+
+    expect(() => registry.getSandbox("alpha")).toThrow(/invalid workload receipt/);
+  });
+
+  it("does not serialize an invalid workload receipt", () => {
+    expect(() =>
+      registry.save({
+        defaultSandbox: "alpha",
+        sandboxes: {
+          alpha: {
+            name: "alpha",
+            workload: { schemaVersion: 2, kind: "legacy-dockerfile" },
+          },
+        },
+      }),
+    ).toThrow(/invalid workload receipt/);
+    expect(fs.existsSync(regFile)).toBe(false);
   });
 
   it("skips malformed sandbox entries while loading the registry", () => {
@@ -855,7 +1023,10 @@ describe("registry", () => {
   it("setChannelDisabled toggles a channel on and off for a sandbox", () => {
     registry.registerSandbox({
       name: "s1",
-      messaging: { schemaVersion: 1, plan: makeMessagingPlan("s1", ["telegram", "discord"]) },
+      messaging: {
+        schemaVersion: 1,
+        plan: makeMessagingPlan({ sandboxName: "s1", channels: ["telegram", "discord"] }),
+      },
     });
     expect(registry.getDisabledChannels("s1")).toEqual([]);
 
@@ -872,7 +1043,10 @@ describe("registry", () => {
   it("setChannelDisabled clears plan.disabledChannels when empty", () => {
     registry.registerSandbox({
       name: "s1",
-      messaging: { schemaVersion: 1, plan: makeMessagingPlan("s1", ["telegram"]) },
+      messaging: {
+        schemaVersion: 1,
+        plan: makeMessagingPlan({ sandboxName: "s1", channels: ["telegram"] }),
+      },
     });
     registry.setChannelDisabled("s1", "telegram", true);
     registry.setChannelDisabled("s1", "telegram", false);
@@ -884,7 +1058,10 @@ describe("registry", () => {
   it("setChannelDisabled returns false when the channel is not configured in the plan", () => {
     registry.registerSandbox({
       name: "s1",
-      messaging: { schemaVersion: 1, plan: makeMessagingPlan("s1", ["telegram"]) },
+      messaging: {
+        schemaVersion: 1,
+        plan: makeMessagingPlan({ sandboxName: "s1", channels: ["telegram"] }),
+      },
     });
     expect(registry.setChannelDisabled("s1", "discord", true)).toBe(false);
     expect(registry.getDisabledChannels("s1")).toEqual([]);
@@ -897,7 +1074,10 @@ describe("registry", () => {
   it("registerSandbox preserves disabledChannels when re-registering", () => {
     registry.registerSandbox({
       name: "s1",
-      messaging: { schemaVersion: 1, plan: makeMessagingPlan("s1", ["telegram"]) },
+      messaging: {
+        schemaVersion: 1,
+        plan: makeMessagingPlan({ sandboxName: "s1", channels: ["telegram"] }),
+      },
     });
     registry.setChannelDisabled("s1", "telegram", true);
     registry.registerSandbox({
@@ -1078,6 +1258,19 @@ describe("advisory file locking", () => {
     }
   });
 
+  it("acquireLock does not treat an owner file EEXIST as lock contention (#7694)", () => {
+    const origWrite = fs.writeFileSync;
+    fs.writeFileSync = () => {
+      throw Object.assign(new Error("owner write EEXIST"), { code: "EEXIST" });
+    };
+    try {
+      expect(() => registry.acquireLock()).toThrow("owner write EEXIST");
+      expect(fs.existsSync(lockDir)).toBe(false);
+    } finally {
+      fs.writeFileSync = origWrite;
+    }
+  });
+
   it("acquireLock removes stale lock owned by dead process", () => {
     // Create a lock with a PID that doesn't exist (99999999)
     fs.mkdirSync(lockDir, { recursive: true });
@@ -1185,5 +1378,88 @@ describe("advisory file locking", () => {
     const { sandboxes, defaultSandbox } = registry.listSandboxes();
     expect(sandboxes).toHaveLength(0);
     expect(defaultSandbox).toBe(null);
+  });
+
+  describe("malformed sandboxes.json", () => {
+    const malformed = '{"sandboxes":{"keep-me":{"name":"keep-me"}},"defaultSandbox":"keep-me",}';
+
+    function writeMalformedRegistry() {
+      fs.mkdirSync(path.dirname(regFile), { recursive: true, mode: 0o700 });
+      fs.writeFileSync(regFile, malformed, { mode: 0o600 });
+    }
+
+    it("reading reports the damage instead of an empty registry", () => {
+      writeMalformedRegistry();
+
+      expect(() => registry.listSandboxes()).toThrow(/not valid JSON/);
+    });
+
+    it("registerSandbox refuses to replace it and keeps the original bytes", () => {
+      writeMalformedRegistry();
+
+      expect(() => registry.registerSandbox({ name: "new-sandbox" })).toThrow(/not valid JSON/);
+
+      expect(fs.readFileSync(regFile, "utf-8")).toBe(malformed);
+      expect(fs.existsSync(`${regFile}.lock`)).toBe(false);
+      expect(
+        fs.readdirSync(path.dirname(regFile)).filter((name) => name.includes(".tmp.")),
+      ).toEqual([]);
+    });
+
+    it("keeps failing for every reader process until the file is repaired", () => {
+      const { spawnSync } = require("child_process");
+      writeMalformedRegistry();
+
+      const registryPath = path.resolve(
+        path.join(import.meta.dirname, "..", "src", "lib", "state", "registry.ts"),
+      );
+      const homeDir = path.dirname(path.dirname(regFile));
+      const orchestrator = `
+        const { spawn } = require("child_process");
+        const workerScript = \`
+          process.env.HOME = ${JSON.stringify(homeDir)};
+          const reg = require(${JSON.stringify(registryPath)});
+          try {
+            reg.listSandboxes();
+          } catch (error) {
+            process.exit(error && error.code === "ECONFIGCORRUPT" ? 0 : 2);
+          }
+          process.exit(3);
+        \`;
+        const workers = [];
+        for (let w = 0; w < 4; w++) {
+          workers.push(spawn(process.execPath, ["-e", workerScript, "w" + w]));
+        }
+        let exitCount = 0;
+        let allOk = true;
+        for (const child of workers) {
+          child.on("exit", (code) => {
+            if (code !== 0) allOk = false;
+            exitCount++;
+            if (exitCount === workers.length) {
+              process.exit(allOk ? 0 : 1);
+            }
+          });
+        }
+      `;
+      const result = spawnSync(process.execPath, ["-e", orchestrator], {
+        encoding: "utf-8",
+        timeout: 30_000,
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(fs.readFileSync(regFile, "utf-8")).toBe(malformed);
+    });
+
+    it("recovers once the file holds valid JSON again", () => {
+      writeMalformedRegistry();
+      expect(() => registry.listSandboxes()).toThrow(/not valid JSON/);
+
+      fs.writeFileSync(regFile, '{"sandboxes":{"keep-me":{"name":"keep-me"}}}', { mode: 0o600 });
+      registry.registerSandbox({ name: "new-sandbox" });
+
+      const names = registry.listSandboxes().sandboxes.map((entry: { name: string }) => entry.name);
+      expect(names.sort()).toEqual(["keep-me", "new-sandbox"]);
+    });
   });
 });

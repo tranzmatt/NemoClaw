@@ -5,9 +5,14 @@ import YAML from "yaml";
 
 export type OpenShellPolicyMapping = Record<string, unknown>;
 
+export type ValidatedOpenShellPolicyMapping = OpenShellPolicyMapping & {
+  readonly version?: number;
+  readonly network_policies?: OpenShellPolicyMapping;
+};
+
 export interface ParsedOpenShellPolicy {
   readonly yamlBody: string;
-  readonly policy: OpenShellPolicyMapping;
+  readonly policy: ValidatedOpenShellPolicyMapping;
 }
 
 const MISSING_POLICY_DOCUMENT =
@@ -15,6 +20,24 @@ const MISSING_POLICY_DOCUMENT =
 
 function isMapping(value: unknown): value is OpenShellPolicyMapping {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertValidatedPolicyFields(
+  policy: OpenShellPolicyMapping,
+): asserts policy is ValidatedOpenShellPolicyMapping {
+  if (
+    policy.version !== undefined &&
+    (typeof policy.version !== "number" ||
+      !Number.isInteger(policy.version) ||
+      policy.version < 1)
+  ) {
+    throw new Error(
+      "Current policy from openshell policy get --base version must be a positive integer",
+    );
+  }
+  if (policy.network_policies !== undefined && !isMapping(policy.network_policies)) {
+    throw new Error("Current policy network_policies must be a YAML mapping");
+  }
 }
 
 function parseYaml(source: string, invalidMessage: string): unknown {
@@ -54,19 +77,7 @@ export function parseOpenShellPolicy(raw: string): ParsedOpenShellPolicy {
   if (!isMapping(parsed)) {
     throw new Error("Current policy from openshell policy get --base must be a YAML mapping");
   }
-  if (
-    parsed.version !== undefined &&
-    (typeof parsed.version !== "number" ||
-      !Number.isInteger(parsed.version) ||
-      parsed.version < 1)
-  ) {
-    throw new Error(
-      "Current policy from openshell policy get --base version must be a positive integer",
-    );
-  }
-  if (parsed.network_policies !== undefined && !isMapping(parsed.network_policies)) {
-    throw new Error("Current policy network_policies must be a YAML mapping");
-  }
+  assertValidatedPolicyFields(parsed);
 
   // Unmarked output is accepted only when it has a positive policy-root
   // identity. OpenShell diagnostic mappings are otherwise indistinguishable
@@ -89,7 +100,7 @@ export function parseOpenShellPolicy(raw: string): ParsedOpenShellPolicy {
 // regressionTest: the root policy round-trip and plugin runner policy tests.
 // removalCondition: OpenShell's supported base-policy contract guarantees that
 // provider-composed entries are absent from every mutation read.
-// tracking: revalidate this guard at every stable OpenShell pin after 0.0.72.
+// tracking: revalidated for stable OpenShell 0.0.101; revalidate after 0.0.101.
 export function withoutProviderComposedPolicies<T>(policies: Record<string, T>): Record<string, T> {
   return Object.fromEntries(
     Object.entries(policies).filter(([name]) => !name.startsWith("_provider_")),

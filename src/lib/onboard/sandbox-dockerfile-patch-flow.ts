@@ -7,7 +7,10 @@ import {
   SandboxBaseImageResolutionError,
   type SandboxBaseImageResolutionMetadata,
 } from "../sandbox-base-image";
+import type { PreservedEnvFile } from "../state/preserved-env";
 import { DEFAULT_TOOL_DISCLOSURE, type ToolDisclosure } from "../tool-disclosure";
+import type { DcodeAutoApprovalMode } from "./dcode-auto-approval";
+import type { SelectedDockerGpuRoute } from "./docker-gpu-route";
 import type { SandboxGpuConfig } from "./sandbox-gpu-mode";
 
 type DockerRunResult = { status: number | null };
@@ -24,6 +27,7 @@ export type SandboxDockerfilePatchDeps = {
   dockerImageInspect?: (target: string, opts?: Record<string, unknown>) => DockerRunResult;
   isLinuxDockerDriverGatewayEnabled?: () => boolean;
   enforceDockerGpuPatchPreserveNetwork?: EnforceDockerGpuPatchPreserveNetwork;
+  isWsl?: () => boolean;
   patchStagedDockerfile?: PatchStagedDockerfile;
   now?: () => number;
 };
@@ -37,11 +41,16 @@ export type PrepareSandboxDockerfilePatchInput = {
   model: string;
   chatUiUrl: string;
   provider: string | null;
+  endpointUrl?: string | null;
+  compatibleEndpointReasoning?: "true" | "false";
   preferredInferenceApi: string | null;
   webSearchConfig: WebSearchConfig | null;
   toolDisclosure?: ToolDisclosure;
+  rebuildPreservedEnv?: readonly PreservedEnvFile[];
+  dcodeAutoApprovalMode?: DcodeAutoApprovalMode;
   hermesToolGateways: string[];
   sandboxGpuConfig: SandboxGpuConfig;
+  selectedGpuRoute?: SelectedDockerGpuRoute;
   resolutionHint?: SandboxBaseImageResolutionMetadata | null;
   preResolvedBaseImageMetadata?: SandboxBaseImageResolutionMetadata | null;
   forceBaseImageRefresh?: boolean;
@@ -53,6 +62,7 @@ export type PrepareSandboxDockerfilePatchInput = {
 
 export type SandboxDockerfilePatchResult = {
   buildId: string;
+  dashboardRemoteBindPrepared: boolean;
   resolvedBaseImage: ResolvedSandboxBaseImage | null;
 };
 
@@ -74,6 +84,11 @@ function linuxDockerDriverGatewayEnabled(): boolean {
   const { isLinuxDockerDriverGatewayEnabled } =
     require("./docker-driver-platform") as typeof import("./docker-driver-platform");
   return isLinuxDockerDriverGatewayEnabled();
+}
+
+function wslHostDetected(): boolean {
+  const { isWsl } = require("../platform") as typeof import("../platform");
+  return isWsl();
 }
 
 function enforceDockerGpuPatchPreserveNetwork(
@@ -101,11 +116,16 @@ export async function prepareSandboxDockerfilePatch({
   model,
   chatUiUrl,
   provider,
+  endpointUrl = null,
+  compatibleEndpointReasoning,
   preferredInferenceApi,
   webSearchConfig,
   toolDisclosure = DEFAULT_TOOL_DISCLOSURE,
+  rebuildPreservedEnv,
+  dcodeAutoApprovalMode,
   hermesToolGateways,
   sandboxGpuConfig,
+  selectedGpuRoute = "none",
   resolutionHint = null,
   preResolvedBaseImageMetadata = null,
   forceBaseImageRefresh = false,
@@ -158,6 +178,7 @@ export async function prepareSandboxDockerfilePatch({
     sandboxGpuConfig,
     {
       dockerDriverGateway,
+      selectedRoute: selectedGpuRoute,
       gatewayPort,
       log,
     },
@@ -167,11 +188,13 @@ export async function prepareSandboxDockerfilePatch({
   // checked in here and known not to consume it. Custom --from Dockerfiles
   // and other managed agents retain the historical per-run rewrite.
   const managedAgentName = agent?.name ?? "openclaw";
+  const managedOpenClawWslExposure =
+    !fromDockerfile && managedAgentName === "openclaw" && (deps.isWsl ?? wslHostDetected)();
   const buildIdPolicy =
     !fromDockerfile && STABLE_MANAGED_BUILD_ID_AGENTS.has(managedAgentName)
       ? "preserve"
       : "rewrite";
-  (deps.patchStagedDockerfile ?? patchStagedDockerfile)(
+  const patched = (deps.patchStagedDockerfile ?? patchStagedDockerfile)(
     stagedDockerfile,
     model,
     chatUiUrl,
@@ -188,11 +211,23 @@ export async function prepareSandboxDockerfilePatch({
       return {
         buildIdPolicy,
         toolDisclosure,
+        ...(rebuildPreservedEnv ? { rebuildPreservedEnv } : {}),
+        ...(!fromDockerfile ? { trustedManagedDockerfile: true } : {}),
+        ...(!fromDockerfile && managedAgentName === "openclaw"
+          ? { wslDashboardExposure: managedOpenClawWslExposure }
+          : {}),
+        ...(endpointUrl ? { upstreamEndpointUrl: endpointUrl } : {}),
+        ...(compatibleEndpointReasoning ? { compatibleEndpointReasoning } : {}),
+        ...(dcodeAutoApprovalMode ? { dcodeAutoApprovalMode } : {}),
         requireToolDisclosureContract: Boolean(fromDockerfile),
         ...(metadata ? { baseImageResolutionMetadata: metadata } : {}),
       };
     })(),
   );
 
-  return { buildId, resolvedBaseImage: resolved };
+  return {
+    buildId,
+    dashboardRemoteBindPrepared: patched?.dashboardRemoteBindPrepared === true,
+    resolvedBaseImage: resolved,
+  };
 }

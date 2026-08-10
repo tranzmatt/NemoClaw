@@ -31,13 +31,13 @@ describe("LangChain Deep Agents Code managed provider label", () => {
       "nvidia-prod",
     );
     const stagedSource = fs.readFileSync(stagedDockerfile, "utf8");
-    expect(stagedSource).toContain("ARG NEMOCLAW_PROVIDER_KEY=inference");
+    expect(stagedSource).toContain("ARG NEMOCLAW_INFERENCE_PROVIDER_ID=inference");
     expect(stagedSource).toContain("ARG NEMOCLAW_UPSTREAM_PROVIDER=nvidia-prod");
     expect(stagedSource).toContain("NEMOCLAW_UPSTREAM_PROVIDER=${NEMOCLAW_UPSTREAM_PROVIDER}");
     const runtimeEnv = Object.fromEntries(
       [
         "NEMOCLAW_MODEL",
-        "NEMOCLAW_PROVIDER_KEY",
+        "NEMOCLAW_INFERENCE_PROVIDER_ID",
         "NEMOCLAW_UPSTREAM_PROVIDER",
         "NEMOCLAW_INFERENCE_BASE_URL",
         "NEMOCLAW_INFERENCE_API",
@@ -110,6 +110,10 @@ for upstream in (None, "", "bad provider!", " nvidia-prod", "nvidia-prod\\n", "x
 
 os.environ["NEMOCLAW_UPSTREAM_PROVIDER"] = "openai"
 assert _nemoclaw_managed.managed_display_provider("openai") == "openai"
+
+os.environ["NEMOCLAW_UPSTREAM_PROVIDER"] = "openrouter-api"
+assert _nemoclaw_managed.managed_display_provider("openai") == "openrouter"
+assert _nemoclaw_managed.managed_display_provider("openrouter") == "openrouter"
 
 os.environ["NEMOCLAW_UPSTREAM_PROVIDER"] = "compatible-anthropic-endpoint"
 assert _nemoclaw_managed.managed_display_provider("openai") == "compatible-anthropic-endpoint"

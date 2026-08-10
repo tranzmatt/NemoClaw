@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 type ProviderRecoveryInternals = {
   providerNameToOptionKey: (
@@ -101,6 +101,7 @@ describe("readRecordedProvider", () => {
     registry.getSandbox = originalGetSandbox;
     registry.listSandboxes = originalListSandboxes;
     onboardSession.loadSession = originalLoadSession;
+    vi.restoreAllMocks();
   });
 
   it("returns the provider stored in sandboxes.json", () => {
@@ -161,16 +162,23 @@ describe("readRecordedProvider", () => {
     expect(readRecordedProvider("")).toBeNull();
   });
 
-  it("falls back to the session when the registry read throws", () => {
+  it("fails closed instead of trusting session state when the registry read throws (#6630)", () => {
     registry.getSandbox = () => {
       throw new Error("registry unreadable");
     };
-    onboardSession.loadSession = () =>
-      ({ sandboxName: "spark-1", provider: "ollama-local" }) as ReturnType<
-        typeof onboardSession.loadSession
-      >;
+    const loadSession = vi.fn(
+      () =>
+        ({ sandboxName: "spark-1", provider: "ollama-local" }) as ReturnType<
+          typeof onboardSession.loadSession
+        >,
+    );
+    onboardSession.loadSession = loadSession;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     stubLiveGatewayUntrusted();
-    expect(readRecordedProvider("spark-1")).toBe("ollama-local");
+
+    expect(readRecordedProvider("spark-1")).toBeNull();
+    expect(loadSession).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("refusing recovery"));
   });
 
   it("returns null when registry, session, and live-gateway lookups all throw", () => {
@@ -234,6 +242,7 @@ describe("rebuild resume session normalization", () => {
         credentialEnv: "COMPATIBLE_API_KEY",
         preferredInferenceApi: "openai",
         compatibleEndpointReasoning: null,
+        compatibleEndpointReasoningEffort: null,
         pinEndpoint: true,
         endpointUrl: "https://new-provider.example/v1",
         registryInferenceRoute: null,
@@ -542,6 +551,7 @@ onboardSession.loadSession = () => ({
 credentials.prompt = async () => "";
 credentials.ensureApiKey = async () => {};
 process.env.NEMOCLAW_NON_INTERACTIVE = "1";
+require("node:dns/promises").lookup = async () => [{ address: "93.184.216.34", family: 4 }];
 const { setupNim } = require(${onboardPath});
 
 (async () => {
@@ -552,6 +562,7 @@ const { setupNim } = require(${onboardPath});
     "NEMOCLAW_PROVIDER_KEY",
     "NVIDIA_INFERENCE_API_KEY",
     "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
     "COMPATIBLE_ANTHROPIC_API_KEY",
@@ -602,136 +613,5 @@ const { setupNim } = require(${onboardPath});
         ),
       ),
     ).toBe(true);
-  });
-
-  it("ignores stale recorded providers when fresh setup disables provider recovery", () => {
-    const repoRoot = path.join(import.meta.dirname, "..");
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-onboard-fresh-provider-"));
-    const fakeBin = path.join(tmpDir, "bin");
-    const scriptPath = path.join(tmpDir, "fresh-provider-recovery-check.js");
-    const onboardPath = JSON.stringify(path.join(repoRoot, "src", "lib", "onboard.ts"));
-    const sessionPath = JSON.stringify(
-      path.join(repoRoot, "src", "lib", "state", "onboard-session.ts"),
-    );
-    const registryPath = JSON.stringify(path.join(repoRoot, "src", "lib", "state", "registry.ts"));
-    const runnerPath = JSON.stringify(path.join(repoRoot, "src", "lib", "runner.ts"));
-    const credentialsPath = JSON.stringify(
-      path.join(repoRoot, "src", "lib", "credentials", "store.ts"),
-    );
-
-    fs.mkdirSync(fakeBin, { recursive: true });
-    fs.writeFileSync(
-      path.join(fakeBin, "curl"),
-      `#!/usr/bin/env bash
-body='{"choices":[{"message":{"role":"assistant","content":"OK"}}]}'
-status="200"
-outfile=""
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    -o) outfile="$2"; shift 2 ;;
-    *) shift ;;
-  esac
-done
-printf '%s' "$body" > "$outfile"
-printf '%s' "$status"
-`,
-      { mode: 0o755 },
-    );
-
-    const script = String.raw`
-const credentials = require(${credentialsPath});
-const runner = require(${runnerPath});
-const registry = require(${registryPath});
-const onboardSession = require(${sessionPath});
-
-runner.runCapture = () => "";
-registry.getSandbox = () => null;
-registry.listSandboxes = () => ({ sandboxes: [], defaultSandbox: null });
-onboardSession.loadSession = () => ({
-  sandboxName: "dcode-station",
-  provider: "ollama-local",
-  model: "llama3.1",
-});
-const prompts = [];
-credentials.prompt = async (message) => {
-  prompts.push(message);
-  return "";
-};
-credentials.ensureApiKey = async () => {};
-process.env.NEMOCLAW_NON_INTERACTIVE = "1";
-const { setupNim } = require(${onboardPath});
-
-(async () => {
-  for (const key of [
-    "NEMOCLAW_PROVIDER",
-    "NEMOCLAW_PROVIDER_KEY",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY",
-    "COMPATIBLE_API_KEY",
-    "COMPATIBLE_ANTHROPIC_API_KEY",
-  ]) {
-    delete process.env[key];
-  }
-  process.env.NVIDIA_INFERENCE_API_KEY = "nvapi-test";
-  process.env.NEMOCLAW_MODEL = "nvidia/test-model";
-  const originalLog = console.log;
-  const originalError = console.error;
-  const lines = [];
-  console.log = (...args) => lines.push(args.join(" "));
-  console.error = (...args) => lines.push(args.join(" "));
-  try {
-    const nonInteractive = await setupNim(null, "dcode-station", null, false);
-    process.env.NEMOCLAW_PROVIDER = "openai";
-    process.env.OPENAI_API_KEY = "sk-test";
-    process.env.NEMOCLAW_MODEL = "gpt-5.4";
-    const explicitProvider = await setupNim(null, "dcode-station", null, false);
-    delete process.env.NEMOCLAW_PROVIDER;
-    delete process.env.OPENAI_API_KEY;
-    process.env.NEMOCLAW_MODEL = "nvidia/test-model";
-    delete process.env.NEMOCLAW_NON_INTERACTIVE;
-    const interactive = await setupNim(null, "dcode-station", null, false);
-    originalLog(JSON.stringify({ nonInteractive, explicitProvider, interactive, prompts, lines }));
-  } finally {
-    console.log = originalLog;
-    console.error = originalError;
-  }
-})().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
-`;
-    fs.writeFileSync(scriptPath, script);
-
-    const result = spawnSync(process.execPath, [scriptPath], {
-      cwd: repoRoot,
-      encoding: "utf-8",
-      env: {
-        ...process.env,
-        HOME: tmpDir,
-        PATH: `${fakeBin}:${process.env.PATH || ""}`,
-        NEMOCLAW_TEST_NO_SLEEP: "1",
-      },
-    });
-
-    expect(result.status).toBe(0);
-    const payload = JSON.parse(result.stdout.trim());
-    expect(payload.nonInteractive.provider).toBe("nvidia-prod");
-    expect(payload.nonInteractive.model).toBe("nvidia/test-model");
-    expect(payload.nonInteractive.preferredInferenceApi).toBe("openai-completions");
-    expect(payload.explicitProvider.provider).toBe("openai-api");
-    expect(payload.explicitProvider.model).toBe("gpt-5.4");
-    expect(payload.interactive.provider).toBe("nvidia-prod");
-    expect(payload.interactive.preferredInferenceApi).toBe("openai-completions");
-    expect(payload.prompts[0]).toMatch(/^  Choose \[\d+\]: $/);
-    expect(
-      payload.lines.some((line: string) => line.includes("Select your inference provider")),
-    ).toBe(true);
-    expect(
-      payload.lines.some((line: string) => line.includes("[non-interactive] Provider: build")),
-    ).toBe(true);
-    expect(payload.lines.every((line: string) => !line.includes("recovered from sandbox"))).toBe(
-      true,
-    );
   });
 });

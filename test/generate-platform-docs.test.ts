@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -11,15 +11,16 @@ import { describe, expect, it } from "vitest";
 import {
   buildPublishedRouteIndex,
   resolvePageLinksByText,
-} from "../scripts/check-docs-published-routes.ts";
-import { resolveAgentNameAlias } from "../src/lib/agent/defs";
+} from "../scripts/check-docs-published-routes.mts";
+import { loadAgent, resolveAgentNameAlias } from "../src/lib/agent/defs";
 
 const SCRIPT_PATH = path.join(import.meta.dirname, "..", "scripts", "generate-platform-docs.py");
+const PYTHON = process.env.PYTHON ?? "python3";
 
 function runPython(script: string): string {
-  return execFileSync("python3", ["-c", script, SCRIPT_PATH], {
+  return execFileSync(PYTHON, ["-c", script, SCRIPT_PATH], {
     encoding: "utf-8",
-  });
+  }).replace(/\r\n/g, "\n");
 }
 
 function loadGeneratorAs(name: string): string {
@@ -115,6 +116,72 @@ except ValueError as exc:
     expect(output).not.toContain("NO_ERROR");
   });
 
+  it("rejects malformed platform runtimes via the generator entry path", () => {
+    const tmp = mkdtempSync(path.join(tmpdir(), "genplatform-"));
+    try {
+      const cases = [
+        ["non-list", "Docker"],
+        ["empty-list", []],
+        ["non-string-item", ["Docker", 1]],
+        ["empty-string-item", ["Docker", ""]],
+        ["whitespace-string-item", ["Docker", " \t"]],
+      ] as const;
+      const outputs = cases.map(([label, runtimes]) => {
+        const matrixPath = path.join(tmp, `${label}.json`);
+        const matrixPathLiteral = JSON.stringify(matrixPath);
+        writeFileSync(
+          matrixPath,
+          JSON.stringify({
+            statuses: { tested: "Validated." },
+            owners: { engineering: "@NVIDIA/nemoclaw-maintainer" },
+            project_status: { stage: "a", label: "b", since: "c", notes: "d" },
+            platforms: [{ name: "X", runtimes, status: "tested", notes: "n" }],
+            providers: [],
+            agents: [],
+            integrations: [],
+            deployment_paths: [],
+            capabilities: [],
+            out_of_scope: [],
+          }),
+        );
+
+        const result = spawnSync(
+          PYTHON,
+          [
+            "-c",
+            `
+${loadGeneratorAs("g")}
+import pathlib
+
+module.MATRIX_PATH = pathlib.Path(${matrixPathLiteral})
+sys.argv = [sys.argv[1], "--check"]
+module.main()
+`,
+            SCRIPT_PATH,
+          ],
+          { encoding: "utf-8" },
+        );
+        expect(result.status, label).toBe(1);
+        return `${label}:${result.stdout}${result.stderr}`.replace(/\r\n/g, "\n");
+      });
+      const output = outputs.join("\n");
+      const expected =
+        "Error: ci/platform-matrix.json: platforms[0].runtimes must be a non-empty list of non-empty strings";
+      for (const label of [
+        "non-list",
+        "empty-list",
+        "non-string-item",
+        "empty-string-item",
+        "whitespace-string-item",
+      ]) {
+        expect(output).toContain(`${label}:${expected}`);
+      }
+      expect(output).not.toContain("NO_ERROR");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("rejects placeholder owner values (TBD, TODO, see PR review, empty)", () => {
     const output = runPython(`
 ${loadGeneratorAs("g")}
@@ -157,6 +224,36 @@ module._validate_matrix(matrix)
 print("OK")
 `);
     expect(output.trim()).toBe("OK");
+  });
+
+  it("rejects unmatched backticks in prerequisite-specific platform notes", () => {
+    const output = runPython(`
+${loadGeneratorAs("g")}
+
+def matrix_with(note):
+    return {
+      "statuses": {"deferred": "Roadmap-only."},
+      "owners": {"engineering": "@NVIDIA/nemoclaw-maintainer"},
+      "project_status": {"stage":"a","label":"b","since":"c","notes":"d"},
+      "platforms": [{
+        "name": "Station", "runtimes": ["Docker"], "status": "deferred",
+        "notes": "full notes", "prerequisites_notes": note
+      }],
+      "providers": [], "agents": [], "integrations": [],
+      "deployment_paths": [], "capabilities": [], "out_of_scope": []
+    }
+
+for label, note in [("unmatched", "unclosed \`code"), ("balanced", "closed \`code\`")]:
+    try:
+        module._validate_matrix(matrix_with(note))
+        print(f"{label}:OK")
+    except ValueError as exc:
+        print(f"{label}:{exc}")
+`);
+    expect(output).toContain(
+      "unmatched:ci/platform-matrix.json: platforms[0].prerequisites_notes has an odd number of backticks",
+    );
+    expect(output).toContain("balanced:OK");
   });
 
   // PRA-2 on #5712: matrix.get(section, []) used to silently accept a missing
@@ -255,13 +352,14 @@ print(module.generate_provider_table(providers))
     expect(output).not.toContain("Deferred\\|Provider");
   });
 
-  it("full platform table includes deferred rows; partial table excludes them", () => {
+  it("prerequisites table includes deferred rows only when they have setup guidance", () => {
     const output = runPython(`
 ${loadGeneratorAs("g")}
 
 platforms = [
+  {"name": "Station", "runtimes": ["Docker"], "status": "deferred", "ci_tested": False, "prerequisites_notes": "evaluation setup", "notes": "full Station notes"},
   {"name": "Linux", "runtimes": ["Docker"], "status": "tested", "ci_tested": True, "notes": "n"},
-  {"name": "WSL", "runtimes": ["Docker"], "status": "deferred", "ci_tested": False, "notes": "later"}
+  {"name": "RTX", "runtimes": ["Docker"], "status": "deferred", "ci_tested": False, "notes": "later"}
 ]
 print("PARTIAL:")
 print(module.generate_platform_table(platforms))
@@ -270,14 +368,43 @@ print(module.generate_platform_table_full(platforms))
 `);
     const [partial, full] = output.split("FULL:");
     expect(partial).toContain("Linux");
-    expect(partial).not.toContain("WSL");
+    expect(partial).toContain("Station");
+    expect(partial).toContain("evaluation setup");
+    expect(partial).not.toContain("full Station notes");
+    expect(partial).not.toContain("RTX");
+    expect(partial.indexOf("Linux")).toBeLessThan(partial.indexOf("Station"));
     expect(full).toContain("Linux");
-    expect(full).toContain("WSL");
+    expect(full).toContain("Station");
+    expect(full).toContain("full Station notes");
+    expect(full).toContain("RTX");
+    expect(full.indexOf("Linux")).toBeLessThan(full.indexOf("RTX"));
+    expect(full.indexOf("RTX")).toBeLessThan(full.indexOf("Station"));
+  });
+
+  it("prerequisites platform block includes documented deferred setup and links to the complete matrix", () => {
+    const output = runPython(`
+${loadGeneratorAs("g")}
+
+platforms = [
+  {"name": "Linux", "runtimes": ["Docker"], "status": "tested", "notes": "ready"},
+  {"name": "Station", "runtimes": ["Docker"], "status": "deferred", "prerequisites_notes": "evaluation setup", "notes": "later"},
+  {"name": "RTX", "runtimes": ["Docker"], "status": "deferred", "notes": "later"}
+]
+print(module.generate_platform_prerequisites_block(platforms))
+`);
+    expect(output).toContain("Linux");
+    expect(output).toContain("Station");
+    expect(output).toContain("evaluation setup");
+    expect(output).not.toContain("RTX");
+    expect(output).toContain(
+      "For the complete platform support matrix, including all deferred platforms and CI coverage, refer to [Platform Support](../reference/platform-support).",
+    );
   });
 
   it("exits non-zero for --check on a placeholder owner in the real matrix", () => {
     const tmp = mkdtempSync(path.join(tmpdir(), "genplatform-"));
     const matrixPath = path.join(tmp, "matrix.json");
+    const matrixPathLiteral = JSON.stringify(matrixPath);
     writeFileSync(
       matrixPath,
       JSON.stringify({
@@ -294,12 +421,12 @@ print(module.generate_platform_table_full(platforms))
     );
 
     const result = spawnSync(
-      "python3",
+      PYTHON,
       [
         "-c",
         `
 ${loadGeneratorAs("g")}
-matrix = module.load_matrix.__globals__["json"].load(open("${matrixPath}"))
+matrix = module.load_matrix.__globals__["json"].load(open(${matrixPathLiteral}))
 try:
     module._validate_matrix(matrix)
     raise SystemExit(0)
@@ -334,7 +461,7 @@ print(block)
   // credential-boundary invariants. Each test reads the actual matrix and
   // docs at the PR head, not a fixture, so a future edit that breaks the
   // invariant fails this suite before the change ships.
-  it("every `--agent <id>` example across matrix, docs, and generated skills resolves to a manifest whose name field agrees", () => {
+  it("every documented `--agent <id>` selector resolves through production agent selection", () => {
     const repoRoot = path.join(import.meta.dirname, "..");
     const matrix = JSON.parse(
       readFileSync(path.join(repoRoot, "ci", "platform-matrix.json"), "utf-8"),
@@ -356,25 +483,13 @@ print(block)
       for (const match of body.matchAll(onboardExample)) agentIds.add(match[1]);
     }
     expect(agentIds.size).toBeGreaterThan(0);
-    const agentsRoot = path.join(repoRoot, "agents");
-    const availableAgents = ["openclaw", "hermes", "langchain-deepagents-code"];
     for (const id of agentIds) {
-      const canonicalId = resolveAgentNameAlias(id, availableAgents) ?? id;
-      const manifest = path.join(agentsRoot, canonicalId, "manifest.yaml");
+      const canonicalId = resolveAgentNameAlias(id);
       expect(
-        existsSync(manifest),
-        `\`--agent ${id}\` advertised somewhere in matrix/docs/skills but neither aliases nor agents/${id}/manifest.yaml resolve it`,
-      ).toBe(true);
-      const manifestBody = readFileSync(manifest, "utf-8");
-      const nameMatch = manifestBody.match(/^name:\s*([a-z0-9-]+)\s*$/m);
-      expect(
-        nameMatch?.[1],
-        `agents/${canonicalId}/manifest.yaml lacks a name field`,
-      ).toBeDefined();
-      expect(
-        nameMatch?.[1],
-        `agents/${canonicalId}/manifest.yaml declares name ${nameMatch?.[1]}, breaking the loader contract for documented \`--agent ${id}\``,
-      ).toBe(canonicalId);
+        canonicalId,
+        `documented \`--agent ${id}\` must resolve through the production agent loader`,
+      ).not.toBeNull();
+      expect(loadAgent(canonicalId ?? id).name).toBe(canonicalId);
     }
   });
 
@@ -432,13 +547,19 @@ print(block)
     }
   });
 
-  it("Option 3 docs expose reasoning mode for scripted compatible endpoints (#3279)", () => {
+  it("compatible endpoint docs expose reasoning mode for scripted setup (#3279)", () => {
     const body = readFileSync(
-      path.join(import.meta.dirname, "..", "docs", "inference", "inference-options.mdx"),
+      path.join(
+        import.meta.dirname,
+        "..",
+        "docs",
+        "inference",
+        "set-up-openai-compatible-endpoint.mdx",
+      ),
       "utf-8",
     );
     expect(body).toContain("| `NEMOCLAW_REASONING` |");
-    expect(body).toContain("Set `NEMOCLAW_REASONING=true` when the compatible endpoint");
+    expect(body).toContain("Set `NEMOCLAW_REASONING=true` when the endpoint");
   });
 
   // PRA-2 on #5712 follow-up: a canonical launch-claims page that lives in the

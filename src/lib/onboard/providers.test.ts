@@ -14,6 +14,8 @@ const {
   NON_INTERACTIVE_PROVIDER_KEYS,
   REMOTE_PROVIDER_CONFIG,
   buildProviderArgs,
+  getNonInteractiveProvider,
+  getNonInteractiveModel,
   getRequestedModelHint,
   getRequestedProviderHint,
   isProviderKeyCredentialCandidate,
@@ -41,6 +43,11 @@ const {
     credentialEnv: string,
     baseUrl: string | null,
   ) => string[];
+  getNonInteractiveProvider: (allowHostedInferenceStaging?: boolean) => string | null;
+  getNonInteractiveModel: (
+    providerKey: string,
+    options?: { allowProviderModelFallback?: boolean },
+  ) => string | null;
   getRequestedModelHint: (
     nonInteractive: boolean,
     allowHostedInferenceStaging?: boolean,
@@ -81,6 +88,7 @@ function withProviderEnv(next: Record<string, string | undefined>, testBody: () 
     "NEMOCLAW_PROVIDER",
     "NEMOCLAW_ENDPOINT_URL",
     "NEMOCLAW_MODEL",
+    "NEMOCLAW_PROVIDER_MODEL",
     "NEMOCLAW_COMPAT_MODEL",
     "NEMOCLAW_PREFERRED_API",
     "NEMOCLAW_CLOUD_EXPERIMENTAL_MODEL",
@@ -114,6 +122,35 @@ function withProviderEnv(next: Record<string, string | undefined>, testBody: () 
 }
 
 describe("onboard provider helpers", () => {
+  it("keeps managed llama.cpp as a public non-interactive provider selector (#8433)", () => {
+    expect(NON_INTERACTIVE_PROVIDER_KEYS.has("install-llama-cpp")).toBe(true);
+    withProviderEnv({ NEMOCLAW_PROVIDER: "install-llama-cpp" }, () => {
+      expect(getNonInteractiveProvider(false)).toBe("install-llama-cpp");
+    });
+  });
+
+  it("registers OpenRouter with an OpenAI-compatible provider profile and aliases (#5826)", () => {
+    const provider = REMOTE_PROVIDER_CONFIG.openrouter;
+
+    expect(provider).toMatchObject({
+      providerName: "openrouter-api",
+      providerType: "openai",
+      credentialEnv: "OPENROUTER_API_KEY",
+    });
+    expect(NON_INTERACTIVE_PROVIDER_KEYS.has("openrouter")).toBe(true);
+    expect(NON_INTERACTIVE_PROVIDER_ALIASES["open-router"]).toBe("openrouter");
+    expect(NON_INTERACTIVE_PROVIDER_ALIASES.openrouterai).toBe("openrouter");
+    expect(
+      buildProviderArgs(
+        "create",
+        provider.providerName,
+        provider.providerType,
+        provider.credentialEnv,
+        "https://openrouter.ai/api/v1",
+      ),
+    ).toContain("OPENAI_BASE_URL=https://openrouter.ai/api/v1");
+  });
+
   it("keeps the discovery profile Anthropic before agent-specific surface selection (#6289)", () => {
     const provider = REMOTE_PROVIDER_CONFIG.anthropicCompatible;
 
@@ -367,6 +404,51 @@ describe("onboard provider helpers", () => {
         expect(process.env.COMPATIBLE_API_KEY).toBeUndefined();
       },
     );
+  });
+
+  it("supports the NVIDIA QA non-interactive provider-model contract (#6869)", () => {
+    withProviderEnv(
+      {
+        NEMOCLAW_PROVIDER: "ollama",
+        NEMOCLAW_PROVIDER_MODEL: "qwen3.6:35b",
+      },
+      () => {
+        expect(getRequestedModelHint(true)).toBe("qwen3.6:35b");
+      },
+    );
+  });
+
+  it("keeps NEMOCLAW_MODEL ahead of NEMOCLAW_PROVIDER_MODEL", () => {
+    withProviderEnv(
+      {
+        NEMOCLAW_PROVIDER: "ollama",
+        NEMOCLAW_MODEL: "qwen2.5:0.5b",
+        NEMOCLAW_PROVIDER_MODEL: "qwen3.6:35b",
+      },
+      () => {
+        expect(getRequestedModelHint(true)).toBe("qwen2.5:0.5b");
+      },
+    );
+  });
+
+  it("preserves NEMOCLAW_MODEL when the provider-model fallback is disabled", () => {
+    withProviderEnv(
+      {
+        NEMOCLAW_MODEL: "nvidia/nemotron-3-super-120b-a12b",
+        NEMOCLAW_PROVIDER_MODEL: "fallback-model",
+      },
+      () => {
+        expect(getNonInteractiveModel("openai", { allowProviderModelFallback: false })).toBe(
+          "nvidia/nemotron-3-super-120b-a12b",
+        );
+      },
+    );
+  });
+
+  it("omits NEMOCLAW_PROVIDER_MODEL when the provider-model fallback is disabled", () => {
+    withProviderEnv({ NEMOCLAW_PROVIDER_MODEL: "fallback-model" }, () => {
+      expect(getNonInteractiveModel("openai", { allowProviderModelFallback: false })).toBeNull();
+    });
   });
 
   it("stages Deep Agents NEMOCLAW_PROVIDER_KEY as hosted custom inference", () => {

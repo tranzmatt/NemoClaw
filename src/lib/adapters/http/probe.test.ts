@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -102,6 +104,92 @@ describe("http-probe helpers", () => {
     expect(outputPath).not.toBe("");
     expect(fs.existsSync(outputPath)).toBe(false);
     expect(fs.existsSync(path.dirname(outputPath))).toBe(false);
+  });
+
+  it("captures a response at the process byte limit without a body temp file (#8161)", () => {
+    const body = "x".repeat(1024);
+    let maxBuffer: number | undefined;
+    const result = runCurlProbe(["-sS", "https://example.test/models"], {
+      maxResponseBytes: 1024,
+      spawnSyncImpl: (_command, args, options) => {
+        maxBuffer = options.maxBuffer;
+        expect(args).not.toContain("-o");
+        const writeOut = args[args.indexOf("-w") + 1];
+        const statusMarker = writeOut.slice(0, -"%{http_code}".length);
+        return {
+          pid: 1,
+          output: [],
+          stdout: `${body}${statusMarker}200`,
+          stderr: "",
+          status: 0,
+          signal: null,
+        };
+      },
+    });
+
+    expect(result).toMatchObject({ ok: true, httpStatus: 200, curlStatus: 0, body });
+    expect(maxBuffer).toBeGreaterThan(1024);
+    expect(maxBuffer).toBeLessThan(1150);
+  });
+
+  it("maps a process buffer overflow to curl's oversized-response status (#8161)", () => {
+    const result = runCurlProbe(["-sS", "https://example.test/models"], {
+      maxResponseBytes: 1024,
+      spawnSyncImpl: () => ({
+        pid: 1,
+        output: [],
+        stdout: "partial untrusted response",
+        stderr: "partial diagnostic",
+        status: null,
+        signal: "SIGTERM",
+        error: Object.assign(new Error("spawnSync curl ENOBUFS"), { code: "ENOBUFS" }),
+      }),
+    });
+
+    expect(result).toMatchObject({
+      ok: false,
+      httpStatus: 0,
+      curlStatus: 63,
+      body: "",
+      stderr: "curl response exceeded the configured process byte limit",
+    });
+    expect(result.message).not.toContain("partial untrusted response");
+    expect(result.message).not.toContain("partial diagnostic");
+  });
+
+  it("aborts an unknown-length chunked response at the process byte limit (#8161)", async () => {
+    const serverScript = String.raw`
+      const http = require("node:http");
+      const server = http.createServer((_request, response) => {
+        response.writeHead(200, {
+          "Content-Type": "application/json",
+          "Transfer-Encoding": "chunked",
+        });
+        response.write("x".repeat(128 * 1024));
+        response.end("x".repeat(128 * 1024));
+      });
+      server.listen(0, "127.0.0.1", () => {
+        process.stdout.write(String(server.address().port) + "\n");
+      });
+      process.on("SIGTERM", () => server.close(() => process.exit(0)));
+    `;
+    const server = spawn(process.execPath, ["-e", serverScript], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const exit = once(server, "exit");
+    const [portOutput] = await once(server.stdout, "data");
+
+    try {
+      const result = runCurlProbe(
+        ["-sS", "--max-time", "5", `http://127.0.0.1:${Number(String(portOutput).trim())}/`],
+        { maxResponseBytes: 1024, pinnedAddresses: [] },
+      );
+
+      expect(result).toMatchObject({ ok: false, httpStatus: 0, curlStatus: 63, body: "" });
+    } finally {
+      server.kill("SIGTERM");
+      await exit;
+    }
   });
 
   it("lets the process wrapper outlive curl --max-time", () => {
@@ -405,12 +493,16 @@ describe("http-probe helpers", () => {
     }
   });
 
-  it("strips credential-shaped opts.env entries when trustedConfigFiles is supplied", () => {
+  it("strips expanded credential-shaped opts.env entries with trusted config (#5048)", () => {
     const configPath = path.join(os.tmpdir(), "nemoclaw-trusted-curl.conf");
     let spawnedEnv: NodeJS.ProcessEnv | undefined;
     runCurlProbe(["-sS", "--config", configPath, "https://example.test/models"], {
       trustedConfigFiles: [configPath],
-      env: { NVIDIA_API_KEY: "nvapi-should-not-leak", MY_BENIGN_VAR: "should-survive" },
+      env: {
+        CONNECTIONSTRING: "should-not-leak",
+        NVIDIA_API_KEY: "nvapi-should-not-leak",
+        MY_BENIGN_VAR: "should-survive",
+      },
       spawnSyncImpl: (_command, _args, options) => {
         spawnedEnv = options.env as NodeJS.ProcessEnv;
         return {
@@ -424,6 +516,7 @@ describe("http-probe helpers", () => {
       },
     });
 
+    expect(spawnedEnv?.CONNECTIONSTRING).toBeUndefined();
     expect(spawnedEnv?.NVIDIA_API_KEY).toBeUndefined();
     expect(spawnedEnv?.MY_BENIGN_VAR).toBe("should-survive");
   });
@@ -457,6 +550,94 @@ describe("http-probe helpers", () => {
     expect(spawnedEnv?.HTTP_PROXY).toBe("http://proxy.internal:3128");
     expect(spawnedEnv?.NVIDIA_API_KEY).toBeUndefined();
     expect(spawnedEnv?.MY_SECRET_TOKEN).toBeUndefined();
+  });
+
+  it("bypasses ambient proxies when --resolve pins the validated origin (#6293)", () => {
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+    runCurlProbe(
+      ["-sS", "--resolve", "example.test:443:93.184.216.34", "https://example.test/models"],
+      {
+        pinnedAddresses: ["93.184.216.34"],
+        replaceEnv: true,
+        env: {
+          PATH: "/usr/bin",
+          HTTP_PROXY: "http://proxy.internal:3128",
+          HTTPS_PROXY: "http://proxy.internal:3128",
+          ALL_PROXY: "socks5://proxy.internal:1080",
+          http_proxy: "http://proxy.internal:3128",
+          https_proxy: "http://proxy.internal:3128",
+          all_proxy: "socks5://proxy.internal:1080",
+        },
+        spawnSyncImpl: (_command, _args, options) => {
+          spawnedEnv = options.env as NodeJS.ProcessEnv;
+          return {
+            pid: 1,
+            output: [],
+            stdout: "200",
+            stderr: "",
+            status: 0,
+            signal: null,
+          };
+        },
+      },
+    );
+
+    for (const name of [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+    ]) {
+      expect(spawnedEnv?.[name]).toBeUndefined();
+    }
+    expect(spawnedEnv?.NO_PROXY).toBe("*");
+    expect(spawnedEnv?.no_proxy).toBe("*");
+  });
+
+  it.each([
+    "http://127.0.0.1:8000/v1/models",
+    "https://inference.local/v1/models",
+    "https://93.184.216.34/v1/models",
+  ])("bypasses ambient proxies for approved no-pin origin %s (#6293)", (url) => {
+    let spawnedEnv: NodeJS.ProcessEnv | undefined;
+    runCurlProbe(["-sS", url], {
+      pinnedAddresses: [],
+      replaceEnv: true,
+      env: {
+        HTTP_PROXY: "http://proxy.internal:3128",
+        HTTPS_PROXY: "http://proxy.internal:3128",
+        ALL_PROXY: "socks5://proxy.internal:1080",
+        http_proxy: "http://proxy.internal:3128",
+        https_proxy: "http://proxy.internal:3128",
+        all_proxy: "socks5://proxy.internal:1080",
+      },
+      spawnSyncImpl: (_command, _args, options) => {
+        spawnedEnv = options.env as NodeJS.ProcessEnv;
+        return {
+          pid: 1,
+          output: [],
+          stdout: "200",
+          stderr: "",
+          status: 0,
+          signal: null,
+        };
+      },
+    });
+
+    for (const name of [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+    ]) {
+      expect(spawnedEnv?.[name]).toBeUndefined();
+    }
+    expect(spawnedEnv?.NO_PROXY).toBe("*");
+    expect(spawnedEnv?.no_proxy).toBe("*");
   });
 
   it("scrubs credential-shaped env even when trustedConfigFiles is not supplied", () => {

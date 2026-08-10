@@ -150,13 +150,17 @@ export function areRequiredDockerDriverBinariesPresent(
   return true;
 }
 
-export function ensureOpenshellForOnboard(deps: OpenShellInstallDeps): OpenShellInstallResult {
+export function ensureOpenshellForOnboard(
+  deps: OpenShellInstallDeps,
+  options: { afterSuccessfulInstall?(): void } = {},
+): OpenShellInstallResult {
   const platform = deps.platform ?? process.platform;
   const arch = deps.arch ?? process.arch;
   let openshellInstall: OpenShellInstallResult = {
     localBin: null,
     futureShellPathHint: null,
   };
+  const minOpenshellVersion = deps.getBlueprintMinOpenshellVersion() ?? "0.0.101";
 
   if (!deps.isOpenshellInstalled()) {
     deps.log("  openshell CLI not found. Installing...");
@@ -177,7 +181,6 @@ export function ensureOpenshellForOnboard(deps: OpenShellInstallDeps): OpenShell
         deps.exit(1);
       }
     } else {
-      const minOpenshellVersion = deps.getBlueprintMinOpenshellVersion() ?? "0.0.72";
       const currentVersionOutput = deps.runCaptureOpenshell(["--version"], {
         ignoreError: true,
       });
@@ -200,7 +203,7 @@ export function ensureOpenshellForOnboard(deps: OpenShellInstallDeps): OpenShell
         } else if (needsDockerDriverBinaries) {
           const required = platform === "linux" ? "gateway and sandbox" : "gateway";
           deps.log(
-            `  OpenShell standalone gateway onboarding requires the ${required} binaries. Reinstalling...`,
+            `  OpenShell Docker-driver gateway onboarding requires the ${required} binaries. Reinstalling...`,
           );
         } else if (needsMessagingFeatures) {
           deps.log(
@@ -224,7 +227,6 @@ export function ensureOpenshellForOnboard(deps: OpenShellInstallDeps): OpenShell
   });
   deps.log(`  \u2713 openshell CLI: ${openshellVersionOutput || "unknown"}`);
   const installedOpenshellVersion = deps.getInstalledOpenshellVersion(openshellVersionOutput);
-  const minOpenshellVersion = deps.getBlueprintMinOpenshellVersion();
   if (
     installedOpenshellVersion &&
     minOpenshellVersion &&
@@ -287,5 +289,6 @@ export function ensureOpenshellForOnboard(deps: OpenShellInstallDeps): OpenShell
       "  Add that export to your shell profile, or open a new terminal before running openshell directly.",
     );
   }
+  if (openshellInstall.installed === true) options.afterSuccessfulInstall?.();
   return openshellInstall;
 }

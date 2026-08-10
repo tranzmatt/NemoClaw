@@ -101,13 +101,13 @@ beforeEach(() => {
   selectForRemovalMock = vi.spyOn(policies, "selectForRemoval").mockResolvedValue("pypi");
   vi.spyOn(policies, "loadPreset").mockImplementation((name: unknown) => {
     const presetName = String(name);
-    return `network_policies:\n  ${presetName}:\n    host: ${presetName}.example.com\n`;
+    return `network_policies:\n  ${presetName}:\n    name: ${presetName}\n    endpoints:\n      - host: ${presetName}.example.com\n        port: 443\n        protocol: rest\n        rules:\n          - allow: { method: GET, path: "/**" }\n`;
   });
   loadPresetForSandboxMock = vi
     .spyOn(policies, "loadPresetForSandbox")
     .mockImplementation((_sandboxName: unknown, name: unknown) => {
       const presetName = String(name);
-      return `network_policies:\n  ${presetName}:\n    host: ${presetName}.example.com\n`;
+      return `network_policies:\n  ${presetName}:\n    name: ${presetName}\n    endpoints:\n      - host: ${presetName}.example.com\n        port: 443\n        protocol: rest\n        rules:\n          - allow: { method: GET, path: "/**" }\n`;
     });
   applyPresetMock = vi.spyOn(policies, "applyPreset").mockReturnValue(true);
   removePresetMock = vi.spyOn(policies, "removePreset").mockReturnValue(true);
@@ -123,7 +123,9 @@ describe("addSandboxPolicy", () => {
     await addSandboxPolicy("test-sandbox");
 
     expect(promptMock).toHaveBeenCalledWith("  Apply 'pypi' to sandbox 'test-sandbox'? [Y/n]: ");
-    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "pypi");
+    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "pypi", {
+      suppressDisclosure: true,
+    });
   });
 
   it("skips applying an interactively selected preset when confirmation is declined", async () => {
@@ -140,7 +142,8 @@ describe("addSandboxPolicy", () => {
 
     expect(promptMock).not.toHaveBeenCalled();
     expect(applyPresetMock).not.toHaveBeenCalled();
-    expect(printedText()).toContain("Endpoints that would be opened: pypi.example.com");
+    expect(printedText()).toContain("Effective egress that would be opened:");
+    expect(printedText()).toContain("- pypi.example.com:443");
     expect(printedText()).toContain("--dry-run: no changes applied.");
   });
 
@@ -148,7 +151,9 @@ describe("addSandboxPolicy", () => {
     await addSandboxPolicy("test-sandbox", { preset: "pypi", yes: true });
 
     expect(promptMock).not.toHaveBeenCalled();
-    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "pypi");
+    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "pypi", {
+      suppressDisclosure: true,
+    });
   });
 
   it("honors non-interactive mode when an explicit preset is provided", async () => {
@@ -157,7 +162,9 @@ describe("addSandboxPolicy", () => {
     await addSandboxPolicy("test-sandbox", { preset: "pypi" });
 
     expect(promptMock).not.toHaveBeenCalled();
-    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "pypi");
+    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "pypi", {
+      suppressDisclosure: true,
+    });
   });
 
   it("fails fast in non-interactive mode without an explicit preset", async () => {
@@ -166,6 +173,28 @@ describe("addSandboxPolicy", () => {
     await expect(captureExit(() => addSandboxPolicy("test-sandbox"))).resolves.toBe(1);
 
     expect(printedText()).toContain("Non-interactive mode requires a preset name.");
+    expect(applyPresetMock).not.toHaveBeenCalled();
+  });
+
+  it("exits non-zero when the add picker reaches stdin EOF (#7418)", async () => {
+    selectFromListMock.mockRejectedValueOnce(
+      Object.assign(new Error("Prompt closed before input"), { code: "EOF" }),
+    );
+
+    await expect(captureExit(() => addSandboxPolicy("test-sandbox"))).resolves.toBe(1);
+
+    // Names the real condition rather than reporting non-interactive mode,
+    // which is not what happened here.
+    expect(printedText()).toContain("No input available on stdin");
+    expect(applyPresetMock).not.toHaveBeenCalled();
+  });
+
+  it("propagates a non-EOF picker failure instead of exiting (#7418)", async () => {
+    const failure = Object.assign(new Error("stdin read failed"), { code: "EIO" });
+    selectFromListMock.mockRejectedValueOnce(failure);
+
+    await expect(addSandboxPolicy("test-sandbox")).rejects.toBe(failure);
+
     expect(applyPresetMock).not.toHaveBeenCalled();
   });
 
@@ -242,7 +271,7 @@ describe("addSandboxPolicy", () => {
     expect(output).not.toContain("not supported for agent");
     expect(output).not.toContain("Channels supported by agent");
     expect(output).not.toContain("Preset not found");
-    expect(output).not.toContain("Endpoints that would be opened");
+    expect(output).not.toContain("Effective egress that would be opened");
     expect(promptMock).not.toHaveBeenCalled();
     expect(loadPresetForSandboxMock).not.toHaveBeenCalled();
     expect(applyPresetMock).not.toHaveBeenCalled();
@@ -275,7 +304,9 @@ describe("addSandboxPolicy", () => {
 
     expect(printedText()).toContain(expected);
     expect(printedText()).toContain(detail);
-    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", preset);
+    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", preset, {
+      suppressDisclosure: true,
+    });
   });
 
   it("prints Discord validation guidance when the preset name is provided", async () => {
@@ -284,7 +315,9 @@ describe("addSandboxPolicy", () => {
     expect(printedText()).toContain("curl is not in the preset binary allowlist");
     expect(printedText()).toContain("Node HTTPS");
     expect(promptMock).not.toHaveBeenCalled();
-    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "discord");
+    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "discord", {
+      suppressDisclosure: true,
+    });
   });
 
   it("does not print messaging guidance when a non-messaging preset is selected", async () => {
@@ -292,7 +325,9 @@ describe("addSandboxPolicy", () => {
 
     expect(printedText()).not.toContain("only opens network egress to the");
     expect(printedText()).not.toContain("re-run 'nemoclaw onboard' and select");
-    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "pypi");
+    expect(applyPresetMock).toHaveBeenCalledWith("test-sandbox", "pypi", {
+      suppressDisclosure: true,
+    });
   });
 });
 
@@ -348,6 +383,17 @@ describe("removeSandboxPolicy", () => {
     await expect(captureExit(() => removeSandboxPolicy("test-sandbox"))).resolves.toBe(1);
 
     expect(printedText()).toContain("Non-interactive mode requires a preset name.");
+    expect(removePresetMock).not.toHaveBeenCalled();
+  });
+
+  it("exits non-zero when the remove picker reaches stdin EOF (#7418)", async () => {
+    selectForRemovalMock.mockRejectedValueOnce(
+      Object.assign(new Error("Prompt closed before input"), { code: "EOF" }),
+    );
+
+    await expect(captureExit(() => removeSandboxPolicy("test-sandbox"))).resolves.toBe(1);
+
+    expect(printedText()).toContain("No input available on stdin");
     expect(removePresetMock).not.toHaveBeenCalled();
   });
 });

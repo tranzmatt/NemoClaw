@@ -6,7 +6,10 @@ import type { SandboxEntry } from "../state/registry";
 import {
   checkGatewayRouteCompatibility,
   formatGatewayRouteConflict,
+  formatGatewayRouteImpactWarning,
   type GatewayInferenceRoute,
+  isAdvisoryGatewayRouteConflict,
+  isAdvisoryProviderModelRouteConflict,
   preflightGatewayRouteDiscovery,
 } from "./gateway-route-compatibility";
 
@@ -102,6 +105,54 @@ describe("shared gateway inference route compatibility", () => {
     });
   });
 
+  it("preserves llama.cpp endpoint and completions API as durable route identity (#8161)", () => {
+    const result = discover(
+      discoveryRoute("llama-cpp-local", {
+        credentialEnv: "NEMOCLAW_LLAMACPP_LOCAL_TOKEN",
+      }),
+      [
+        sandbox("llama-peer", {
+          provider: "llama-cpp-local",
+          model: "team/model-alias",
+          endpointUrl: "http://127.0.0.1:8081/v1",
+          preferredInferenceApi: "openai-completions",
+          credentialEnv: "NEMOCLAW_LLAMACPP_LOCAL_TOKEN",
+        }),
+      ],
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      requiredModel: "team/model-alias",
+      requiredEndpointUrl: "http://127.0.0.1:8081/v1",
+      requiredInferenceApi: "openai-completions",
+    });
+  });
+
+  it("blocks a conflicting llama.cpp endpoint on a shared gateway (#8161)", () => {
+    const result = check(
+      route("llama-cpp-local", "team/model-alias", {
+        endpointUrl: "http://127.0.0.1:8081/v1",
+        preferredInferenceApi: "openai-completions",
+        credentialEnv: "NEMOCLAW_LLAMACPP_LOCAL_TOKEN",
+      }),
+      [
+        sandbox("llama-peer", {
+          provider: "llama-cpp-local",
+          model: "team/model-alias",
+          endpointUrl: "http://localhost:8082/v1",
+          preferredInferenceApi: "openai-completions",
+          credentialEnv: "NEMOCLAW_LLAMACPP_LOCAL_TOKEN",
+        }),
+      ],
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      conflicts: [{ sandboxName: "llama-peer", reason: "custom-endpoint" }],
+    });
+  });
+
   it("blocks conflicting or unprovable discovery before a provider probe (#6315)", () => {
     expect(discover(discoveryRoute("anthropic-prod"), [sandbox("stopped-peer")])).toMatchObject({
       ok: false,
@@ -138,7 +189,7 @@ describe("shared gateway inference route compatibility", () => {
     ).toEqual({ ok: true });
   });
 
-  it("blocks provider or model conflicts from every same-gateway registry row (#6315)", () => {
+  it("classifies valid provider or model differences as advisory and names affected sandboxes (#6315)", () => {
     const result = check(route("anthropic-prod", "claude-new"), [sandbox("stopped-peer")]);
 
     expect(result).toMatchObject({
@@ -148,6 +199,16 @@ describe("shared gateway inference route compatibility", () => {
     expect(formatGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toContain(
       "Stopped sandboxes are included",
     );
+    expect(isAdvisoryGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toBe(
+      true,
+    );
+    expect(
+      isAdvisoryProviderModelRouteConflict(result as Exclude<typeof result, { ok: true }>),
+    ).toBe(true);
+    const warning = formatGatewayRouteImpactWarning(result as Exclude<typeof result, { ok: true }>);
+    expect(warning).toContain("will re-point the one shared inference route");
+    expect(warning).toContain("'stopped-peer' (nvidia-prod / nvidia/model-a)");
+    expect(warning).toContain("not per sandbox");
   });
 
   it("allows different routes on different gateways (#6315)", () => {
@@ -223,25 +284,34 @@ describe("shared gateway inference route compatibility", () => {
     });
   });
 
-  it("ignores credential environment differences in route identity (#6315)", () => {
-    expect(
-      check(
-        route("compatible-endpoint", "custom/model", {
+  it("fails closed before replacing a shared provider credential identity (#6315)", () => {
+    const result = check(
+      route("compatible-endpoint", "custom/model", {
+        endpointUrl: "https://example.test/v1",
+        preferredInferenceApi: "openai-completions",
+        credentialEnv: "REQUESTED_KEY",
+      }),
+      [
+        sandbox("custom-peer", {
+          provider: "compatible-endpoint",
+          model: "custom/model",
           endpointUrl: "https://example.test/v1",
           preferredInferenceApi: "openai-completions",
-          credentialEnv: "REQUESTED_KEY",
+          credentialEnv: "RECORDED_KEY",
         }),
-        [
-          sandbox("custom-peer", {
-            provider: "compatible-endpoint",
-            model: "custom/model",
-            endpointUrl: "https://example.test/v1",
-            preferredInferenceApi: "openai-completions",
-            credentialEnv: "RECORDED_KEY",
-          }),
-        ],
-      ),
-    ).toEqual({ ok: true });
+      ],
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      conflicts: [{ sandboxName: "custom-peer", reason: "provider-credential" }],
+    });
+    expect(formatGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toContain(
+      "different credential identity",
+    );
+    expect(isAdvisoryGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toBe(
+      false,
+    );
   });
 
   it.each([
@@ -271,6 +341,37 @@ describe("shared gateway inference route compatibility", () => {
     );
 
     expect(result).toMatchObject({ ok: false, conflicts: [{ reason }] });
+    expect(isAdvisoryGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toBe(
+      false,
+    );
+    expect(
+      isAdvisoryProviderModelRouteConflict(result as Exclude<typeof result, { ok: true }>),
+    ).toBe(false);
+  });
+
+  it("does not let a model difference hide a custom endpoint conflict (#6315)", () => {
+    const result = check(
+      route("compatible-endpoint", "target/model", {
+        endpointUrl: "https://target.example.test/v1",
+        preferredInferenceApi: "openai-completions",
+      }),
+      [
+        sandbox("custom-peer", {
+          provider: "compatible-endpoint",
+          model: "peer/model",
+          endpointUrl: "https://peer.example.test/v1",
+          preferredInferenceApi: "openai-completions",
+        }),
+      ],
+    );
+
+    expect(result).toMatchObject({
+      ok: false,
+      conflicts: [{ sandboxName: "custom-peer", reason: "custom-endpoint" }],
+    });
+    expect(
+      isAdvisoryProviderModelRouteConflict(result as Exclude<typeof result, { ok: true }>),
+    ).toBe(false);
   });
 
   it.each([
@@ -305,6 +406,34 @@ describe("shared gateway inference route compatibility", () => {
     expect(formatGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toContain(
       "remove and re-onboard that sandbox with complete custom-route metadata",
     );
+    expect(isAdvisoryGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toBe(
+      false,
+    );
+  });
+
+  it("fails closed when a different provider encounters an incomplete custom peer (#6315)", () => {
+    const result = check(route("anthropic-prod", "claude-new"), [
+      sandbox("legacy-custom", {
+        provider: "compatible-endpoint",
+        model: "custom/model",
+        endpointUrl: null,
+        preferredInferenceApi: "openai-completions",
+      }),
+    ]);
+
+    expect(result).toMatchObject({
+      ok: false,
+      conflicts: [
+        {
+          sandboxName: "legacy-custom",
+          reason: "incomplete-custom-route",
+          scope: "registered",
+        },
+      ],
+    });
+    expect(isAdvisoryGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toBe(
+      false,
+    );
   });
 
   it("fails closed when a requested custom route has no API metadata or peers (#6315)", () => {
@@ -328,6 +457,9 @@ describe("shared gateway inference route compatibility", () => {
     });
     expect(formatGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toContain(
       "requested custom route lacks durable endpoint or API-family metadata",
+    );
+    expect(isAdvisoryGatewayRouteConflict(result as Exclude<typeof result, { ok: true }>)).toBe(
+      false,
     );
   });
 

@@ -7,11 +7,89 @@ import {
   classifySandboxContainerFailureForStatus,
   classifySandboxStatusPreflightFailure,
   getSandboxStatusInferenceHealth,
+  getSandboxStatusReport,
   isDockerDaemonUnreachableForStatus,
   maybeGetSandboxStatusInferenceHealth,
+  resolveSandboxStatusDcodeAutoApprovalMode,
   sandboxGpuProofStatusSuffix,
   sandboxGpuProofUnverified,
 } from "./status";
+
+describe("sandbox status DCode auto-approval (#6478)", () => {
+  it("defaults legacy DCode entries to disabled", () => {
+    expect(
+      resolveSandboxStatusDcodeAutoApprovalMode({
+        name: "dcode",
+        agent: "langchain-deepagents-code",
+      } as never),
+    ).toBe("disabled");
+  });
+
+  it("projects durable serving profile provenance into JSON status (#8384)", async () => {
+    const provenance = {
+      schemaVersion: 1,
+      catalogDigest: `sha256:${"1".repeat(64)}`,
+      preset: {
+        id: "vllm.dgx-spark-gb10.single.example",
+        digest: `sha256:${"2".repeat(64)}`,
+        displayName: "Example Spark profile",
+        supportState: "experimental",
+      },
+      recipe: {
+        id: "vllm.dgx-spark-gb10.single.example",
+        digest: `sha256:${"3".repeat(64)}`,
+        backend: "vllm",
+      },
+      model: { id: "example/model", revision: "revision-1" },
+      runtimeImage: null,
+      estimatedImageDownloadBytes: null,
+      estimatedModelDownloadBytes: null,
+    } as const;
+    const report = await getSandboxStatusReport("profile-test", {
+      getSandbox: () =>
+        ({
+          name: "profile-test",
+          agent: "openclaw",
+          servingProfileProvenance: provenance,
+        }) as never,
+      reconcile: async () => ({ state: "missing" as const, output: "not found" }),
+    });
+
+    expect(report.servingProfileProvenance).toEqual(provenance);
+  });
+
+  it("projects effective DCode mode into JSON while using null for other agents", async () => {
+    const missingLookup = async () => ({ state: "missing" as const, output: "not found" });
+    const legacyDcode = await getSandboxStatusReport("dcode", {
+      getSandbox: () => ({ name: "dcode", agent: "langchain-deepagents-code" }) as never,
+      reconcile: missingLookup,
+    });
+    const openclaw = await getSandboxStatusReport("openclaw", {
+      getSandbox: () => ({ name: "openclaw", agent: "openclaw" }) as never,
+      reconcile: missingLookup,
+    });
+
+    expect(legacyDcode.dcodeAutoApprovalMode).toBe("disabled");
+    expect(openclaw.dcodeAutoApprovalMode).toBeNull();
+  });
+
+  it("reports the recorded DCode mode and omits it for other agents", () => {
+    expect(
+      resolveSandboxStatusDcodeAutoApprovalMode({
+        name: "dcode",
+        agent: "langchain-deepagents-code",
+        dcodeAutoApprovalMode: "thread-opt-in",
+      } as never),
+    ).toBe("thread-opt-in");
+    expect(
+      resolveSandboxStatusDcodeAutoApprovalMode({
+        name: "openclaw",
+        agent: "openclaw",
+        dcodeAutoApprovalMode: "thread-opt-in",
+      } as never),
+    ).toBeNull();
+  });
+});
 
 describe("sandbox status inference health", () => {
   it("passes the current model with the current provider", () => {

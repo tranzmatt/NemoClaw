@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { OPENSHELL_PROBE_TIMEOUT_MS } from "../adapters/openshell/timeouts";
 import type { AgentDefinition } from "../agent/defs";
+import { getInteractiveAgentCommand } from "../agent/gateway-restart-scripts";
 import { DASHBOARD_PORT } from "../core/ports";
 import { buildChain, buildControlUiUrls, buildFallbackControlUiUrls } from "../dashboard/contract";
 import * as nim from "../inference/nim";
@@ -31,12 +32,13 @@ import {
   buildDetachedForwardStartSpawn,
   buildForwardStartProgressLogger,
   looksLikeForwardPortConflict,
-  runDetachedForwardStartWithPortReleaseRetries,
+  runDetachedForwardStartWithRetries,
 } from "./forward-start";
 import {
   ensureMessagingHostForwardForSandbox,
   resolveMessagingHostForwardForSandbox,
 } from "./messaging-host-forward";
+import { buildSshForwardHintLines } from "./ssh-forward-hint";
 
 const ANSI_RE = /\x1B(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1B\\)|[@-_])/g;
 export const CONTROL_UI_PORT = DASHBOARD_PORT;
@@ -58,6 +60,8 @@ export interface OnboardDashboardDeps {
   isWsl(): boolean;
   redact(value: unknown): string;
   sleep(seconds: number): void;
+  /** Environment used to detect an SSH session for the port-forward hint. */
+  env?: NodeJS.ProcessEnv;
   // Sandbox-registry lookup used by `ensureDashboardForward` for the
   // cross-gateway dashboard port view. Tests inject a stub so the allocator
   // never reads the runner's real `~/.nemoclaw/sandboxes.json`; production
@@ -70,6 +74,7 @@ export interface OnboardDashboardDeps {
     deps: {
       note: (msg: string) => void;
       buildControlUiUrls: (token: string | null, port: number) => string[];
+      effectiveDashboardPort?: number;
     },
   ): void;
 }
@@ -111,6 +116,7 @@ export interface OnboardDashboardHelpers {
     provider: string,
     nimContainer?: string | null,
     agent?: AgentDefinition | null,
+    ready?: boolean,
   ): void;
   stopAllDashboardForwards(): void;
 }
@@ -257,11 +263,13 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
     const messagingForward = resolveMessagingHostForwardForSandbox(sandboxName);
     if (messagingForward) preservedPorts.add(String(messagingForward.port));
     const preferredPort = Number(getDashboardForwardPort(chatUiUrl));
-    const stopForwardForSandbox = createSandboxForwardStopper({
-      runOpenshell: deps.runOpenshell,
-      runCaptureOpenshell: deps.runCaptureOpenshell,
-      sandboxName,
-    });
+    const makeStopForwardForSandbox = () =>
+      createSandboxForwardStopper({
+        runOpenshell: deps.runOpenshell,
+        runCaptureOpenshell: deps.runCaptureOpenshell,
+        sandboxName,
+      });
+    const stopForwardForSandbox = makeStopForwardForSandbox();
     let existingForwards = deps.runCaptureOpenshell(["forward", "list"], { ignoreError: true });
     const preferredEntry = findForwardEntry(existingForwards, String(preferredPort));
     if (
@@ -314,7 +322,7 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
     parsedUrl.port = String(actualPort);
     const actualTarget = getDashboardForwardTarget(parsedUrl.toString());
     stopForwardForSandbox(actualPort);
-    const { ok: fwdOk, diagnostic: fwdDiagnostic } = runDetachedForwardStartWithPortReleaseRetries(
+    const { ok: fwdOk, diagnostic: fwdDiagnostic } = runDetachedForwardStartWithRetries(
       buildDetachedForwardStartSpawn(
         deps.openshellArgv(["forward", "start", "--background", actualTarget, sandboxName]),
       ),
@@ -324,7 +332,10 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
       { port: actualPort, sandboxName },
       () => {
         deps.sleep(1);
-        stopForwardForSandbox(actualPort);
+        // The setup stopper intentionally de-duplicates ports. A port-conflict
+        // retry needs a fresh sandbox-scoped stopper so it can preserve the
+        // established conflict-recovery behavior despite that one-shot guard.
+        makeStopForwardForSandbox()(actualPort);
       },
       { onProgress: buildForwardStartProgressLogger(actualPort) },
     );
@@ -375,10 +386,13 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
     sandboxName: string,
     agent: { forwardPort?: number | null; forward_ports?: number[] | null },
   ): number {
+    const chatUiUrl = process.env.CHAT_UI_URL;
     return ensureAgentDashboardForwardForAgent({
       sandboxName,
       agent,
       ensureDashboardForward,
+      chatUiUrl,
+      controlUiPort: chatUiUrl ? Number(getDashboardForwardPort(chatUiUrl)) : undefined,
     });
   }
 
@@ -426,12 +440,33 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
     }
   }
 
+  /**
+   * Print the terminal handoff for a ready sandbox. `launch` runs the same
+   * preflight as `connect` and then starts the agent (#6006), so it leads. The
+   * `connect` path stays documented for anyone who wants a sandbox shell, and
+   * the command it tells the user to run comes from the agent manifest rather
+   * than a hardcoded `openclaw tui`.
+   */
+  function printTerminalHandoff(
+    indent: string,
+    sandboxName: string,
+    agent: AgentDefinition | null,
+  ): void {
+    console.log(`${indent}Terminal:`);
+    console.log(`${indent}  ${deps.cliName()} launch ${sandboxName}`);
+    console.log("");
+    console.log(`${indent}  Or open a sandbox shell first:`);
+    console.log(`${indent}    ${deps.cliName()} ${sandboxName} connect`);
+    console.log(`${indent}    then run: ${getInteractiveAgentCommand(agent, agent?.name)}`);
+  }
+
   function printDashboard(
     sandboxName: string,
     model: string,
     provider: string,
     nimContainer: string | null = null,
     agent: AgentDefinition | null = null,
+    ready = true,
   ): void {
     const nimStatus = deps.nimStatus ?? nim.nimStatus;
     const nimStatusByName = deps.nimStatusByName ?? nim.nimStatusByName;
@@ -464,7 +499,7 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
 
     console.log("");
     console.log(`  ${"─".repeat(50)}`);
-    console.log(`  ${deps.agentProductName()} is ready`);
+    console.log(`  ${deps.agentProductName()} is ${ready ? "ready" : "not ready"}`);
     console.log("");
     console.log(`  Sandbox:  ${sandboxName}`);
     console.log(`  Model:    ${model} (${providerLabel})`);
@@ -477,6 +512,7 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
       console.log("");
       deps.printAgentDashboardUi(sandboxName, token, agent, {
         note: deps.note,
+        effectiveDashboardPort: chain.port,
         buildControlUiUrls: (tokenValue: string | null, port: number) => {
           const primary = buildControlUiUrls(tokenValue, port);
           const alternates = buildFallbackControlUiUrls(tokenValue, port, [
@@ -487,8 +523,7 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
         },
       });
       console.log("");
-      console.log("  Terminal:");
-      console.log(`    ${deps.cliName()} ${sandboxName} connect`);
+      printTerminalHandoff("  ", sandboxName, agent);
     } else if (token) {
       console.log("  Start chatting");
       console.log("");
@@ -496,9 +531,7 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
       console.log(`      ${dashboardUrl}`);
       printWslFallback(fallbackDashboardUrls, "    ");
       console.log("");
-      console.log("    Terminal:");
-      console.log(`      ${deps.cliName()} ${sandboxName} connect`);
-      console.log("      then run: openclaw tui");
+      printTerminalHandoff("    ", sandboxName, agent);
       console.log("");
       console.log("  Authenticated dashboard URL, if needed:");
       console.log(`    ${deps.cliName()} ${sandboxName} dashboard-url --quiet`);
@@ -510,9 +543,18 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
       console.log(`      ${dashboardUrl}`);
       printWslFallback(fallbackDashboardUrls, "    ");
       console.log("");
-      console.log("    Terminal:");
-      console.log(`      ${deps.cliName()} ${sandboxName} connect`);
-      console.log("      then run: openclaw tui");
+      printTerminalHandoff("    ", sandboxName, agent);
+    }
+    const sshForwardHint = buildSshForwardHintLines({
+      port: chain.port,
+      accessUrl: chain.accessUrl,
+      env: deps.env,
+    });
+    if (sshForwardHint) {
+      console.log("");
+      for (const line of sshForwardHint) {
+        console.log(line);
+      }
     }
     console.log("");
     console.log("  Manage later");
@@ -522,7 +564,7 @@ export function createOnboardDashboardHelpers(deps: OnboardDashboardDeps): Onboa
     console.log(
       `    Model:       ${deps.cliName()} inference set --model <model> --provider <provider> --sandbox ${sandboxName}`,
     );
-    console.log(`    Policies:    ${deps.cliName()} ${sandboxName} policy-add`);
+    console.log(`    Policies:    ${deps.cliName()} ${sandboxName} policy add`);
     console.log(
       `    Credentials: ${deps.cliName()} credentials reset <KEY> && ${deps.cliName()} onboard`,
     );

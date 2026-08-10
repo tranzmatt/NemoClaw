@@ -1,64 +1,77 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
 import { describe, expect, it } from "vitest";
-import YAML from "yaml";
 import {
-  evaluateE2eWorkflowDispatchSelectors,
-  formatFreeStandingJobsInventoryForShell,
-  readFreeStandingJobsInventory,
   validateE2eWorkflowBoundary,
-  validateFreeStandingWorkflowInventory,
+  validateJetsonRunnerDispatchBoundary,
 } from "../../../tools/e2e/workflow-boundary.mts";
 import { readWorkflow } from "../../helpers/e2e-workflow-contract.ts";
 
+function validateWorkflowMutation(
+  mutate: (workflow: ReturnType<typeof readWorkflow>) => void,
+): string[] {
+  const workflow = readWorkflow();
+  mutate(workflow);
+  return validateJetsonRunnerDispatchBoundary(workflow);
+}
+
 describe("Jetson nvmap GPU E2E workflow boundary", () => {
-  it("keeps Jetson selectable but excluded from full-suite dispatch", () => {
-    const inventory = readFreeStandingJobsInventory();
-    expect(validateE2eWorkflowBoundary()).toEqual([]);
-    expect(inventory.allowedJobs).toContain("jetson-nvmap-gpu");
-    expect(inventory.explicitOnlyJobs).toContain("jetson-nvmap-gpu");
-    expect(formatFreeStandingJobsInventoryForShell(inventory)).toContain(
-      "explicit_only_jobs_csv=openshell-gateway-auth-contract,mcp-bridge-dev,hermes-gpu-startup,sandbox-rlimits-connect,jetson-nvmap-gpu",
+  it("rejects a permissive Jetson runner opt-in", () => {
+    const inputErrors = validateWorkflowMutation((workflow) => {
+      const triggers = (workflow.on ?? workflow[true as unknown as string]) as {
+        workflow_dispatch?: {
+          inputs?: Record<string, { default?: unknown; description?: string; type?: string }>;
+        };
+      };
+      const input = triggers.workflow_dispatch!.inputs!.allow_jetson_runner_queue;
+      input.type = "string";
+      input.default = true;
+      input.description = "Queue the runner";
+    });
+    expect(inputErrors).toEqual(
+      expect.arrayContaining([
+        "workflow_dispatch allow_jetson_runner_queue input must be boolean",
+        "workflow_dispatch allow_jetson_runner_queue input must default to false",
+        "workflow_dispatch allow_jetson_runner_queue input must require repository administrator confirmation from the authoritative NVIDIA/NemoClaw Settings -> Actions -> Runners inventory and document queued timeout behavior",
+      ]),
     );
-    expect(inventory.targetToJob.get("jetson-nvmap-gpu")).toBe("jetson-nvmap-gpu");
-    expect(evaluateE2eWorkflowDispatchSelectors({}).selectedFreeStandingJobs).not.toContain(
-      "jetson-nvmap-gpu",
+
+    const guardErrors = validateWorkflowMutation((workflow) => {
+      const job = (workflow.jobs as Record<string, unknown>)["jetson-nvmap-gpu"] as {
+        "runs-on"?: string;
+        if?: string;
+        steps?: Array<{ name?: string }>;
+      };
+      job["runs-on"] = "self-hosted";
+      job.if = "${{ true }}";
+      job.steps!.push({ name: "Guard Jetson runner dispatch" });
+    });
+    expect(guardErrors).toEqual(
+      expect.arrayContaining([
+        "jetson-nvmap-gpu job must require allow_jetson_runner_queue before runner assignment and retain trusted-main selectors",
+        "jetson-nvmap-gpu job must use the configured runner only after job-level opt-in",
+        "jetson-nvmap-gpu must enforce opt-in before runner assignment, not in a step",
+      ]),
     );
   });
 
-  it("rejects invalid explicit-only workflow metadata", () => {
-    const workflow = readWorkflow();
-    const jobs = workflow.jobs as Record<string, { env?: Record<string, unknown> }>;
-    jobs["jetson-nvmap-gpu"].env!.E2E_DEFAULT_ENABLED = "yes";
-    const directory = mkdtempSync(join(tmpdir(), "nemoclaw-explicit-only-"));
-    const workflowPath = join(directory, "workflow.yaml");
-    try {
-      writeFileSync(workflowPath, YAML.stringify(workflow));
-      expect(validateFreeStandingWorkflowInventory(workflowPath)).toContain(
-        'jetson-nvmap-gpu job E2E_DEFAULT_ENABLED must be "0" when set',
-      );
-    } finally {
-      rmSync(directory, { force: true, recursive: true });
-    }
+  it("requires the Jetson flag at the job boundary", () => {
+    const errors = validateWorkflowMutation((workflow) => {
+      const job = (workflow.jobs as Record<string, unknown>)["jetson-nvmap-gpu"] as {
+        if?: string;
+      };
+      job.if = job.if?.replace("inputs.allow_jetson_runner_queue && ", "");
+    });
+
+    expect(errors).toContain(
+      "jetson-nvmap-gpu job must require allow_jetson_runner_queue before runner assignment and retain trusted-main selectors",
+    );
   });
 
-  it("runs Jetson only when explicitly selected", () => {
-    for (const selector of [{ targets: "jetson-nvmap-gpu" }, { jobs: "jetson-nvmap-gpu" }]) {
-      expect(evaluateE2eWorkflowDispatchSelectors(selector)).toMatchObject({
-        valid: true,
-        liveTargetsRun: false,
-        selectedFreeStandingJobs: ["jetson-nvmap-gpu"],
-        registryTargets: [],
-      });
-    }
-  });
-
-  it("reports default jobs without claiming explicit-only Jetson ran", () => {
-    expect(validateE2eWorkflowBoundary()).toEqual([]);
+  it("accepts the real workflow without Jetson queue contract errors", () => {
+    const errors = validateE2eWorkflowBoundary();
+    expect(errors.filter((error) => /jetson|allow_jetson_runner_queue/iu.test(error))).toEqual([]);
+    expect(errors).toEqual([]);
   });
 });

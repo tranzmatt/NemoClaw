@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import type { ArtifactSink } from "../fixtures/artifacts.ts";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
+import { assertCleanupSucceededOrAbsent } from "../fixtures/cleanup-resources.ts";
 import { resultText } from "../fixtures/clients/command.ts";
 import type { HostCliClient } from "../fixtures/clients/host.ts";
 import { type SandboxClient, validateSandboxName } from "../fixtures/clients/sandbox.ts";
@@ -56,6 +57,7 @@ const CLOUD_MODEL =
   "nvidia/nemotron-3-super-120b-a12b";
 const INSTALL_TIMEOUT_MS = 25 * 60_000;
 const CHAT_TIMEOUT_MS = 120_000;
+const SANDBOX_PROBE_TIMEOUT_MS = 120_000;
 const TEST_TIMEOUT_MS = 40 * 60_000;
 const MAX_ATTEMPTS = positiveInteger(process.env.E2E_PHASE_5B_MAX_ATTEMPTS, 3);
 const RETRY_SLEEP_MS = positiveInteger(process.env.E2E_PHASE_5B_RETRY_SLEEP_SEC, 5) * 1_000;
@@ -85,7 +87,7 @@ function testEnv(home: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv
   return testHomeEnvironment(home, extra, { ...process.env, OPENSHELL_GATEWAY: "nemoclaw" });
 }
 
-async function bestEffort(run: () => Promise<unknown>): Promise<void> {
+async function bestEffortPreclean(run: () => Promise<unknown>): Promise<void> {
   try {
     await run();
   } catch {
@@ -100,19 +102,31 @@ async function cleanupCloudInferenceState(
   home: string,
 ): Promise<void> {
   const env = testEnv(home);
-  await bestEffort(() =>
-    host.command("node", [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes"], {
-      artifactName: "cleanup-nemoclaw-destroy-cloud-inference",
-      env,
-      timeoutMs: 120_000,
-    }),
-  );
-  await bestEffort(() =>
+  await bestEffortPreclean(() => cleanupCloudInferenceNemoClawSandbox(host, home));
+  await bestEffortPreclean(() =>
     sandbox.openshell(["sandbox", "delete", SANDBOX_NAME], {
       artifactName: "cleanup-openshell-sandbox-delete-cloud-inference",
       env,
       timeoutMs: 60_000,
     }),
+  );
+}
+
+async function cleanupCloudInferenceNemoClawSandbox(
+  host: HostCliClient,
+  home: string,
+): Promise<void> {
+  const result = await host.command("node", [CLI_ENTRYPOINT, SANDBOX_NAME, "destroy", "--yes"], {
+    artifactName: "cleanup-nemoclaw-destroy-cloud-inference",
+    env: testEnv(home),
+    timeoutMs: 120_000,
+  });
+  assertCleanupSucceededOrAbsent(
+    result,
+    /Sandbox '.+' does not exist|Run 'nemoclaw onboard' to create one|sandbox .* not found|no such sandbox/iu.test(
+      resultText(result),
+    ),
+    `cleanup cloud inference sandbox ${SANDBOX_NAME}`,
   );
 }
 
@@ -212,9 +226,102 @@ async function expectLiveChatPong(
   throw new Error(`Live chat failed after ${MAX_ATTEMPTS} attempt(s): ${lastFailure}`);
 }
 
+async function expectSandboxCredentialBoundary(
+  sandbox: SandboxClient,
+  home: string,
+  apiKey: string,
+): Promise<void> {
+  const authProbe = await sandbox.exec(
+    SANDBOX_NAME,
+    [
+      "sh",
+      "-lc",
+      "find /sandbox -name auth-profiles.json -not -path '*/node_modules/*' -not -path '*/dist/*' -print",
+    ],
+    {
+      artifactName: "phase-3-sandbox-auth-profiles-probe",
+      env: testEnv(home),
+      timeoutMs: SANDBOX_PROBE_TIMEOUT_MS,
+    },
+  );
+  expect(authProbe.exitCode, resultText(authProbe)).toBe(0);
+  expect(authProbe.stdout.trim(), "auth-profiles.json must not be present in sandbox state").toBe(
+    "",
+  );
+
+  const secretScanCommand = [
+    "for dir in /sandbox/.openclaw /sandbox/.nemoclaw; do",
+    '  [ -d "$dir" ] || continue',
+    `  matches=$(grep -rIlE 'nvapi-|ghp_|npm_' "$dir")`,
+    "  scan_status=$?",
+    '  case "$scan_status" in',
+    `    0) filtered=$(printf '%s\\n' "$matches" | grep -Ev '/policies/|/plugin-runtime-deps/|/extensions/[^/]+/(dist|node_modules)/')`,
+    "       filter_status=$?",
+    '       case "$filter_status" in',
+    "         0) filtered_file=$(mktemp)",
+    "            temp_status=$?",
+    '            case "$temp_status" in 0) ;; *) exit "$temp_status" ;; esac',
+    `            trap 'rm -f "$filtered_file"' EXIT HUP INT TERM`,
+    `            printf '%s\\n' "$filtered" > "$filtered_file"`,
+    "            write_status=$?",
+    '            case "$write_status" in 0) ;; *) exit "$write_status" ;; esac',
+    "            while IFS= read -r file; do",
+    `              matching_lines=$(grep -IE 'nvapi-|ghp_|npm_' "$file")`,
+    "              match_status=$?",
+    '              case "$match_status" in',
+    `                0) printf '%s' "$matching_lines" | grep -qv 'STRIPPED'`,
+    "                   unstripped_status=$?",
+    '                   case "$unstripped_status" in',
+    `                     0) printf '%s\\n' "$file" ;;`,
+    "                     1) ;;",
+    '                     *) exit "$unstripped_status" ;;',
+    "                   esac",
+    "                   ;;",
+    "                1) ;;",
+    '                *) exit "$match_status" ;;',
+    "              esac",
+    '            done < "$filtered_file"',
+    '            rm -f "$filtered_file"',
+    "            trap - EXIT HUP INT TERM",
+    "            ;;",
+    "         1) ;;",
+    '         *) exit "$filter_status" ;;',
+    "       esac",
+    "       ;;",
+    "    1) ;;",
+    '    *) exit "$scan_status" ;;',
+    "  esac",
+    "done",
+  ].join("\n");
+
+  const secretProbe = await sandbox.exec(SANDBOX_NAME, ["sh", "-lc", secretScanCommand], {
+    artifactName: "phase-3-sandbox-secret-pattern-probe",
+    env: testEnv(home),
+    redactionValues: [apiKey],
+    timeoutMs: SANDBOX_PROBE_TIMEOUT_MS,
+  });
+  expect(secretProbe.exitCode, resultText(secretProbe)).toBe(0);
+  expect(secretProbe.stdout.trim(), "sandbox config must not contain secret-shaped tokens").toBe(
+    "",
+  );
+}
+
+// biome-ignore format: preserve legacy live-test body formatting so phase-only changes stay reviewable.
 test(
   "cloud inference: inference.local chat and OpenClaw skill filesystem validate",
-  async ({ artifacts, cleanup, host, sandbox, secrets, skip }) => {
+  {
+    timeout: TEST_TIMEOUT_MS,
+    meta: {
+      e2ePhases: [
+        "verify cloud inference prerequisites",
+        "install hosted-inference OpenClaw sandbox",
+        "exercise managed inference.local chat",
+        "scan sandbox agent state for credentials",
+        "validate repo and sandbox skill layouts",
+      ],
+    },
+  },
+  async ({ artifacts, cleanup, host, progress, sandbox, secrets, skip }) => {
     const hosted = requireHostedInferenceConfig(secrets);
     const apiKey = hosted.apiKey;
 
@@ -237,6 +344,7 @@ test(
         "install.sh --non-interactive creates or recreates the named OpenClaw sandbox",
         "nemoclaw and openshell are available on PATH after install",
         "curl inside the sandbox reaches https://inference.local/v1/chat/completions and returns PONG",
+        "sandbox agent state contains neither auth-profiles.json nor secret-shaped credential values",
         "repo .agents/skills SKILL.md frontmatter and body validate",
         "sandbox /sandbox/.openclaw and openclaw.json validate; skills subdir may be present or absent",
       ],
@@ -262,12 +370,22 @@ test(
     }
 
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-cloud-inference-home-"));
-    cleanup.add(`remove cloud inference state for ${SANDBOX_NAME}`, async () => {
-      await cleanupCloudInferenceState(host, sandbox, home);
-      fs.rmSync(home, { recursive: true, force: true });
-    });
+    cleanup.trackDisposable(`remove cloud inference test home ${home}`, () =>
+      fs.rmSync(home, { recursive: true, force: true }),
+    );
+    cleanup.trackDisposable(`delete cloud inference OpenShell sandbox ${SANDBOX_NAME}`, () =>
+      sandbox.cleanupSandbox(SANDBOX_NAME, {
+        artifactName: "cleanup-openshell-sandbox-delete-cloud-inference",
+        env: testEnv(home),
+        timeoutMs: 60_000,
+      }),
+    );
+    cleanup.trackDisposable(`destroy cloud inference sandbox ${SANDBOX_NAME}`, () =>
+      cleanupCloudInferenceNemoClawSandbox(host, home),
+    );
     await cleanupCloudInferenceState(host, sandbox, home);
 
+    progress.phase("install hosted-inference OpenClaw sandbox");
     const install = await host.command(
       "bash",
       ["install.sh", "--non-interactive", "--yes-i-accept-third-party-software"],
@@ -294,6 +412,7 @@ test(
 
     await expectCliOnPath(host, home);
 
+    progress.phase("exercise managed inference.local chat");
     const chat = await expectLiveChatPong(sandbox, home, apiKey);
     await artifacts.writeJson("phase-2-chat-result.json", {
       model: CLOUD_MODEL,
@@ -301,8 +420,12 @@ test(
       content: chat.content,
     });
 
+    progress.phase("scan sandbox agent state for credentials");
+    await expectSandboxCredentialBoundary(sandbox, home, apiKey);
+
+    progress.phase("validate repo and sandbox skill layouts");
     const repoSkills = await host.command("bash", [REPO_SKILL_VALIDATOR, "--repo", REPO_ROOT], {
-      artifactName: "phase-3-validate-repo-skills",
+      artifactName: "phase-4-validate-repo-skills",
       cwd: REPO_ROOT,
       env: testEnv(home),
       timeoutMs: 60_000,
@@ -310,7 +433,7 @@ test(
     expect(repoSkills.exitCode, resultText(repoSkills)).toBe(0);
 
     const sandboxSkills = await host.command("bash", [SANDBOX_SKILL_VALIDATOR], {
-      artifactName: "phase-3-validate-sandbox-openclaw-skills",
+      artifactName: "phase-4-validate-sandbox-openclaw-skills",
       cwd: REPO_ROOT,
       env: testEnv(home, { SANDBOX_NAME }),
       timeoutMs: 90_000,
@@ -330,11 +453,11 @@ test(
         dockerRunning: docker.exitCode === 0,
         installCompleted: install.exitCode === 0,
         chatReturnedPong: /pong/i.test(chat.content),
+        sandboxCredentialBoundaryValidated: true,
         repoSkillsValidated: repoSkills.exitCode === 0,
         sandboxOpenClawLayoutValidated: sandboxSkills.exitCode === 0,
         sandboxSkillsSubdir: sandboxSkillStatus,
       },
     });
   },
-  TEST_TIMEOUT_MS,
 );

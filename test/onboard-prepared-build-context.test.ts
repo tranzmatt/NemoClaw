@@ -17,7 +17,7 @@ type PreparedContextResult = {
   commands: string[];
   errorMessage: string | null;
   patchCalls: number;
-  planBuildContexts: string[];
+  planFromRefs: string[];
   registerCalls: Array<{ imageTag?: string | null }>;
   resolvedBuildIds: string[];
   stageCalls: number;
@@ -59,10 +59,13 @@ function runPreparedContextScenario(scenario: PreparedContextScenario): Prepared
     path.join(repoRoot, "src", "lib", "onboard", "sandbox-dockerfile-patch-flow.ts"),
   );
   const sandboxCreatePlanPath = JSON.stringify(
-    path.join(repoRoot, "src", "lib", "onboard", "sandbox-create-plan.ts"),
+    path.join(repoRoot, "src", "lib", "onboard", "sandbox-create-plan-materialization.ts"),
   );
   const imageTagPath = JSON.stringify(
     path.join(repoRoot, "src", "lib", "domain", "sandbox", "image-tag.ts"),
+  );
+  const dockerGpuSandboxCreatePath = JSON.stringify(
+    path.join(repoRoot, "src", "lib", "onboard", "docker-gpu-sandbox-create.ts"),
   );
 
   const script = String.raw`
@@ -75,8 +78,9 @@ const preflight = require(${preflightPath});
 const credentials = require(${credentialsPath});
 const buildContextStage = require(${buildContextStagePath});
 const dockerfilePatchFlow = require(${dockerfilePatchFlowPath});
-const sandboxCreatePlan = require(${sandboxCreatePlanPath});
+const sandboxCreatePlanMaterialization = require(${sandboxCreatePlanPath});
 const imageTag = require(${imageTagPath});
+const dockerGpuSandboxCreate = require(${dockerGpuSandboxCreatePath});
 const { loadAgent } = require(${agentDefsPath});
 
 const scenario = ${JSON.stringify(scenario)};
@@ -85,11 +89,25 @@ const buildId = ${JSON.stringify(buildId)};
 const sandboxName = "prepared-dcode";
 const commands = [];
 const registerCalls = [];
-const planBuildContexts = [];
+const planFromRefs = [];
 const resolvedBuildIds = [];
 let cleanupCalls = 0;
 let patchCalls = 0;
 let stageCalls = 0;
+
+dockerGpuSandboxCreate.createDockerGpuSandboxCreatePatch = () => ({
+  maybeApplyDuringCreate: () => {},
+  createFailureMessage: () => null,
+  exitOnPatchError: async () => {},
+  attachManagedBootstrapCutover: () => {},
+  rollbackManagedStartupAfterCreateFailure: async () => {},
+  ensureApplied: async () => {},
+  waitForSupervisorReconnectIfNeeded: () => {},
+  commitAfterReady: async () => {},
+  selectedMode: () => null,
+  printReadinessFailureIfEnabled: () => {},
+  verifyGpuOrExit: async (verify) => verify(sandboxName),
+});
 
 buildContextStage.stageCreateSandboxBuildContext = () => {
   stageCalls += 1;
@@ -100,10 +118,10 @@ dockerfilePatchFlow.prepareSandboxDockerfilePatch = async () => {
   throw new Error("prepared context was unexpectedly repatched");
 };
 
-const prepareSandboxCreatePlan = sandboxCreatePlan.prepareSandboxCreatePlan;
-sandboxCreatePlan.prepareSandboxCreatePlan = (input) => {
-  planBuildContexts.push(input.buildCtx);
-  return prepareSandboxCreatePlan(input);
+const materializeSandboxCreatePlan = sandboxCreatePlanMaterialization.materializeSandboxCreatePlan;
+sandboxCreatePlanMaterialization.materializeSandboxCreatePlan = (input) => {
+  planFromRefs.push(input.fromRef);
+  return materializeSandboxCreatePlan(input);
 };
 const resolveSandboxImageTagFromCreateOutput = imageTag.resolveSandboxImageTagFromCreateOutput;
 imageTag.resolveSandboxImageTagFromCreateOutput = (output, receivedBuildId, warn) => {
@@ -210,7 +228,7 @@ const { createSandbox } = require(${onboardPath});
     commands,
     errorMessage,
     patchCalls,
-    planBuildContexts,
+    planFromRefs,
     registerCalls,
     resolvedBuildIds,
     stageCalls,
@@ -230,6 +248,7 @@ const { createSandbox } = require(${onboardPath});
       HOME: tmpDir,
       NEMOCLAW_HOME: path.join(tmpDir, ".nemoclaw"),
       NEMOCLAW_NON_INTERACTIVE: "1",
+      NEMOCLAW_TEST_MANAGED_IMAGE_FALLBACK: "1",
       PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
     },
   });
@@ -253,7 +272,7 @@ describe("onboard prepared DCode build context", () => {
     assert.equal(result.errorMessage, null);
     assert.equal(result.stageCalls, 0);
     assert.equal(result.patchCalls, 0);
-    assert.deepEqual(result.planBuildContexts, [result.buildCtx]);
+    assert.deepEqual(result.planFromRefs, [`${result.buildCtx}/Dockerfile`]);
     assert.deepEqual(result.resolvedBuildIds, [result.buildId]);
     assert.equal(result.cleanupCalls, 1);
     assert.ok(
@@ -281,7 +300,7 @@ describe("onboard prepared DCode build context", () => {
     );
     assert.equal(result.stageCalls, 0);
     assert.equal(result.patchCalls, 0);
-    assert.deepEqual(result.planBuildContexts, []);
+    assert.deepEqual(result.planFromRefs, []);
     assert.deepEqual(result.resolvedBuildIds, []);
     assert.equal(result.cleanupCalls, 0);
     assert.equal(

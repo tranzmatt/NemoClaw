@@ -17,8 +17,10 @@ const LARGE_OLLAMA_FIT_MEMORY_MB = Math.max(
 );
 
 import {
+  buildOllamaProbeOptions,
   CONTAINER_REACHABILITY_IMAGE,
   DEFAULT_OLLAMA_MODEL,
+  findReachableOllamaHost,
   getBootstrapOllamaModelOptions,
   getDefaultOllamaModel,
   getLocalProviderBaseUrl,
@@ -31,6 +33,8 @@ import {
   getOllamaModelOptions,
   getOllamaProbeCommand,
   getOllamaWarmupCommand,
+  getWindowsHostOllamaDockerReachabilityArgs,
+  isLocalProviderProbeOutputHealthy,
   isOllamaRunnerCrash,
   LOCAL_INFERENCE_SANDBOX_HOST_URL_ENV,
   parseOllamaList,
@@ -39,6 +43,8 @@ import {
   probeOllamaAuthProxyHealth,
   QWEN3_6_OLLAMA_MODEL,
   resetOllamaContainerPortCache,
+  resetOllamaHostCache,
+  setResolvedOllamaHost,
   validateLocalProvider,
   validateOllamaModel,
 } from "./local";
@@ -81,11 +87,75 @@ describe("local inference helpers", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
+    resetOllamaHostCache();
     if (originalSandboxHostUrl === undefined) {
       delete process.env[LOCAL_INFERENCE_SANDBOX_HOST_URL_ENV];
     } else {
       process.env[LOCAL_INFERENCE_SANDBOX_HOST_URL_ENV] = originalSandboxHostUrl;
     }
+  });
+
+  it("uses Docker-context validation only for Windows-host Ollama (#8127)", () => {
+    expect(buildOllamaProbeOptions(false)).toMatchObject({
+      allowHostDockerInternal: false,
+      probeFromDocker: null,
+    });
+
+    setResolvedOllamaHost("host.docker.internal");
+
+    expect(buildOllamaProbeOptions(false)).toMatchObject({
+      allowHostDockerInternal: true,
+      probeFromDocker: { expectedPort: 11434 },
+    });
+  });
+
+  it("enables retries for missing structured tool calls only when Ollama tool calls are required (#8714)", () => {
+    expect(buildOllamaProbeOptions(false)).toMatchObject({
+      requireChatCompletionsToolCalling: true,
+      retryChatCompletionsToolReadiness: true,
+    });
+    expect(buildOllamaProbeOptions(true)).toMatchObject({
+      requireChatCompletionsToolCalling: false,
+      retryChatCompletionsToolReadiness: false,
+    });
+  });
+
+  it("builds a credential-free Docker Desktop probe for Windows-host Ollama (#8127)", () => {
+    expect(getWindowsHostOllamaDockerReachabilityArgs()).toEqual([
+      "run",
+      "--rm",
+      CONTAINER_REACHABILITY_IMAGE,
+      "-sf",
+      "--connect-timeout",
+      "2",
+      "--max-time",
+      "5",
+      "http://host.docker.internal:11434/api/tags",
+    ]);
+  });
+
+  it("probes WSL loopback before Windows-host Ollama", () => {
+    vi.stubEnv("WSL_DISTRO_NAME", "Ubuntu");
+    const commands: string[][] = [];
+    const endpoints: string[] = [];
+
+    const host = findReachableOllamaHost((command) => {
+      commands.push([...command]);
+      const endpoint = command.at(-1) ?? "";
+      endpoints.push(endpoint);
+      return endpoint.includes("host.docker.internal") ? "ollama" : "";
+    });
+
+    expect(host).toBe("host.docker.internal");
+    expect(endpoints).toEqual([
+      "http://127.0.0.1:11434/api/tags",
+      "http://host.docker.internal:11434/api/tags",
+    ]);
+    expect(commands.map((command) => command.slice(2, 6))).toEqual([
+      ["--connect-timeout", "3", "--max-time", "5"],
+      ["--connect-timeout", "3", "--max-time", "5"],
+    ]);
   });
 
   it("returns the expected base URL for vllm-local", () => {
@@ -175,6 +245,16 @@ describe("local inference helpers", () => {
     ]);
   });
 
+  it("requires HTTP 200 for managed health output and rejects curl connection status 000", () => {
+    expect(isLocalProviderProbeOutputHealthy("http://10.40.0.1:8000/health", "200")).toBe(true);
+    expect(isLocalProviderProbeOutputHealthy("http://10.40.0.1:8000/health", "204")).toBe(false);
+    expect(isLocalProviderProbeOutputHealthy("http://10.40.0.1:8000/health", "000")).toBe(false);
+    expect(isLocalProviderProbeOutputHealthy("http://127.0.0.1:8000/v1/models", "000")).toBe(false);
+    expect(
+      isLocalProviderProbeOutputHealthy("http://127.0.0.1:8000/v1/models", '{"data":[]}'),
+    ).toBe(true);
+  });
+
   it("validates a reachable local provider", () => {
     let callCount = 0;
     const mockCapture = () => {
@@ -254,7 +334,7 @@ describe("local inference helpers", () => {
     const result = validateLocalProvider("ollama-local", mockCapture, mockSleep);
     expect(result.ok).toBe(false);
     expect(result.diagnostic).toMatch(/HTTP 502/);
-    expect(result.diagnostic).toMatch(/host-gateway resolved to/);
+    expect(result.diagnostic).toMatch(/host\.openshell\.internal resolved to/);
     expect(sleepCalls).toEqual([2, 2]);
   });
 
@@ -324,6 +404,143 @@ describe("local inference helpers", () => {
     });
   });
 
+  it("requires the configured Ollama model while accepting the implicit latest tag", () => {
+    const result = probeLocalProviderHealth("ollama-local", {
+      model: "nemotron-mini",
+      runCurlProbeImpl: () => ({
+        ok: true,
+        httpStatus: 200,
+        curlStatus: 0,
+        body: '{"models":[{"name":"nemotron-mini:latest"}]}',
+        stderr: "",
+        message: "HTTP 200",
+      }),
+      loadOllamaProxyTokenImpl: () => null,
+    });
+
+    expect(result?.ok).toBe(true);
+    expect(result?.detail).toContain("reachable");
+  });
+
+  it("reports an unavailable configured Ollama model instead of daemon health", () => {
+    const result = probeLocalProviderHealth("ollama-local", {
+      model: "missing-model:latest",
+      runCurlProbeImpl: () => ({
+        ok: true,
+        httpStatus: 200,
+        curlStatus: 0,
+        body: '{"models":[{"name":"available-model:latest"}]}',
+        stderr: "",
+        message: "HTTP 200",
+      }),
+      loadOllamaProxyTokenImpl: () => null,
+    });
+
+    expect(result?.ok).toBe(false);
+    expect(result?.failureLabel).toBe("unhealthy");
+    expect(result?.detail).toContain("missing-model:latest");
+    expect(result?.detail).toContain("available-model:latest");
+  });
+
+  it.each([
+    {
+      provider: "ollama-local",
+      body: JSON.stringify({ models: [{ name: "available\u001b]52;c;payload\u0007\nmodel" }] }),
+    },
+    {
+      provider: "vllm-local",
+      body: JSON.stringify({ data: [{ id: `available\u001b[31m${"x".repeat(180)}` }] }),
+    },
+  ])("sanitizes $provider inventory names in unavailable-model diagnostics", ({
+    provider,
+    body,
+  }) => {
+    const result = probeLocalProviderHealth(provider, {
+      model: "missing\u001b[2J\nmodel",
+      runCurlProbeImpl: () => ({
+        ok: true,
+        httpStatus: 200,
+        curlStatus: 0,
+        body,
+        stderr: "",
+        message: "HTTP 200",
+      }),
+      loadOllamaProxyTokenImpl: () => null,
+    });
+
+    expect(result?.ok).toBe(false);
+    expect(result?.detail).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/);
+    expect(result?.detail.length).toBeLessThan(400);
+  });
+
+  it.each([
+    {
+      provider: "ollama-local",
+      body: "not-json",
+      expectedDetail: "not a valid /api/tags response",
+    },
+    {
+      provider: "ollama-local",
+      body: '{"data":[]}',
+      expectedDetail: "not a valid /api/tags response",
+    },
+    {
+      provider: "vllm-local",
+      body: "not-json",
+      expectedDetail: "could not verify configured model",
+    },
+    {
+      provider: "vllm-local",
+      body: "{}",
+      expectedDetail: "could not verify configured model",
+    },
+    {
+      provider: "vllm-local",
+      body: '{"models":[]}',
+      expectedDetail: "could not verify configured model",
+    },
+  ])("fails closed for an invalid $provider configured-model inventory", ({
+    provider,
+    body,
+    expectedDetail,
+  }) => {
+    const result = probeLocalProviderHealth(provider, {
+      model: "configured-model",
+      runCurlProbeImpl: () => ({
+        ok: true,
+        httpStatus: 200,
+        curlStatus: 0,
+        body,
+        stderr: "",
+        message: "HTTP 200",
+      }),
+      loadOllamaProxyTokenImpl: () => null,
+    });
+
+    expect(result?.ok).toBe(false);
+    expect(result?.failureLabel).toBe("unhealthy");
+    expect(result?.detail).toContain(expectedDetail);
+  });
+
+  it.each([
+    { body: '{"data":[{"id":"served-model"}]}', expected: true },
+    { body: '{"data":[{"id":"different-model"}]}', expected: false },
+  ])("matches the configured vLLM model against its model inventory", ({ body, expected }) => {
+    const result = probeLocalProviderHealth("vllm-local", {
+      model: "served-model",
+      runCurlProbeImpl: () => ({
+        ok: true,
+        httpStatus: 200,
+        curlStatus: 0,
+        body,
+        stderr: "",
+        message: "HTTP 200",
+      }),
+    });
+
+    expect(result?.ok).toBe(expected);
+  });
+
   it("reports a clear local provider outage when the host probe cannot connect", () => {
     const result = probeLocalProviderHealth("ollama-local", {
       runCurlProbeImpl: () => ({
@@ -381,6 +598,71 @@ describe("local inference helpers", () => {
       probeLabel: "auth proxy",
       endpoint: "http://127.0.0.1:11435/api/tags",
     });
+  });
+
+  it("skips the auth-proxy subprobe when connect probes it separately (#8669)", () => {
+    const commands: string[][] = [];
+    const result = probeLocalProviderHealth("ollama-local", {
+      skipOllamaAuthProxySubprobe: true,
+      loadOllamaProxyTokenImpl: () => {
+        throw new Error("auth-proxy token should not be loaded");
+      },
+      runCurlProbeImpl: (command) => {
+        commands.push([...command]);
+        return {
+          ok: true,
+          httpStatus: 200,
+          curlStatus: 0,
+          body: '{"models":[]}',
+          stderr: "",
+          message: "HTTP 200",
+        };
+      },
+    });
+
+    expect(commands).toHaveLength(1);
+    expect(commands[0]?.at(-1)).toBe("http://127.0.0.1:11434/api/tags");
+    expect(result?.ok).toBe(true);
+    expect(result?.subprobes).toBeUndefined();
+  });
+
+  it("loads the Ollama proxy token only from the selected nondefault gateway root", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-ollama-port-token-"));
+    const defaultRoot = path.join(home, ".nemoclaw");
+    const selectedRoot = path.join(defaultRoot, "gateways", "9123");
+    fs.mkdirSync(selectedRoot, { recursive: true });
+    fs.writeFileSync(path.join(defaultRoot, "ollama-proxy-token"), "default-root-token\n");
+    fs.writeFileSync(path.join(selectedRoot, "ollama-proxy-token"), "selected-port-token\n");
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("NEMOCLAW_GATEWAY_PORT", "9123");
+    vi.resetModules();
+
+    try {
+      const freshLocal = await import("./local");
+      let authConfig = "";
+      const result = freshLocal.probeOllamaAuthProxyHealth({
+        runCurlProbeImpl: (_argv, options) => {
+          const configPath = options?.trustedConfigFiles?.[0] ?? "";
+          authConfig = fs.readFileSync(configPath, "utf8");
+          return {
+            ok: true,
+            httpStatus: 200,
+            curlStatus: 0,
+            body: '{"models":[]}',
+            stderr: "",
+            message: "HTTP 200",
+          };
+        },
+      });
+
+      expect(result?.ok).toBe(true);
+      expect(authConfig).toContain("selected-port-token");
+      expect(authConfig).not.toContain("default-root-token");
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("surfaces 401 on the auth-proxy subprobe even when backend is healthy", () => {

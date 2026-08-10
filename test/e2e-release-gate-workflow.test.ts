@@ -1,66 +1,37 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { readFileSync } from "node:fs";
-
 import { describe, expect, it } from "vitest";
 
+import { validateE2eWorkflow } from "../tools/e2e/workflow-boundary.mts";
 import { readYaml, type WorkflowJob } from "./helpers/e2e-workflow-contract";
 
-const e2eWorkflow = readYaml<{ jobs: Record<string, WorkflowJob> }>(".github/workflows/e2e.yaml");
+type E2eWorkflow = {
+  on?: {
+    workflow_dispatch?: {
+      inputs?: Record<string, unknown>;
+    };
+  };
+  jobs: Record<string, WorkflowJob>;
+};
+
+const e2eWorkflow = readYaml<E2eWorkflow>(".github/workflows/e2e.yaml");
 
 describe("release gate workflow resource contracts", () => {
-  it("starts hosted agent proofs in the first wave after matrix generation", () => {
-    const fullJob = e2eWorkflow.jobs["full-e2e"];
-    const tuiJob = e2eWorkflow.jobs["openclaw-tui-chat-correlation"];
+  it("rejects trusted dispatch receipt contract drift", () => {
+    const workflow = structuredClone(e2eWorkflow);
+    const steps = workflow.jobs["generate-matrix"].steps!;
+    const receipt = steps.find((step) => step.name === "Record trusted E2E dispatch receipt")!;
+    const upload = steps.find((step) => step.name === "Upload trusted E2E dispatch receipt")!;
+    delete receipt.env!.DISPATCH_JOBS;
+    upload.with!.name = "mutable-dispatch-receipt";
 
-    expect(fullJob.needs).toBe("generate-matrix");
-    expect(fullJob.if).not.toContain("always()");
-    expect(fullJob.if).toContain(",full-e2e,");
-    const fullE2ERun = fullJob.steps?.find(
-      (step) => step.name === "Run full-e2e live Vitest test",
-    )?.run;
-    expect(fullE2ERun).toMatch(/npx vitest run --project e2e-live[\s\S]*full-e2e\.test\.ts/u);
-    expect(fullE2ERun).not.toContain("onboard-progress-budget.test.ts");
-    expect(fullE2ERun?.match(/npx vitest run --project e2e-live/gu)).toHaveLength(1);
-    expect(tuiJob.needs).toBe("generate-matrix");
-    expect(tuiJob.if).not.toContain("always()");
-    expect(tuiJob.if).toContain(",openclaw-tui-chat-correlation,");
-  });
-
-  it("budgets cold Ollama pulls in the consolidated GPU lane", () => {
-    const gpuJob = e2eWorkflow.jobs["gpu-e2e"];
-    const liveTest = readFileSync(new URL("./e2e/live/gpu-e2e.test.ts", import.meta.url), "utf8");
-
-    expect(gpuJob["timeout-minutes"]).toBe(90);
-    expect(gpuJob.env?.NEMOCLAW_OLLAMA_PULL_TIMEOUT).toBe("2400");
-    expect(liveTest).toContain("timeoutMs: 55 * 60_000");
-  });
-
-  it("authenticates Spark image pulls through the shared guarded steps", () => {
-    const steps = e2eWorkflow.jobs["spark-install"].steps ?? [];
-    const stepIndex = (name: string) => steps.findIndex((step) => step.name === name);
-    const auth = steps.find((step) => step.name === "Authenticate to Docker Hub");
-    const cleanup = steps.find((step) => step.name === "Clean up Docker auth");
-
-    expect(steps.some((step) => step.name === "Configure isolated Docker auth directory")).toBe(
-      false,
-    );
-    expect(auth?.uses).toBeUndefined();
-    expect(auth?.if).toBeUndefined();
-    expect(auth?.["continue-on-error"]).toBeUndefined();
-    expect(auth?.env).toHaveProperty("DOCKERHUB_AUTH_REQUIRED");
-    expect(auth?.run).toEqual(expect.any(String));
-    expect(stepIndex("Authenticate to Docker Hub")).toBeLessThan(
-      stepIndex("Prepare E2E workspace"),
-    );
-    expect(stepIndex("Authenticate to Docker Hub")).toBeLessThan(
-      stepIndex("Run Spark install live test"),
-    );
-    expect(cleanup?.if).toBe("always()");
-    expect(cleanup?.run).toBe("bash .github/scripts/docker-auth-cleanup.sh");
-    expect(stepIndex("Run Spark install live test")).toBeLessThan(
-      stepIndex("Clean up Docker auth"),
+    expect(validateE2eWorkflow(workflow as unknown as Record<string, unknown>)).toEqual(
+      expect.arrayContaining([
+        "trusted E2E dispatch receipt must bind only the authenticated repository, PR, candidate, workflow, run, and dispatch identities",
+        "generate-matrix upload-e2e-artifacts must preserve its explicit name/path contract",
+        "trusted E2E dispatch receipt upload must preserve its immutable run identity",
+      ]),
     );
   });
 });

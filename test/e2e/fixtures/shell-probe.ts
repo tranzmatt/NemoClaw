@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { spawn } from "node:child_process";
-
 import type { ArtifactSink } from "./artifacts.ts";
+import { type ChildProcessProgress, spawnObservedChild } from "./observed-child-process.ts";
 import { superviseChild } from "./shell/supervisor.ts";
 import type { TrustedShellCommand } from "./shell/trusted-command.ts";
+import { resolveLiveE2eWorkloadSourceEnv } from "./workload-source-env.ts";
 
 /**
  * Fixture-flavoured host shell probe.
@@ -26,6 +26,8 @@ export interface ShellProbeRunOptions {
   killGraceMs?: number;
   artifactName?: string;
   redactionValues?: string[];
+  /** Retain at most the last N bytes from each output stream. */
+  captureLimitBytes?: number;
   /** Timestamp-only output observer; chunk contents never cross this boundary. */
   onOutput?: (event: ShellProbeOutputEvent) => void;
 }
@@ -40,6 +42,8 @@ export { trustedShellCommand } from "./shell/trusted-command.ts";
 
 export interface ShellProbeResult {
   command: string[];
+  /** Wall-clock command duration, persisted for CI bottleneck analysis. */
+  durationMs?: number;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
@@ -54,9 +58,12 @@ export interface ShellProbeResult {
 
 export interface ShellProbeDeps {
   artifacts: ArtifactSink;
+  progress: ChildProcessProgress;
   redact: (text: string, extraValues?: string[]) => string;
-  signal: AbortSignal;
+  signal: AbortSignalSource;
 }
+
+export type AbortSignalSource = AbortSignal | (() => AbortSignal);
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const DEFAULT_KILL_GRACE_MS = 1_000;
@@ -82,13 +89,78 @@ function redactedError(error: unknown, message: string): Error {
   return next;
 }
 
+interface TextCapture {
+  append(chunk: string): void;
+  value(): {
+    droppedBytes: number;
+    limitBytes?: number;
+    text: string;
+  };
+}
+
+function createTextCapture(limitBytes: number | undefined): TextCapture {
+  if (limitBytes === undefined) {
+    let text = "";
+    return {
+      append(chunk) {
+        text += chunk;
+      },
+      value() {
+        return { droppedBytes: 0, text };
+      },
+    };
+  }
+  if (!Number.isSafeInteger(limitBytes) || limitBytes <= 0) {
+    throw new Error("captureLimitBytes must be a positive safe integer");
+  }
+
+  let droppedBytes = 0;
+  let tail = Buffer.alloc(0);
+  return {
+    append(chunk) {
+      const incoming = Buffer.from(chunk, "utf8");
+      const combined = tail.length === 0 ? incoming : Buffer.concat([tail, incoming]);
+      if (combined.length <= limitBytes) {
+        tail = combined;
+        return;
+      }
+      const overflow = combined.length - limitBytes;
+      let retainedStart = overflow;
+      while (retainedStart < combined.length && (combined[retainedStart]! & 0xc0) === 0x80) {
+        retainedStart += 1;
+      }
+      droppedBytes += retainedStart;
+      tail = Buffer.from(combined.subarray(retainedStart));
+    },
+    value() {
+      return { droppedBytes, limitBytes, text: tail.toString("utf8") };
+    },
+  };
+}
+
+function redactTruncatedSecretPrefix(text: string, redactionValues: string[]): string {
+  let fragmentLength = 0;
+  for (const value of redactionValues) {
+    const maxLength = Math.min(value.length - 1, text.length);
+    for (let length = maxLength; length > fragmentLength; length -= 1) {
+      if (text.startsWith(value.slice(-length))) {
+        fragmentLength = length;
+        break;
+      }
+    }
+  }
+  return fragmentLength > 0 ? `[REDACTED]${text.slice(fragmentLength)}` : text;
+}
+
 export class ShellProbe {
   private readonly artifacts: ArtifactSink;
+  private readonly progress: ChildProcessProgress;
   private readonly redact: (text: string, extraValues?: string[]) => string;
-  private readonly signal: AbortSignal;
+  private readonly signal: AbortSignalSource;
 
   constructor(deps: ShellProbeDeps) {
     this.artifacts = deps.artifacts;
+    this.progress = deps.progress;
     this.redact = deps.redact;
     this.signal = deps.signal;
   }
@@ -97,6 +169,7 @@ export class ShellProbe {
     trustedCommand: TrustedShellCommand,
     options: ShellProbeRunOptions = {},
   ): Promise<ShellProbeResult> {
+    const signal = typeof this.signal === "function" ? this.signal() : this.signal;
     const command = trustedCommand.command;
     const args = [...trustedCommand.args];
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -114,8 +187,18 @@ export class ShellProbe {
     };
     const redactProbeText = (text: string) =>
       this.redact(enforcedValues.length > 0 ? enforceLocalRedaction(text) : text, redactionValues);
+    const renderCapturedText = (capture: TextCapture): string => {
+      const { droppedBytes, limitBytes, text } = capture.value();
+      const boundarySafeText =
+        droppedBytes > 0 ? redactTruncatedSecretPrefix(text, enforcedValues) : text;
+      const redacted = redactProbeText(boundarySafeText);
+      return droppedBytes > 0
+        ? `[shell-probe omitted ${droppedBytes} earlier bytes; showing up to the last ${limitBytes} bytes]\n${redacted}`
+        : redacted;
+    };
     const redactedCommand = [command, ...args].map(redactProbeText);
-    const artifactBase = `shell/${safeArtifactBase(redactProbeText(options.artifactName ?? command))}`;
+    const activityName = safeArtifactBase(redactProbeText(options.artifactName ?? command));
+    const artifactBase = `shell/${activityName}`;
     const writeArtifacts = async (
       result: Omit<ShellProbeResult, "artifacts">,
     ): Promise<ShellProbeResult["artifacts"]> => ({
@@ -124,54 +207,64 @@ export class ShellProbe {
       result: await this.artifacts.writeJson(`${artifactBase}.result.json`, result),
     });
 
-    let stdout = "";
-    let stderr = "";
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      detached: true,
-      env: { ...(options.env ?? {}) },
-      stdio: ["ignore", "pipe", "pipe"],
+    const stdout = createTextCapture(options.captureLimitBytes);
+    const stderr = createTextCapture(options.captureLimitBytes);
+    const startedAtMs = Date.now();
+    const commandOutputObserver =
+      options.onOutput === this.progress.onOutput ? undefined : options.onOutput;
+    const child = spawnObservedChild(command, args, {
+      activityLabel: `command: ${activityName}`,
+      progress: this.progress,
+      spawn: {
+        cwd: options.cwd,
+        detached: true,
+        env: resolveLiveE2eWorkloadSourceEnv({ ...(options.env ?? {}) }),
+        stdio: ["ignore", "pipe", "pipe"],
+      },
     });
     const supervised = await superviseChild(child, {
       timeoutMs,
       killGraceMs,
-      signal: this.signal,
+      signal,
       onStdout: (chunk) => {
-        stdout += chunk;
+        stdout.append(chunk);
         try {
-          options.onOutput?.({ stream: "stdout", atMs: Date.now() });
+          commandOutputObserver?.({ stream: "stdout", atMs: Date.now() });
         } catch {
           // Test instrumentation must not change command execution.
         }
       },
       onStderr: (chunk) => {
-        stderr += chunk;
+        stderr.append(chunk);
         try {
-          options.onOutput?.({ stream: "stderr", atMs: Date.now() });
+          commandOutputObserver?.({ stream: "stderr", atMs: Date.now() });
         } catch {
           // Test instrumentation must not change command execution.
         }
       },
     });
 
-    const redactedStdout = redactProbeText(stdout);
+    const redactedStdout = renderCapturedText(stdout);
+    const redactedStderr = renderCapturedText(stderr);
+    const durationMs = Date.now() - startedAtMs;
     if (supervised.spawnError) {
       const redactedMessage = redactProbeText(errorMessage(supervised.spawnError));
-      const redactedStderr = redactProbeText([stderr, redactedMessage].filter(Boolean).join("\n"));
+      const stderrWithError = [redactedStderr, redactedMessage].filter(Boolean).join("\n");
       await writeArtifacts({
         command: redactedCommand,
+        durationMs,
         exitCode: null,
         signal: null,
         timedOut: supervised.timedOut,
         stdout: redactedStdout,
-        stderr: redactedStderr,
+        stderr: stderrWithError,
       });
       throw redactedError(supervised.spawnError, redactedMessage);
     }
 
-    const redactedStderr = redactProbeText(stderr);
     const result: Omit<ShellProbeResult, "artifacts"> = {
       command: redactedCommand,
+      durationMs,
       exitCode: supervised.exitCode,
       signal: supervised.signal,
       timedOut: supervised.timedOut,

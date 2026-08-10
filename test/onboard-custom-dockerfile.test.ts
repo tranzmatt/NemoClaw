@@ -10,6 +10,7 @@ import path from "node:path";
 import { describe, it } from "vitest";
 
 import { createCustomBuildContextFilter } from "../src/lib/onboard/custom-build-context.js";
+import { writeOkOpenshell } from "./helpers/onboard-openshell-fixture";
 import { testTimeoutOptions } from "./helpers/timeouts";
 
 const repoRoot = path.join(import.meta.dirname, "..");
@@ -184,9 +185,7 @@ describe("onboard custom Dockerfile", () => {
       fs.writeFileSync(path.join(customBuildDir, "credentials.json"), "{}");
 
       fs.mkdirSync(fakeBin, { recursive: true });
-      fs.writeFileSync(path.join(fakeBin, "openshell"), "#!/usr/bin/env bash\nexit 0\n", {
-        mode: 0o755,
-      });
+      writeOkOpenshell(fakeBin);
 
       const customDockerfilePath = JSON.stringify(path.join(customBuildDir, "Dockerfile"));
 
@@ -200,6 +199,20 @@ const childProcess = require("node:child_process");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
 const path = require("node:path");
+
+const originalSpawnSync = childProcess.spawnSync;
+childProcess.spawnSync = (command, args, options) => {
+  const normalized = _n([command, ...(Array.isArray(args) ? args : [])]);
+  if (command === "ssh" && normalized.includes("installed_plugin_index")) {
+    return {
+      status: 0,
+      signal: null,
+      stdout: Buffer.from(JSON.stringify({ version: 1, installRecords: {}, loadPaths: [] })),
+      stderr: Buffer.alloc(0),
+    };
+  }
+  return originalSpawnSync(command, args, options);
+};
 
 const commands = [];
 let hasExtraFileAtSpawn = false;
@@ -219,7 +232,7 @@ runner.run = (command, opts = {}) => {
   return { status: 0 };
 };
 runner.runCapture = (command) => {
-  if (_n(command).includes("sandbox get my-assistant")) return "";
+  if (_n(command).includes("sandbox get") && _n(command).includes("my-assistant")) return "";
   if (_n(command).includes("sandbox list")) return "my-assistant Ready";
   {
     const mockedCapture = require(${onboardScriptMocksPath}).mockOnboardRunCapture(command);
@@ -361,7 +374,7 @@ const destructive = [];
 const sandboxLive = process.env.SANDBOX_LIVE === "1";
 const capture = (command) => {
   const text = Array.isArray(command) ? command.join(" ") : String(command);
-  if (/sandbox get my-assistant/.test(text)) return sandboxLive ? "my-assistant Ready" : "";
+  if (/sandbox get(?: -g \S+)? my-assistant/.test(text)) return sandboxLive ? "my-assistant Ready" : "";
   if (/sandbox list/.test(text)) return sandboxLive ? "my-assistant Ready" : "";
   if (/forward list/.test(text)) return "";
   return "";

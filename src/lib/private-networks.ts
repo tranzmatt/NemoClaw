@@ -17,6 +17,8 @@ import { ROOT } from "./runner";
 
 const NETWORKS_FILE = path.join(ROOT, "nemoclaw-blueprint", "private-networks.yaml");
 
+export const OPENSHELL_SANDBOX_HOST_BRIDGE = "host.openshell.internal";
+
 export interface NetworkEntry {
   address: string;
   prefix: number;
@@ -156,7 +158,7 @@ export function resetCache(): void {
  *
  * IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) are auto-matched against
  * IPv4 rules by node:net BlockList, so no explicit handling is needed.
- * NAT64, 6to4, and Teredo prefixes are blocked by prefix in the YAML
+ * NAT64, 6to4, and IETF special-purpose prefixes are blocked by prefix in the YAML
  * because BlockList does not extract embedded IPv4 from those forms.
  */
 export function isPrivateIp(address: string): boolean {
@@ -189,4 +191,47 @@ export function isPrivateHostname(hostname: string): boolean {
     if (normalised === reserved || normalised.endsWith(`.${reserved}`)) return true;
   }
   return isPrivateIp(normalised);
+}
+
+export function isAllowedOpenShellSandboxBridgeUrl(url: URL): boolean {
+  const hostname =
+    url.hostname.startsWith("[") && url.hostname.endsWith("]")
+      ? url.hostname.slice(1, -1)
+      : url.hostname;
+  const port = Number(url.port);
+  return (
+    hostname.replace(/\.$/, "").toLowerCase() === OPENSHELL_SANDBOX_HOST_BRIDGE &&
+    url.protocol === "http:" &&
+    Number.isInteger(port) &&
+    port >= 1024 &&
+    port <= 65535 &&
+    !url.username &&
+    !url.password &&
+    !url.search &&
+    !url.hash
+  );
+}
+
+/**
+ * Return true when `hostname` is an IPv4/IPv6 loopback literal (127.0.0.0/8 or
+ * ::1) or the RFC 6761 `localhost` special-use name.
+ *
+ * Loopback is a proper subset of what isPrivateHostname matches, but it is
+ * semantically distinct for SSRF purposes: a loopback address only ever reaches
+ * a service on the probing host itself, so it is not a pivot to other internal
+ * infrastructure the way LAN ranges (10/8, 192.168/16) or link-local metadata
+ * (169.254.169.254) are. Host-side onboarding probes for locally-run inference
+ * servers (Ollama on 127.0.0.1, vLLM on localhost) legitimately target it, so
+ * callers that must still refuse genuine private-network SSRF can exempt
+ * loopback specifically without weakening the LAN/metadata blocks.
+ */
+export function isLoopbackHostname(hostname: string): boolean {
+  const stripped =
+    hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+  const normalised = stripped.replace(/\.$/, "").toLowerCase();
+  if (normalised === "localhost") return true;
+  const family = isIP(normalised);
+  if (family === 4) return normalised.startsWith("127.");
+  if (family === 6) return normalised === "::1";
+  return false;
 }
