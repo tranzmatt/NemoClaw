@@ -7,7 +7,7 @@ import {
   createRebuildFlowHarness,
   installRebuildFlowTestHooks,
   snapshotEnv,
-} from "../../../../test/helpers/rebuild-flow-test-harness";
+} from "../../../../test/helpers/rebuild-flow-generic-harness";
 
 describe("rebuildSandbox flow: target session", () => {
   installRebuildFlowTestHooks();
@@ -144,7 +144,7 @@ describe("rebuildSandbox flow: target session", () => {
       harness.session.provider = "compatible-endpoint";
       harness.session.model = "session-model";
       harness.session.preferredInferenceApi = "openai-completions";
-      harness.session.endpointUrl = "https://my-custom-endpoint.example/v1?x=1#frag";
+      harness.session.endpointUrl = "https://my-custom-endpoint.example/v1/";
 
       await expect(
         harness.rebuildSandbox("alpha", ["--yes"], { throwOnError: true }),

@@ -63,6 +63,19 @@ const MANAGED_IMAGE_SELECTION_POLICIES = new Set(["prefer-managed", "require-man
 const MANAGED_IMAGE_PLATFORMS = new Set(["linux/amd64", "linux/arm64"]);
 const NATIVE_ARTIFACT_PLATFORMS = new Set(["windows/x64"]);
 const NATIVE_ARTIFACT_AGENTS = new Set(["openclaw"]);
+const HOST_PLATFORMS = new Set<NodeJS.Platform>([
+  "aix",
+  "android",
+  "cygwin",
+  "darwin",
+  "freebsd",
+  "haiku",
+  "linux",
+  "netbsd",
+  "openbsd",
+  "sunos",
+  "win32",
+]);
 const MUTATION_OPERATIONS = new Set<RuntimeProviderMutationOperation>([
   "registration",
   "start",
@@ -79,6 +92,7 @@ const CONTAINER_ENGINE_OPERATIONS = new Set<RuntimeProviderContainerEngineOperat
   "gateway-inspection",
   "host-local-inference",
   "sandbox-lifecycle",
+  "state-mutation",
   "workload-cleanup",
 ]);
 const HOST_LOCAL_INFERENCE_SERVICES = new Set<HostLocalInferenceService>([
@@ -335,6 +349,26 @@ function validateCapabilitiesSurface(surface: Record<string, unknown>): void {
   ] as const) {
     requireBoolean(surface, field, "capabilities");
   }
+  const hostMounts = requireOwnRecord(surface, "readOnlyHostMounts");
+  if (typeof hostMounts.supported !== "boolean") {
+    throw new RuntimeProviderRegistrationError(
+      "capabilities.readOnlyHostMounts.supported must be a boolean",
+    );
+  }
+  if (hostMounts.supported === false) {
+    requireNonEmptyString(hostMounts, "reason", "capabilities.readOnlyHostMounts");
+    return;
+  }
+  if (
+    !Array.isArray(hostMounts.hostPlatforms) ||
+    hostMounts.hostPlatforms.length === 0 ||
+    hostMounts.hostPlatforms.some((platform) => !HOST_PLATFORMS.has(platform as NodeJS.Platform)) ||
+    new Set(hostMounts.hostPlatforms).size !== hostMounts.hostPlatforms.length
+  ) {
+    throw new RuntimeProviderRegistrationError(
+      "capabilities.readOnlyHostMounts.hostPlatforms must list unique Node.js host platforms",
+    );
+  }
 }
 
 function validatePreflightDoctorSurface(surface: Record<string, unknown>): void {
@@ -417,7 +451,15 @@ function validateStateMutationSurface(providerId: string, surface: Record<string
       `stateMutation for '${providerId}' has an unsupported contract version`,
     );
   }
-  for (const operation of ["acquire", "assertFenced", "activate", "recover"] as const) {
+  for (const operation of [
+    "acquire",
+    "assertFenced",
+    "publish",
+    "rollback",
+    "activate",
+    "release",
+    "recover",
+  ] as const) {
     requireFunction(surface, operation, "stateMutation");
   }
 }
@@ -622,6 +664,27 @@ export function requireRuntimeProviderBundleForSandbox(
   return requireRuntimeProviderBundle(sandbox.openshellDriver, providers);
 }
 
+export function requireRuntimeProviderReadOnlyHostMounts(
+  bundle: RuntimeProviderBundle,
+  platform: NodeJS.Platform,
+): Extract<
+  RuntimeProviderBundle["capabilities"]["readOnlyHostMounts"],
+  { readonly supported: true }
+> {
+  const capability = bundle.capabilities.readOnlyHostMounts;
+  if (capability.supported !== true) {
+    throw new RuntimeProviderSelectionError(
+      `Runtime provider '${bundle.identity.id}' does not support read-only host mounts: ${capability.reason}`,
+    );
+  }
+  if (!capability.hostPlatforms.includes(platform)) {
+    throw new RuntimeProviderSelectionError(
+      `Runtime provider '${bundle.identity.id}' has not qualified read-only host mounts on host platform '${platform}'.`,
+    );
+  }
+  return capability;
+}
+
 export function requireRuntimeProviderMutationAuthority(
   bundle: RuntimeProviderBundle,
   operation: RuntimeProviderMutationOperation,
@@ -632,6 +695,18 @@ export function requireRuntimeProviderMutationAuthority(
       `Runtime provider '${bundle.identity.id}' does not authorize '${operation}' mutation.`,
     );
   }
+}
+
+export function requireRuntimeProviderStateMutationSurface(
+  bundle: RuntimeProviderBundle,
+): Extract<RuntimeProviderBundle["stateMutation"], { readonly supported: true }> {
+  const surface = bundle.stateMutation;
+  if (surface.supported !== true) {
+    throw new RuntimeProviderSelectionError(
+      `Runtime provider '${bundle.identity.id}' has no state-mutation implementation: ${surface.reason}`,
+    );
+  }
+  return surface;
 }
 
 export type RuntimeProviderDestructiveCleanupAuthority = {
@@ -710,6 +785,7 @@ export function requireRuntimeProviderHostLocalInferenceOperation(
   bundle: RuntimeProviderBundle,
   service: HostLocalInferenceService,
   input: HostLocalInferenceOperationInput,
+  candidate?: HostLocalInferenceOperation,
 ): HostLocalInferenceOperation {
   const surface = bundle.hostLocalInference;
   if (
@@ -729,7 +805,7 @@ export function requireRuntimeProviderHostLocalInferenceOperation(
       `Runtime provider '${bundle.identity.id}' does not provide an operation-scoped host-local-inference engine for ${service}.`,
     );
   }
-  const operation = surface.createOperation(input);
+  const operation = candidate ?? surface.createOperation(input);
   if (
     operation.providerId !== bundle.identity.id ||
     operation.engine.operation !== "host-local-inference" ||

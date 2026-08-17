@@ -8,9 +8,8 @@ import os from "node:os";
 import path from "node:path";
 import * as ts from "typescript";
 import { describe, expect, it } from "vitest";
-import { openClawBootstrapSnippet } from "./support/entrypoint-script-fixture";
-
 import { extractShellFunctionFromSource } from "./helpers/shell-source";
+import { openClawBootstrapSnippet } from "./support/entrypoint-script-fixture";
 
 const START_SCRIPT = path.join(import.meta.dirname, "..", "scripts", "nemoclaw-start.sh");
 const APPROVAL_POLICY_DIR = path.join(import.meta.dirname, "..", "scripts", "lib");
@@ -707,8 +706,8 @@ describe("nemoclaw-start gateway token export (#1114)", () => {
     );
 
     expect(result.status, result.stderr || result.stdout).toBe(0);
-    expect(configAfter.gateway.auth.token).toEqual(expect.any(String));
     expect(configAfter.gateway.auth.token).not.toBe("");
+    expect(Number.isNaN(Date.parse(configAfter.meta.lastTouchedAt))).toBe(false);
     expect(envFile).toContain("export OPENCLAW_GATEWAY_PORT='18790'");
     expect(envFile).toContain("export NEMOCLAW_OPENCLAW_GATEWAY_URL='ws://127.0.0.1:18790'");
     expect(envFile).not.toContain("export OPENCLAW_GATEWAY_URL='ws://127.0.0.1:18790'");
@@ -3433,12 +3432,9 @@ describe("provider placeholder refresh (#4251)", () => {
 describe("Telegram diagnostics (#2766)", () => {
   const src = fs.readFileSync(START_SCRIPT, "utf-8");
   const telegramDiagnosticsScript = startScriptHeredoc(src, "TELEGRAM_DIAGNOSTICS_EOF");
+  type EntryKind = "non-root" | "root";
 
-  function preGatewaySetupBlock(
-    kind: "non-root" | "root",
-    gatewayLog: string,
-    autoPairLog: string,
-  ) {
+  function preGatewaySetupBlock(kind: EntryKind, gatewayLog: string, autoPairLog: string) {
     const nonRootMarker = src.indexOf("# ── Non-root fallback");
     const start =
       kind === "non-root"
@@ -3459,7 +3455,7 @@ describe("Telegram diagnostics (#2766)", () => {
     return kind === "non-root" ? `${block}fi\n` : block;
   }
 
-  function runPreGatewaySetup(kind: "non-root" | "root") {
+  function runPreGatewaySetup(kind: EntryKind) {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), `nemoclaw-telegram-${kind}-`));
     const configPath = path.join(tmpDir, "openclaw.json");
     const preloadPath = path.join(tmpDir, "telegram-diagnostics.js");
@@ -3525,8 +3521,11 @@ describe("Telegram diagnostics (#2766)", () => {
         `_CIAO_GUARD_SCRIPT=${JSON.stringify(path.join(tmpDir, "ciao-guard.js"))}`,
         `validate_nemoclaw_tmp_permissions() { validate_tmp_permissions ${JSON.stringify(preloadPath)}; }`,
         "NEMOCLAW_CMD=()",
-        '_nemoclaw_safe_create_tmp_file() { : > "$1"; chmod "$2" "$1"; }',
-        preGatewaySetupBlock(kind, gatewayLog, autoPairLog),
+        '_nemoclaw_safe_create_tmp_file() { if [ "$1" = /tmp/auto-pair.log ]; then return 97; fi; : > "$1"; chmod "$2" "$1"; }',
+        `${extractShellFunctionFromSource(src, "prepare_auto_pair_log").replaceAll(
+          "/tmp/auto-pair.log",
+          autoPairLog,
+        )}\n${preGatewaySetupBlock(kind, gatewayLog, autoPairLog)}`,
       ].join("\n"),
       { mode: 0o700 },
     );

@@ -837,8 +837,22 @@ prepare_openclaw_config_startup() {
   fi
 
   run_openclaw_config_guard recover --startup-owner || return 1
-  if [ "$(stat -c '%a %U:%G' /sandbox/.openclaw 2>/dev/null || true)" = "500 root:root" ]; then
-    echo "[config-guard] resuming interrupted recursive OpenClaw state lock" >&2
+  local config_posture journal_posture state_lock_reason=""
+  config_posture="$(stat -c '%a %U:%G' /sandbox/.openclaw 2>/dev/null || true)"
+  journal_posture="$(stat -c '%f %U:%G' \
+    /sandbox/.openclaw/devices/pending.json.nemoclaw-self-approval-journal \
+    2>/dev/null || true)"
+  if [ "$config_posture" = "500 root:root" ]; then
+    state_lock_reason="resuming interrupted recursive OpenClaw state lock"
+  elif [ "$journal_posture" = "8180 root:sandbox" ]; then
+    # Shields created before the #8304 mode correction can retain this exact
+    # unreadable regular-file posture (GNU stat %f: 0x8000 | 0600). Re-run the
+    # descriptor-safe lock before the gateway reads it; current and future
+    # locks publish it group-readable.
+    state_lock_reason="repairing legacy unreadable OpenClaw state"
+  fi
+  if [ -n "$state_lock_reason" ]; then
+    printf '[config-guard] %s\n' "$state_lock_reason" >&2
     timeout --signal=TERM --kill-after=5s 12m \
       python3 -I "$_OPENCLAW_STATE_DIR_GUARD" lock \
       --config-dir /sandbox/.openclaw \
@@ -2323,6 +2337,11 @@ try {
   const gateway = cfg.gateway && typeof cfg.gateway === "object" ? cfg.gateway : (cfg.gateway = {});
   const auth = gateway.auth && typeof gateway.auth === "object" ? gateway.auth : (gateway.auth = {});
   auth.token = tokenUrlSafe(32);
+  const meta = cfg.meta && typeof cfg.meta === "object" ? cfg.meta : (cfg.meta = {});
+  // Record OpenClaw's configuration-write metadata. Without this field,
+  // OpenClaw 2026.7 can classify the authenticated configuration as overwritten
+  // and restore the tokenless build-time backup before gateway authentication resolves.
+  meta.lastTouchedAt = new Date().toISOString();
 
   const dirPath = pathModule.dirname(path);
   let fd;
@@ -3148,6 +3167,16 @@ PYAUTOPAIR
   echo "[gateway] auto-pair watcher launched (pid $AUTO_PAIR_PID)" >&2
 }
 
+prepare_auto_pair_log() {
+  if [ "$(id -u)" -eq 0 ]; then
+    # PID 1 opens the redirection after CAP_DAC_OVERRIDE is gone, then passes
+    # the already-open descriptor to the stepped-down watcher.
+    _nemoclaw_safe_create_tmp_file /tmp/auto-pair.log 600 root:root
+  else
+    _nemoclaw_safe_create_tmp_file /tmp/auto-pair.log 600
+  fi
+}
+
 # ── Proxy environment ────────────────────────────────────────────
 # OpenShell injects HTTP_PROXY/HTTPS_PROXY/NO_PROXY into the sandbox, but its
 # NO_PROXY is limited to 127.0.0.1,localhost,::1 — missing the gateway IP.
@@ -3181,131 +3210,20 @@ export no_proxy="$_NO_PROXY_VAL"
 # #1828 OpenShell CA behavior stays intact) — and repoint the CA env vars at
 # the merged bundle so curl/python/git/node all trust both roots.
 _NEMOCLAW_CORPORATE_CA_FILE="/usr/local/share/nemoclaw/corporate-ca.pem"
-# Concise, secret-free warning when a baked corporate CA fails to merge at
-# runtime. Names the failed step + target path only (never certificate bytes)
-# so an operator can distinguish "no CA was baked" from "runtime merge failed".
-_nemoclaw_ca_merge_warn() {
-  echo "[nemoclaw] WARNING: corporate proxy CA merge failed at ${1}; keeping OpenShell-only trust — external TLS through the corporate proxy may fail (#6210)" >&2
-}
-merge_corporate_proxy_ca() {
-  # Trust-anchor tampering (#8650): replacing the baked corporate CA file with a
-  # symlink makes the merge below read the link target instead, adding
-  # attacker-selected bytes to the trust bundle that curl, python, git, and node
-  # verify against. The image bakes this path as a root-owned 0444 regular file,
-  # so a symlink here is never a legitimate state. This is not the recoverable
-  # "merge failed" case below, which safely keeps OpenShell-only trust, so it
-  # fails closed instead of warning.
-  if [ -L "$_NEMOCLAW_CORPORATE_CA_FILE" ]; then
-    echo "[nemoclaw] refusing symlinked corporate CA at ${_NEMOCLAW_CORPORATE_CA_FILE}; expected a regular file (#8650)" >&2
-    exit 1
-  fi
-  [ -s "$_NEMOCLAW_CORPORATE_CA_FILE" ] || return 0
-  _base_bundle=""
-  if [ -n "${SSL_CERT_FILE:-}" ] && [ -f "${SSL_CERT_FILE}" ]; then
-    _base_bundle="$SSL_CERT_FILE"
-  elif [ -f /etc/ssl/certs/ca-certificates.crt ]; then
-    _base_bundle="/etc/ssl/certs/ca-certificates.crt"
-  fi
-  _merged="/tmp/nemoclaw-ca-bundle.pem"
-  # Trust-anchor path safety (#6210): in the normal container start this
-  # entrypoint runs as root (the step-down prefix wraps only the later agent
-  # commands, not this top-level merge), so the merged bundle is written
-  # root-owned 0444 — the non-root sandbox user that the agent later runs as
-  # inherits SSL_CERT_FILE but cannot rewrite it. The predictable /tmp path is
-  # still handled safely: it is built in a fresh mktemp sibling and atomically
-  # renamed into place; a pre-planted symlink at the target is dropped first
-  # (below); and rename(2) replaces the target link/file rather than writing
-  # through it, so a pre-planted symlink or file cannot redirect the write. On a
-  # non-root start the whole entrypoint (and the agent) is the same sandbox user,
-  # so there is no privilege boundary to cross.
-  # Build the bundle in a private temp file next to the target, verifying every
-  # write, then atomically rename into place. If any step fails we bail without
-  # exporting anything, leaving the OpenShell-only trust intact rather than
-  # pointing tools at a partial/empty bundle.
-  _tmp="$(mktemp "${_merged}.XXXXXX" 2>/dev/null)" || {
-    _nemoclaw_ca_merge_warn "create temp bundle (${_merged})"
-    return 0
-  }
-  if [ -n "$_base_bundle" ]; then
-    cat "$_base_bundle" >>"$_tmp" 2>/dev/null || {
-      rm -f "$_tmp"
-      _nemoclaw_ca_merge_warn "append OpenShell bundle"
-      return 0
-    }
-    printf '\n' >>"$_tmp" 2>/dev/null || {
-      rm -f "$_tmp"
-      _nemoclaw_ca_merge_warn "append OpenShell bundle"
-      return 0
-    }
-  fi
-  # Append through a descriptor opened with O_NOFOLLOW and verified as a regular
-  # file (#8650). The check above rejects a planted symlink; this rejects one
-  # swapped in afterwards, because the type check and the read share one
-  # descriptor and no path is resolved twice. Status 2 means the source was
-  # rejected as a trust anchor; any other non-zero status is an ordinary read
-  # failure that keeps the existing warn-and-continue behavior.
-  _ca_append_status=0
-  python3 -I - "$_NEMOCLAW_CORPORATE_CA_FILE" "$_tmp" <<'PY_APPEND_CORPORATE_CA' || _ca_append_status=$?
-import errno
-import os
-import stat
-import sys
-
-source, target = sys.argv[1], sys.argv[2]
-try:
-    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
-except OSError as error:
-    raise SystemExit(2 if error.errno == errno.ELOOP else 3)
-try:
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-        raise SystemExit(2)
-    with open(target, "ab") as merged:
-        while True:
-            chunk = os.read(descriptor, 65536)
-            if not chunk:
-                break
-            merged.write(chunk)
-finally:
-    os.close(descriptor)
-PY_APPEND_CORPORATE_CA
-  if [ "$_ca_append_status" -eq 2 ]; then
-    rm -f "$_tmp"
-    echo "[nemoclaw] refusing corporate CA at ${_NEMOCLAW_CORPORATE_CA_FILE}; expected a regular file, not a symlink (#8650)" >&2
-    exit 1
-  fi
-  if [ "$_ca_append_status" -ne 0 ]; then
-    rm -f "$_tmp"
-    _nemoclaw_ca_merge_warn "append corporate CA"
-    return 0
-  fi
-  chmod 0444 "$_tmp" 2>/dev/null || {
-    rm -f "$_tmp"
-    _nemoclaw_ca_merge_warn "set merged bundle permissions (${_merged})"
-    return 0
-  }
-  # Defense-in-depth for the predictable /tmp path (#6210): if a co-tenant
-  # pre-planted a symlink at the target, drop it first so we rename into a fresh
-  # regular file we own rather than through an attacker-controlled link.
-  if [ -L "$_merged" ]; then
-    rm -f "$_merged" 2>/dev/null || true
-  fi
-  mv -f "$_tmp" "$_merged" 2>/dev/null || {
-    rm -f "$_tmp"
-    _nemoclaw_ca_merge_warn "install merged bundle (${_merged})"
-    return 0
-  }
-  export SSL_CERT_FILE="$_merged"
-  export CURL_CA_BUNDLE="$_merged"
-  export REQUESTS_CA_BUNDLE="$_merged"
-  export GIT_SSL_CAINFO="$_merged"
-  export NODE_EXTRA_CA_CERTS="$_merged"
-  export _NEMOCLAW_CORPORATE_CA_MERGED=1
-  echo "[nemoclaw] merged corporate proxy CA into sandbox trust bundle (#6210)" >&2
-}
+_NEMOCLAW_CORPORATE_CA_HELPER="/usr/local/lib/nemoclaw/corporate-ca-runtime.sh"
+if [ ! -f "$_NEMOCLAW_CORPORATE_CA_HELPER" ]; then
+  _NEMOCLAW_CORPORATE_CA_HELPER="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/corporate-ca-runtime.sh"
+fi
+if [ ! -f "$_NEMOCLAW_CORPORATE_CA_HELPER" ] || [ -L "$_NEMOCLAW_CORPORATE_CA_HELPER" ]; then
+  echo "[nemoclaw] required corporate CA runtime helper is missing or unsafe" >&2
+  exit 1
+fi
+# shellcheck source=scripts/lib/corporate-ca-runtime.sh
+source "$_NEMOCLAW_CORPORATE_CA_HELPER"
 if [ "${NEMOCLAW_MANAGED_STARTUP_APPLIED:-0}" != "1" ]; then
   merge_corporate_proxy_ca
 fi
-
+unset _NEMOCLAW_CORPORATE_CA_HELPER
 # Git TLS CA bundle fix (NemoClaw#2270).
 # OpenShell's L7 proxy does MITM TLS termination and re-signs with its own CA.
 # OpenShell injects SSL_CERT_FILE and CURL_CA_BUNDLE pointing at the CA bundle,
@@ -3435,6 +3353,31 @@ _RUNTIME_SHELL_ENV_SHIM="[ -f ${_RUNTIME_SHELL_ENV_FILE} ] && . ${_RUNTIME_SHELL
 
 write_runtime_shell_env() {
   _PROXY_ENV_FILE="/tmp/nemoclaw-proxy-env.sh"
+  _emit_gateway_token_reconcile() {
+    local _escaped_intended_gateway_token="$1"
+    cat <<'GATEWAYTOKENRECONCILESTART'
+# nemoclaw-gateway-token-reconcile start
+# The proxy-env file is the trust anchor for OPENCLAW_GATEWAY_TOKEN. Probe
+# writability in a subshell so a readonly pin cannot abort sourcing: advance the
+# anchor when writable (also the fresh-source and repeated-source paths), stay
+# silent when it already holds the intended value, and otherwise emit a
+# controlled conflict diagnostic that never echoes the trusted token.
+GATEWAYTOKENRECONCILESTART
+    printf "if ( OPENCLAW_GATEWAY_TOKEN='%s' ) 2>/dev/null; then\n" \
+      "$_escaped_intended_gateway_token"
+    printf "  OPENCLAW_GATEWAY_TOKEN='%s'\n" "$_escaped_intended_gateway_token"
+    printf "else\n  case \"\${OPENCLAW_GATEWAY_TOKEN-}\" in\n"
+    printf "    '%s') : ;;\n" "$_escaped_intended_gateway_token"
+    cat <<'GATEWAYTOKENRECONCILEEND'
+    *)
+      /usr/bin/printf '%s\n' 'Error: conflicting trust anchor' >&2
+      /usr/bin/false
+      ;;
+  esac
+fi
+# nemoclaw-gateway-token-reconcile end
+GATEWAYTOKENRECONCILEEND
+  }
   {
     cat <<PROXYEOF
 # Proxy configuration (overrides narrow OpenShell defaults on connect)
@@ -4121,11 +4064,19 @@ GUARDENVEOF
       # URL, including loopback, while WhatsApp revalidates its local override
       # immediately at the specialized exec boundary.
       printf 'export OPENCLAW_GATEWAY_TOKEN\n'
+      # Bake the intended value into each URL-case arm, then reconcile it against
+      # any pre-existing value. Avoiding a caller-visible temporary variable is
+      # required because the sourcing shell can already have any variable name
+      # pinned readonly. A blind assignment would abort sourcing with the shell's
+      # raw readonly error (exit 2) — and could echo the failing assignment line
+      # — when OPENCLAW_GATEWAY_TOKEN is already readonly and conflicting (#8428).
       cat <<'GATEWAYTOKENENVEOF'
 case "${OPENCLAW_GATEWAY_URL:-}" in
   *@*)
-    OPENCLAW_GATEWAY_TOKEN=
-    ;;
+GATEWAYTOKENENVEOF
+      _emit_gateway_token_reconcile ""
+      printf '    ;;\n'
+      cat <<'GATEWAYTOKENENVEOF'
   '' | ws://127.0.0.1 | ws://127.0.0.1:* | ws://127.0.0.1/* | \
     wss://127.0.0.1 | wss://127.0.0.1:* | wss://127.0.0.1/* | \
     ws://localhost | ws://localhost:* | ws://localhost/* | \
@@ -4133,10 +4084,10 @@ case "${OPENCLAW_GATEWAY_URL:-}" in
     "ws://[::1]" | "ws://[::1]:"* | "ws://[::1]/"* | \
     "wss://[::1]" | "wss://[::1]:"* | "wss://[::1]/"*)
 GATEWAYTOKENENVEOF
-      printf "    OPENCLAW_GATEWAY_TOKEN='%s'\n" "$_escaped_gateway_token"
+      _emit_gateway_token_reconcile "$_escaped_gateway_token"
       printf '    ;;\n'
       printf '  *)\n'
-      printf '    OPENCLAW_GATEWAY_TOKEN=\n'
+      _emit_gateway_token_reconcile ""
       printf '    ;;\n'
       printf 'esac\n'
     fi
@@ -5115,6 +5066,105 @@ arm_openclaw_gateway_supervisor_cleanup() {
   trap clear_in_container_gateway_marker EXIT
 }
 
+launch_openclaw_gateway_process() {
+  local log_mode="$1"
+  local launch_identity="$2"
+  local -a gateway_launch_prefix=()
+  shift 2
+  case "$launch_identity" in
+    current) ;;
+    gateway)
+      gateway_launch_prefix=(
+        "${STEP_DOWN_PREFIX_GATEWAY[@]}" env HOME=/sandbox sh -c
+        'umask 0007; exec "$@"' sh
+      )
+      ;;
+    *)
+      echo "[gateway] invalid gateway launch identity: $launch_identity" >&2
+      return 1
+      ;;
+  esac
+  case "$log_mode" in
+    append) ;;
+    truncate)
+      # Replace the predictable log path immediately before the initial launch.
+      # The descriptor-safe launcher below then pins that exact regular file.
+      if [ "$launch_identity" = gateway ] && [ "$(id -u)" -eq 0 ]; then
+        _nemoclaw_safe_create_tmp_file /tmp/gateway.log 644 gateway:gateway || return 1
+      else
+        _nemoclaw_safe_create_tmp_file /tmp/gateway.log 644 || return 1
+      fi
+      ;;
+    *)
+      echo "[gateway] invalid gateway log mode: $log_mode" >&2
+      return 1
+      ;;
+  esac
+
+  nohup /usr/bin/env -u OPENCLAW_GATEWAY_TOKEN \
+    "${gateway_launch_prefix[@]+"${gateway_launch_prefix[@]}"}" \
+    python3 -I - "$log_mode" "$@" <<'PYGATEWAYLAUNCH' &
+import os
+import stat
+import sys
+
+log_path = "/tmp/gateway.log"
+log_mode = sys.argv[1]
+argv = sys.argv[2:]
+if not argv:
+    print("[gateway] refusing empty gateway launch command", file=sys.stderr)
+    raise SystemExit(1)
+if not hasattr(os, "O_NOFOLLOW"):
+    print("[SECURITY] refusing gateway launch because O_NOFOLLOW is unavailable", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    before = os.lstat(log_path)
+except OSError as exc:
+    print(f"[SECURITY] refusing unavailable gateway log path: {log_path}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+    print(f"[SECURITY] refusing unsafe gateway log path: {log_path}", file=sys.stderr)
+    raise SystemExit(1)
+
+flags = os.O_WRONLY | os.O_NOFOLLOW
+for optional_flag in ("O_CLOEXEC", "O_NONBLOCK"):
+    flags |= getattr(os, optional_flag, 0)
+if log_mode == "append":
+    flags |= os.O_APPEND
+elif log_mode != "truncate":
+    print(f"[gateway] invalid gateway log mode: {log_mode}", file=sys.stderr)
+    raise SystemExit(1)
+
+try:
+    descriptor = os.open(log_path, flags)
+except OSError as exc:
+    print(f"[SECURITY] refusing unsafe gateway log path: {log_path}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+try:
+    opened = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or opened.st_nlink != 1
+        or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        print(f"[SECURITY] refusing replaced gateway log path: {log_path}", file=sys.stderr)
+        raise SystemExit(1)
+    if log_mode == "truncate":
+        os.ftruncate(descriptor, 0)
+    os.dup2(descriptor, 1)
+    os.dup2(descriptor, 2)
+finally:
+    if descriptor > 2:
+        os.close(descriptor)
+
+environment = os.environ.copy()
+environment.pop("OPENCLAW_GATEWAY_TOKEN", None)
+os.execvpe(argv[0], argv, environment)
+PYGATEWAYLAUNCH
+  GATEWAY_PID=$!
+}
+
 launch_openclaw_gateway() {
   # Drop the gateway marker whenever this supervisor exits -- clean gateway
   # exit (`exit 0` below), a forwarded signal (cleanup_openclaw_on_signal ends
@@ -5127,10 +5177,8 @@ launch_openclaw_gateway() {
   # script -- keeps it in place.
   arm_openclaw_gateway_supervisor_cleanup
   mark_in_container_gateway
-  nohup "${STEP_DOWN_PREFIX_GATEWAY[@]}" env HOME=/sandbox sh -c \
-    'umask 0007; exec "$@" >>/tmp/gateway.log 2>&1' sh \
-    "$OPENCLAW" gateway run --port "${_DASHBOARD_PORT}" &
-  GATEWAY_PID=$!
+  launch_openclaw_gateway_process truncate gateway \
+    "$OPENCLAW" gateway run --port "${_DASHBOARD_PORT}" || return 1
   if ! capture_openclaw_pid_start_identity "$GATEWAY_PID" GATEWAY_PID_START_IDENTITY; then
     # An uncaptured numeric PID is never safe to signal: Bash may already have
     # reaped the short-lived child and the kernel may have reused its PID. Fail
@@ -5150,8 +5198,8 @@ launch_openclaw_gateway() {
 launch_openclaw_gateway_non_root() {
   arm_openclaw_gateway_supervisor_cleanup
   mark_in_container_gateway
-  nohup "$OPENCLAW" gateway run --port "${_DASHBOARD_PORT}" >/tmp/gateway.log 2>&1 &
-  GATEWAY_PID=$!
+  launch_openclaw_gateway_process truncate current \
+    "$OPENCLAW" gateway run --port "${_DASHBOARD_PORT}" || return 1
   capture_openclaw_pid_start_identity "$GATEWAY_PID" GATEWAY_PID_START_IDENTITY || exit 1
   record_gateway_pid "$GATEWAY_PID" "$GATEWAY_PID_START_IDENTITY"
   echo "[gateway] openclaw gateway launched (pid $GATEWAY_PID)" >&2
@@ -5745,12 +5793,7 @@ if [ "$(id -u)" -ne 0 ]; then
   write_auth_profile
   harden_auth_profiles
 
-  # In non-root mode, detach gateway stdout/stderr from the sandbox-create
-  # stream so openshell sandbox create can return once the container is ready.
-  _nemoclaw_safe_create_tmp_file /tmp/gateway.log 644
-
-  # Separate log for auto-pair in non-root mode as well.
-  _nemoclaw_safe_create_tmp_file /tmp/auto-pair.log 600
+  prepare_auto_pair_log
 
   prepare_plugin_refresh_log || exit 1
 
@@ -5821,8 +5864,8 @@ if [ "$(id -u)" -ne 0 ]; then
     echo "[gateway] pid $EXITED_GATEWAY_PID exited (rc=$RC); respawning (#$RESPAWN_COUNT in 60s window) in 2s" >&2
     sleep 2
     prepare_openclaw_automatic_respawn || exit 1
-    nohup "$OPENCLAW" gateway run --port "${_DASHBOARD_PORT}" >>/tmp/gateway.log 2>&1 &
-    GATEWAY_PID=$!
+    launch_openclaw_gateway_process append current \
+      "$OPENCLAW" gateway run --port "${_DASHBOARD_PORT}"
     capture_openclaw_pid_start_identity "$GATEWAY_PID" GATEWAY_PID_START_IDENTITY || exit 1
     record_gateway_pid "$GATEWAY_PID" "$GATEWAY_PID_START_IDENTITY"
     # shellcheck disable=SC2034  # read by cleanup_on_signal from sandbox-init.sh
@@ -5883,12 +5926,7 @@ if [ ${#NEMOCLAW_CMD[@]} -gt 0 ]; then
   exit "$_nemoclaw_cmd_rc"
 fi
 
-# Gateway log: owned by gateway user, world-readable for diagnostics.
-# The sandbox user can read but not truncate/overwrite (not owner, sticky /tmp).
-_nemoclaw_safe_create_tmp_file /tmp/gateway.log 644 gateway:gateway
-
-# Separate log for auto-pair so sandbox user can write to it
-_nemoclaw_safe_create_tmp_file /tmp/auto-pair.log 600 sandbox:sandbox
+prepare_auto_pair_log
 
 prepare_plugin_refresh_log || exit 1
 

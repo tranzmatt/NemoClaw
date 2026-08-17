@@ -5,9 +5,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  buildDockerDriverGatewayConfigToml,
+  ensureDockerDriverGatewayJwtBundle,
   gatewayIdForStateDir,
   NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV,
 } from "./docker-driver-gateway-config";
@@ -20,6 +22,18 @@ import {
 } from "./host-gateway-process";
 
 const PGREP_KEY = `pgrep -f ${HOST_GATEWAY_PGREP_PATTERN}`;
+const tempRoots = new Set<string>();
+
+afterEach(() => {
+  for (const root of tempRoots) fs.rmSync(root, { recursive: true, force: true });
+  tempRoots.clear();
+});
+
+function makeTempRoot(prefix: string): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempRoots.add(root);
+  return root;
+}
 
 type RunResponse = (args: string[]) => RunResult;
 
@@ -49,10 +63,14 @@ function psResponses(
   opts: {
     cmdline: string | (() => string);
     exited: Set<number>;
+    processStatus?: RunResult;
   },
 ): [string, RunResponse][] {
   return [
-    [`ps -p ${pid} -o pid=`, () => (opts.exited.has(pid) ? notFound() : ok(`${pid}\n`))],
+    [
+      `ps -p ${pid} -o stat=`,
+      () => (opts.exited.has(pid) ? notFound() : (opts.processStatus ?? ok("S\n"))),
+    ],
     [`ps -p ${pid} -o uid=`, staticResponse(ok(`${String(process.getuid?.() ?? 501)}\n`))],
     [`ps -p ${pid} -o user=`, staticResponse(ok("tester\n"))],
     [
@@ -71,16 +89,30 @@ function stopScopedTarget(
     namespace?: string;
     pidFilePid?: number;
     port?: number;
+    processStatus?: RunResult;
+    signalDenied?: boolean;
   } = {},
 ) {
   const selectedPid = 9_999_601;
   const pid = overrides.pidFilePid ?? selectedPid;
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-scoped-target-"));
+  const stateDir = makeTempRoot("nemoclaw-scoped-target-");
   const pidFile = path.join(stateDir, "openshell-gateway.pid");
   fs.writeFileSync(pidFile, `${String(pid)}\n`);
+  const jwtBundle = ensureDockerDriverGatewayJwtBundle(stateDir);
   fs.writeFileSync(
     path.join(stateDir, "openshell-gateway.toml"),
-    `[openshell.drivers.docker]\nsandbox_namespace = "${gatewayIdForStateDir(stateDir)}"\n`,
+    buildDockerDriverGatewayConfigToml(
+      {
+        OPENSHELL_GRPC_ENDPOINT: "https://127.0.0.1:18080",
+        OPENSHELL_LOCAL_TLS_DIR: path.join(stateDir, "tls"),
+        OPENSHELL_DOCKER_NETWORK_NAME: "openshell-docker",
+        OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "supervisor:test",
+      },
+      "/usr/bin/openshell-sandbox",
+      jwtBundle,
+      gatewayIdForStateDir(stateDir),
+    ),
+    { mode: 0o600 },
   );
   writeDockerDriverGatewayRuntimeMarkerForStateDir(stateDir, {
     desiredEnv: {},
@@ -88,6 +120,10 @@ function stopScopedTarget(
     pid: selectedPid,
   });
   const exited = new Set<number>();
+  const markExited = (pid: number): true => {
+    exited.add(pid);
+    return true;
+  };
   let cmdlineReads = 0;
   const cmdline = overrides.cmdline ?? "openshell-gateway[nemoclaw=nemoclaw-18080;port=18080]";
   const run = vi.fn(
@@ -101,6 +137,7 @@ function stopScopedTarget(
               : cmdline;
           },
           exited,
+          ...(overrides.processStatus ? { processStatus: overrides.processStatus } : {}),
         }),
       ]),
     ),
@@ -108,10 +145,9 @@ function stopScopedTarget(
   const kill = vi.fn<HostGatewayProcessDeps["kill"]>((killedPid, signal) => {
     switch (signal) {
       case "SIGTERM":
-        exited.add(killedPid);
-        break;
+        return overrides.signalDenied ? false : markExited(killedPid);
     }
-    return true;
+    return overrides.signalDenied !== true;
   });
   const result = stopHostGatewayProcesses(
     {
@@ -124,8 +160,10 @@ function stopScopedTarget(
         [NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV]:
           overrides.namespace ?? gatewayIdForStateDir(stateDir),
       }),
+      warn: vi.fn(),
     },
     {
+      ...(overrides.signalDenied ? { killWaitMs: 0, pollIntervalMs: 0, termWaitMs: 0 } : {}),
       openShellGatewayName: overrides.name ?? "nemoclaw-18080",
       openShellGatewayPort: overrides.port ?? 18080,
       scopedGatewayStop: true,
@@ -137,7 +175,7 @@ function stopScopedTarget(
 }
 
 function stopTargetedPid(pid: number, cmdline: string, targeted = true) {
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-host-gateway-target-"));
+  const stateDir = makeTempRoot("nemoclaw-host-gateway-target-");
   const pidFile = path.join(stateDir, "openshell-gateway.pid");
   fs.writeFileSync(pidFile, `${pid}\n`);
   const exited = new Set<number>();
@@ -207,6 +245,31 @@ describe("stopHostGatewayProcesses target filtering", () => {
       "PID 9999601: process ownership changed immediately before signaling",
     ]);
     expect(kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(pidFile)).toBe(true);
+  });
+
+  it.each([
+    ["ps fails", { status: 2, stdout: "", stderr: "ps failed" }],
+    ["ps returns an error-bearing no-match", { status: 1, stdout: "", stderr: "bad process ID" }],
+    ["ps returns an invalid state", { status: 0, stdout: "?\n", stderr: "" }],
+  ])("fails closed when scoped process status cannot be proven: %s (#7744)", (_case, status) => {
+    const { kill, pidFile, result } = stopScopedTarget({ processStatus: status });
+
+    expect(result.stopped).toEqual([]);
+    expect(result.ownershipFailures).toEqual([
+      "PID 9999601: recorded process status cannot be proven",
+    ]);
+    expect(kill).not.toHaveBeenCalled();
+    expect(fs.existsSync(pidFile)).toBe(true);
+  });
+
+  it("retains scoped ownership evidence when signaling is denied (#7744)", () => {
+    const { kill, pidFile, result } = stopScopedTarget({ signalDenied: true });
+
+    expect(result.stopped).toEqual([]);
+    expect(result.failed).toEqual([9_999_601]);
+    expect(kill).toHaveBeenCalledWith(9_999_601, "SIGTERM");
+    expect(kill).toHaveBeenCalledWith(9_999_601, "SIGKILL");
     expect(fs.existsSync(pidFile)).toBe(true);
   });
 

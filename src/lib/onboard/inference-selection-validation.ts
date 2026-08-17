@@ -14,6 +14,7 @@ const { probeAnthropicEndpoint, probeOpenAiLikeEndpointOptimized } =
       apiKey: string | null | undefined,
       options?: {
         probeStreaming?: boolean;
+        requireStreamingToolCalling?: boolean;
         pinnedAddresses?: readonly string[];
         trustedPrivateCapability?: TrustedPrivateEndpointCapability;
       },
@@ -65,6 +66,11 @@ export interface InferenceSelectionValidationDeps {
   resolveEndpointHost?: EndpointDnsLookupFn;
   /** Exact private endpoint hosts trusted by the operator (tests may inject this). */
   trustedPrivateEndpointHosts?: readonly string[];
+  /**
+   * Optional abort teardown hook for tests. Production loads the helper lazily
+   * so openshell binaries stay out of the validation unit graph.
+   */
+  teardownOrphanManagedGatewayOnAbort?: () => void;
   promptValidationRecovery(
     label: string,
     recovery: ReturnType<typeof getProbeRecovery>,
@@ -147,6 +153,22 @@ export function createInferenceSelectionValidationHelpers(
     deps.trustedPrivateEndpointHosts ?? parseTrustedPrivateInferenceHostsFromEnv(process.env);
 
   function exitNonInteractiveValidationFailure(): never {
+    // #8952: tear down an unowned managed gateway before fatal exit.
+    try {
+      const teardown =
+        deps.teardownOrphanManagedGatewayOnAbort ??
+        (() => {
+          const { teardownOrphanManagedGatewayOnAbort } =
+            require("./gateway-destroy") as typeof import("./gateway-destroy");
+          teardownOrphanManagedGatewayOnAbort();
+        });
+      teardown();
+    } catch (error) {
+      // Helper never throws; this covers require/load / inject failures.
+      console.error(
+        `  Gateway teardown after onboard abort failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     process.exitCode = 1;
     (process.exit as (code?: number) => void)(1);
     throw new Error("Non-interactive endpoint validation failed.");
@@ -442,7 +464,8 @@ export function createInferenceSelectionValidationHelpers(
     // Validate the protocol surface that the selected agent will actually use.
     // Hermes routes custom Anthropic providers through the managed OpenAI
     // frontend, while native Anthropic consumers require strict SSE validation
-    // for duplicate/missing/out-of-order events (#6289).
+    // for duplicate/missing/out-of-order events (#6289) and a native tool_use
+    // result rather than JSON-shaped assistant text (#7967).
     const probe =
       intendedApi === "openai-completions"
         ? await runOpenAiLikeProbe(
@@ -460,6 +483,7 @@ export function createInferenceSelectionValidationHelpers(
             // Reasoning-only compatible endpoints often reject streaming probes,
             // so mirror the custom OpenAI-compatible path and skip streaming.
             probeStreaming: !reasoningEnabled,
+            requireStreamingToolCalling: !reasoningEnabled,
             pinnedAddresses,
             trustedPrivateCapability,
           });

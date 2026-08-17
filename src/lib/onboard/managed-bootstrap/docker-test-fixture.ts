@@ -130,6 +130,9 @@ function originalInspect(inputs = agentInputs()): DockerContainerInspect {
         "A=1",
         `${MANAGED_BOOTSTRAP_IDENTITY_ENV}=${IDENTITY}`,
         "OPENSHELL_SANDBOX_COMMAND=sleep infinity",
+        "OPENSHELL_OCI_IMAGE_USER=root",
+        "OPENSHELL_SANDBOX_UID=",
+        "OPENSHELL_SANDBOX_GID=",
       ],
       Labels: {
         "openshell.ai/managed-by": "openshell",
@@ -139,8 +142,8 @@ function originalInspect(inputs = agentInputs()): DockerContainerInspect {
       },
       Entrypoint: [SUPERVISOR[0]],
       Cmd: SUPERVISOR.slice(1),
-      User: "root",
-      WorkingDir: "/sandbox",
+      User: "0",
+      WorkingDir: "/",
       Hostname: "alpha",
     },
     State: { Running: true, Paused: false, Restarting: false, Dead: false },
@@ -491,7 +494,7 @@ export function fixture(options: DockerFixtureOptions = {}) {
       [target]
         .filter((value): value is DockerContainerInspect => value?.State !== undefined)
         .forEach((value) => {
-          value.State = { ...value.State, Running: false };
+          value.State = { ...value.State, Running: false, Restarting: false };
         });
       return losesAcknowledgement("container:stop")
         ? { status: 1, stderr: "lost stop acknowledgement" }

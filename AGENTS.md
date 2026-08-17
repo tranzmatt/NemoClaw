@@ -74,7 +74,7 @@ Package-specific guides:
 | Run the broad repo-wide pre-commit and coverage baseline | `npm run check` |
 | Type-check CLI | `npm run typecheck:cli` |
 | Type-check plugin and plugin tests | `npm --prefix nemoclaw run typecheck` |
-| Auto-format | `npm run format` |
+| Auto-format added JavaScript and TypeScript files that Oxfmt does not exclude | `npm run format` |
 | Build docs | `npm run docs` |
 | Serve docs locally | `npm run docs:live` |
 
@@ -153,13 +153,15 @@ For shell scripts use `#` comments. For Markdown use HTML comments.
 
 - `bin/` launcher and remaining `scripts/*.js`: **CommonJS** (`require`/`module.exports`), Node.js 22.19+
 - `test/`: **ESM** (`import`/`export`)
-- Biome config in `biome.json`
+- Oxlint uses `oxlint.config.ts`. The isolated `oxlint.type-aware.config.ts` configuration enforces `typescript/no-floating-promises` for plugin sources.
+
+- Use `eslint-plugin-sonarjs` only for the `oxlint.config.ts` cognitive-complexity rules documented in [`tools/lint/DEPENDENCY-REVIEW.md`](tools/lint/DEPENDENCY-REVIEW.md).
 - Keep function complexity low; existing complexity hotspots are tracked separately
 - Unused vars pattern: prefix with `_`
 
 ### TypeScript
 
-- Plugin code in `nemoclaw/src/` is linted and formatted by the root Biome config
+- Oxlint lints plugin code in `nemoclaw/src/`. Oxfmt formats added plugin files that it does not exclude.
 - CLI type-checking via `tsconfig.cli.json`
 - Plugin production and test type-checking via `npm --prefix nemoclaw run typecheck`, using
   `nemoclaw/tsconfig.json` and `nemoclaw/tsconfig.test.json`
@@ -195,6 +197,51 @@ All hooks managed by [prek](https://prek.j178.dev/) (installed via `npm install`
 5. Run `npm run dev:doctor` to verify the contributor environment without changing it
 6. Use `./scripts/dev-setup.sh --expose-cli` only with explicit approval for host-visible CLI exposure
 7. Run the tests targeted to the behavior you change once per relevant change set; rerun them after later edits or hook autofixes that can affect that behavior
+
+### E2E Selection and Authoring
+
+Use live E2E only for behavior that needs a real shell, installer, process,
+Docker, OpenShell, `/proc`, sandbox, external service, or GitHub Actions
+boundary. Put deterministic code, parser, registry, workflow-planner, and
+fixture logic in unit, integration, package-contract, or `e2e-support` tests
+instead. Do not add a live E2E target for a check that can be observed through a
+stable local boundary.
+
+Before adding or extending E2E coverage, name the semantic coverage dimension
+that is missing. Existing migrated examples show the intended granularity:
+catalogue targets pair environment, onboarding profile, expected state, optional
+lifecycle, and `suiteIds`; `dashboard-remote-bind` owns install, onboard,
+artifacts, and terminal cleanup; `credential-sanitization`,
+`telegram-injection`, `messaging-providers`, `messaging-compatible-endpoint`,
+and `gpu-e2e` are separate behavior contracts rather than one broad "full" run.
+Extend matrix metadata only when it selects an already-defined behavior
+dimension. Do not duplicate behavior logic in a second registry, workflow list,
+or hand-maintained catalogue; use the typed registry and shared E2E workflow
+planner documented in [`test/e2e/README.md`](test/e2e/README.md) and
+[`test/e2e/docs/README.md`](test/e2e/docs/README.md).
+
+If a gap is real but not ready for a test, record it as a combinatorial gap
+instead of adding speculative coverage. State the missing dimension, the
+existing nearest coverage, why a new test would duplicate or overreach current
+behavior, and the issue or PR that will make it testable. A gap note must not
+change release judgment by itself.
+
+Assert outcomes, state, artifacts, and redacted diagnostics. Do not assert
+incidental terminal output, progress wording, spinner frames, ANSI escape
+sequences, timing text, or prompt layout unless that text is the product
+contract under review. Terminal traces are evidence; they are not stable
+behavior unless the issue explicitly makes them the behavior.
+
+Retries require a checked-in bounded policy with a narrow transient signature,
+owner, idempotence or reconciliation basis, attempt evidence, and an entry in
+[`test/e2e/RETRY_INVENTORY.md`](test/e2e/RETRY_INVENTORY.md). Do not add
+unproven retries, ambiguous mutation retries, or broad failed-job reruns. A
+mutation retry is allowed only after the test reconciles the external state and
+proves repeating the same desired operation is safe. Keep bounded operation
+retries separate from complete workflow reruns: `E2E / Main Retry` records
+attempts and does not request a broad rerun, while Hosted Runner Recovery owns
+at most one full rerun only for authenticated GitHub-hosted runner-loss
+evidence.
 
 ### Plain Language and Direct Design
 
@@ -271,7 +318,8 @@ If the command trace contains no reviewer-request write, report the event as an 
 ### Gotchas
 
 - `npm install` at root triggers `prek install` which sets up git hooks. If hooks fail, check that `core.hooksPath` is unset: `git config --unset core.hooksPath`
-- The `nemoclaw/` subdirectory has its own `package.json` and `node_modules`, while sharing the root Biome config — it's a separate npm project
+- The `nemoclaw/` subdirectory has its own `package.json` and `node_modules`.
+  It is a separate npm project that shares the root Oxlint and Oxfmt configuration files.
 - SPDX headers are auto-inserted by pre-commit hooks; don't worry about adding them manually
 - Coverage thresholds are ratcheted in `ci/coverage-threshold-*.json` — new code should not decrease CLI or plugin coverage
 - The `.claude/skills` symlink points to `.agents/skills` — both paths resolve to the same content

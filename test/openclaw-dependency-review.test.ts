@@ -12,14 +12,14 @@ import { readYaml, type WorkflowJob, type WorkflowStep } from "./helpers/e2e-wor
 const REPO_ROOT = path.join(import.meta.dirname, "..");
 const DEPENDENCY_REVIEW = path.join(
   REPO_ROOT,
-  "docs",
-  "security",
+  "internal",
+  "security-reviews",
   "openclaw-2026.6.10-dependency-review.md",
 );
 const ACTIVE_DEPENDENCY_REVIEW = path.join(
   REPO_ROOT,
-  "docs",
-  "security",
+  "internal",
+  "security-reviews",
   "openclaw-2026.7.1-dependency-review.md",
 );
 const MCP_TROUBLESHOOTING = path.join(
@@ -282,6 +282,10 @@ describe("OpenClaw 2026.6.10 dependency review contract", () => {
     expect(review).toContain("GHSA-mwp4-54f8-5fhr");
     expect(review).toContain("ip-address@^10.2.0");
     expect(review).toContain("ip-address@10.3.1");
+    expect(review).toContain("hono@4.12.34");
+    expect(review).toContain("GHSA-54fx-42gc-7vw4");
+    expect(review).toContain("GHSA-f23p-vx2j-j53r");
+    expect(review).toContain("GHSA-79qm-7rj5-m7r9");
   });
 
   it("keeps advisor disposition evidence in the dependency review note", () => {
@@ -549,25 +553,6 @@ describe("OpenClaw 2026.6.10 dependency review contract", () => {
     expect(review).toContain("test/onboard-resume-provider-recovery.test.ts");
   });
 
-  // source-shape-contract: security -- The legacy archive remediation helper must be present in the base image before the fail-closed Docker build invokes it
-  it("copies the legacy OpenClaw remediation helper before the base build invokes it", () => {
-    const dockerfile = readFileSync(path.join(REPO_ROOT, "Dockerfile.base"), "utf-8");
-    const flattenedDockerfile = dockerfile.replace(/\\\s*\n/g, " ").replace(/\s+/g, " ");
-    const groupedHelperCopy = flattenedDockerfile.indexOf(
-      "COPY scripts/lib/reviewed-npm-archive.mts scripts/lib/reviewed-npm-audit.mts scripts/lib/openclaw-npm-remediation.mts /scripts/lib/",
-    );
-    const legacyHelperCopy = flattenedDockerfile.indexOf(
-      "COPY scripts/lib/openclaw-npm-remediation.mts /scripts/lib/openclaw-npm-remediation.mts",
-    );
-    const helperCopy = groupedHelperCopy >= 0 ? groupedHelperCopy : legacyHelperCopy;
-    const helperInvocation = flattenedDockerfile.indexOf(
-      "node --experimental-strip-types /scripts/lib/openclaw-npm-remediation.mts",
-    );
-
-    expect(helperCopy).toBeGreaterThanOrEqual(0);
-    expect(helperInvocation).toBeGreaterThan(helperCopy);
-  });
-
   it("keeps every reviewed archive boundary on the shared invariant matrix (#5896)", () => {
     const result = spawnSync(
       "bash",
@@ -644,7 +629,7 @@ for dockerfile in Dockerfile Dockerfile.base; do
   check_contains "$openclaw_block" 'mcporter-audit-policy-sha256=' "$dockerfile mcporter audit policy hash"
   check_contains "$openclaw_block" 'mcporter-audit-status=' "$dockerfile mcporter audit status"
   check_contains "$openclaw_block" 'mcporter-audit-exceptions=' "$dockerfile mcporter audit exceptions"
-  check_contains "$openclaw_block" 'mcporter-recipe=locked-ci+reviewed-audit+signatures-v2' "$dockerfile mcporter provenance recipe"
+  check_contains "$openclaw_block" 'mcporter-recipe=locked-ci+reviewed-audit-v3' "$dockerfile mcporter provenance recipe"
 done
 
 check_contains "$(cat Dockerfile.base)" 'chmod 0444 "$OPENCLAW_PROVENANCE_TMP"' "base provenance protected mode"

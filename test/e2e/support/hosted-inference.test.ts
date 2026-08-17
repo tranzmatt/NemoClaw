@@ -10,7 +10,10 @@ import { describe, expect, it } from "vitest";
 import { buildAvailabilityProbeEnv } from "../fixtures/availability-env.ts";
 import { ProviderClient, trustedProviderEndpoint } from "../fixtures/clients/provider.ts";
 import { startFakeOpenAiCompatibleServer } from "../fixtures/fake-openai-compatible.ts";
-import { requireHostedInferenceConfig } from "../fixtures/hosted-inference.ts";
+import {
+  buildHostedInferenceModelsProbe,
+  requireHostedInferenceConfig,
+} from "../fixtures/hosted-inference.ts";
 import { startTestProgress } from "../fixtures/progress.ts";
 import type {
   ShellProbeResult,
@@ -189,6 +192,44 @@ describe("hosted inference E2E config", () => {
 
     expect(cfg.apiKey).toBe("sk-compatible-key");
     expect(cfg.credentialEnv).toBe("COMPATIBLE_API_KEY");
+  });
+
+  it("passes hosted authorization to curl on stdin without exposing the key in arguments", () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-hosted-models-probe-"));
+    const argsPath = path.join(directory, "curl.args");
+    const stdinPath = path.join(directory, "curl.stdin");
+    fs.writeFileSync(
+      path.join(directory, "curl"),
+      `#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$@" > ${JSON.stringify(argsPath)}
+cat > ${JSON.stringify(stdinPath)}
+printf '{"data":[]}'
+`,
+      { mode: 0o755 },
+    );
+
+    const apiKey = "hosted-models-secret";
+    const probe = buildHostedInferenceModelsProbe(apiKey, "https://inference-api.nvidia.com/v1");
+    try {
+      const result = spawnSync(probe.command, probe.args, {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          ...probe.env,
+          PATH: `${directory}:${process.env.PATH ?? ""}`,
+        },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe('{"data":[]}');
+      expect([probe.command, ...probe.args].join(" ")).not.toContain(apiKey);
+      expect(fs.readFileSync(argsPath, "utf8")).toContain("--header\n@-\n");
+      expect(fs.readFileSync(argsPath, "utf8")).not.toContain(apiKey);
+      expect(fs.readFileSync(stdinPath, "utf8")).toBe(`Authorization: Bearer ${apiKey}\n`);
+    } finally {
+      fs.rmSync(directory, { force: true, recursive: true });
+    }
   });
 
   it("preserves the hosted-compatible mode flag without passing source secrets by default", () => {
@@ -385,6 +426,7 @@ describe("hosted inference E2E config", () => {
       forbiddenMarkers: ["FORBIDDEN_REQUEST_MARKER"],
       model: "nvidia/nvidia/fake-model",
       progress,
+      requestCanaryMarker: "EXPECTED_REQUEST_CANARY",
       requireAuth: true,
       responseText: "RESP_OK",
     });
@@ -408,7 +450,7 @@ describe("hosted inference E2E config", () => {
 
       const chat = await fetch(`${fake.baseUrl}/chat/completions`, {
         body: JSON.stringify({
-          messages: [{ content: "ping", role: "user" }],
+          messages: [{ content: "ping EXPECTED_REQUEST_CANARY", role: "user" }],
           model: "nvidia/nvidia/fake-model",
         }),
         headers: {
@@ -443,6 +485,7 @@ describe("hosted inference E2E config", () => {
             auth: "missing",
             forbiddenMarkerMatches: 1,
             path: "/v1/chat/completions",
+            requestCanaryPresent: false,
           }),
           expect.objectContaining({
             auth: "ok",
@@ -450,6 +493,7 @@ describe("hosted inference E2E config", () => {
             hostHeader: new URL(fake.baseUrl).host,
             model: "nvidia/nvidia/fake-model",
             path: "/v1/chat/completions",
+            requestCanaryPresent: true,
             stream: false,
           }),
           expect.objectContaining({ auth: "ok", path: "/v1/responses", stream: true }),
@@ -459,6 +503,7 @@ describe("hosted inference E2E config", () => {
         requests.reduce((total, request) => total + (request.forbiddenMarkerMatches ?? 0), 0),
       ).toBe(1);
       expect(JSON.stringify(requests)).not.toContain("FORBIDDEN_REQUEST_MARKER");
+      expect(JSON.stringify(requests)).not.toContain("EXPECTED_REQUEST_CANARY");
     } finally {
       await fake.close();
     }

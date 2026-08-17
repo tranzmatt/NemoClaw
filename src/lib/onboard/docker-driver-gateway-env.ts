@@ -58,6 +58,7 @@ export const DOCKER_DRIVER_GATEWAY_RUNTIME_ENV_KEYS = [
   "OPENSHELL_GATEWAY_CONFIG",
   "OPENSHELL_VM_DRIVER_STATE_DIR",
   "OPENSHELL_DRIVER_DIR",
+  "NEMOCLAW_DOCKER_ENABLE_BIND_MOUNTS",
   NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE_ENV,
   "NETAVARK_FW",
 ] as const;
@@ -70,6 +71,7 @@ export interface BuildDockerDriverGatewayEnvOptions {
   podmanSocketPath?: string;
   getDockerSupervisorImage: () => string;
   resolveSandboxBin: () => string | null;
+  enableBindMounts?: boolean;
 }
 
 export type PackageManagedDockerDriverGatewayWithEnvOverrideOptions = Omit<
@@ -234,6 +236,7 @@ export function buildDockerDriverGatewayEnv({
   podmanSocketPath,
   getDockerSupervisorImage,
   resolveSandboxBin,
+  enableBindMounts = false,
 }: BuildDockerDriverGatewayEnvOptions): Record<string, string> {
   const portable = isPortableExperimentalProfile();
   const env: Record<string, string> = {
@@ -247,6 +250,7 @@ export function buildDockerDriverGatewayEnv({
     OPENSHELL_DOCKER_NETWORK_NAME: dockerNetworkName,
     OPENSHELL_DOCKER_SUPERVISOR_IMAGE: getDockerSupervisorImage(),
   };
+  if (enableBindMounts) env.NEMOCLAW_DOCKER_ENABLE_BIND_MOUNTS = "1";
   if (portable) {
     env.NETAVARK_FW = "iptables";
     if (podmanSocketPath !== undefined) {
@@ -272,7 +276,13 @@ export function buildDockerDriverGatewayEnv({
       env.OPENSHELL_DOCKER_SUPERVISOR_BIN = sandboxBin;
     }
   }
-  prepareDockerDriverGatewayConfigEnv(env, stateDir, env.OPENSHELL_DOCKER_SUPERVISOR_BIN);
+  prepareDockerDriverGatewayConfigEnv(env, stateDir, env.OPENSHELL_DOCKER_SUPERVISOR_BIN, {
+    // The installer sets this only after a strict pre-upgrade backup. OpenShell
+    // 0.0.44 had a database but no authenticated config or JWT identity, so
+    // prepared recovery may safely attach the first scoped identity to it.
+    allowOpenShell0044PreAuthDatabase:
+      process.env.NEMOCLAW_RESTORE_LATEST_BACKUP_ON_RECREATE === "1",
+  });
   return env;
 }
 

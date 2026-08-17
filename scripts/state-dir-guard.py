@@ -46,6 +46,8 @@ MAX_GUARD_SECONDS = 10 * 60
 PRODUCTION_FAIL_CLOSED_CONFIG_DIRS = frozenset(
     {"/sandbox/.openclaw", "/sandbox/.hermes", "/sandbox/.deepagents"}
 )
+OPENCLAW_CONFIG_DIR = "/sandbox/.openclaw"
+OPENCLAW_NATIVE_MUTABLE_ROOT = "devices"
 OPENCLAW_MUTATION_MUTEX_PATH = "/run/nemoclaw/openclaw-config-mutation.lock"
 MAX_TRANSITION_LOCK_BYTES = 16 * 1024
 # Keep this exact source/target contract aligned with
@@ -696,6 +698,12 @@ class TraversalContext:
             and relative_path == HERMES_PRIVATE_WRITABLE_SUBPATH
         )
 
+    def is_openclaw_native_mutable_path(self, relative_path: str) -> bool:
+        return self.config_path == OPENCLAW_CONFIG_DIR and (
+            relative_path == OPENCLAW_NATIVE_MUTABLE_ROOT
+            or relative_path.startswith(f"{OPENCLAW_NATIVE_MUTABLE_ROOT}/")
+        )
+
     def is_under_writable_root(self, relative_path: str) -> bool:
         components = tuple(relative_path.split("/"))
         return any(
@@ -1114,7 +1122,12 @@ def _expected_file_mode(policy: Policy, action: Action, old_mode: int) -> int:
         return (old_mode & 0o700) | 0o060 | (0o010 if old_mode & 0o111 else 0)
     if policy == "confidentiality":
         return old_mode & 0o700
-    return old_mode & ~0o022
+    # High-risk files move from the sandbox UID to root while retaining the
+    # sandbox group. Mirror the original owner's read/execute access onto that
+    # group before removing every group/world write bit; otherwise an
+    # owner-private 0600 runtime file becomes root:sandbox 0600 and the
+    # gateway loses the access it had before Shields went up (#8304).
+    return (old_mode & ~0o022) | ((old_mode & 0o500) >> 3)
 
 
 def _freeze_dir_for_lock(dir_fd: int) -> None:
@@ -1782,6 +1795,7 @@ def _verify_metadata(
     action: Action,
     identity: Identity,
     is_confidentiality_root: bool = False,
+    allow_openclaw_native_mutable: bool = False,
 ) -> Issue | None:
     expected_uid, expected_gid = _expected_ids(
         policy, action, identity, is_confidentiality_root
@@ -1796,6 +1810,8 @@ def _verify_metadata(
         return None
     mode = stat.S_IMODE(st.st_mode)
     if entry_type == "directory":
+        if allow_openclaw_native_mutable and mode in (0o700, 0o755):
+            return None
         expected_mode = _expected_dir_mode(policy, action, is_confidentiality_root)
         if mode != expected_mode:
             return Issue(
@@ -1811,6 +1827,8 @@ def _verify_metadata(
             f"file retains special mode bits: {mode:04o}",
         )
     if action == "unlock":
+        if allow_openclaw_native_mutable and mode == 0o600:
+            return None
         if mode & 0o007 or mode & 0o060 != 0o060:
             return Issue(
                 "verification-mode-mismatch",
@@ -1824,12 +1842,21 @@ def _verify_metadata(
                 path,
                 f"confidential file exposes group/world permissions: {mode:04o}",
             )
-    elif mode & 0o022:
-        return Issue(
-            "verification-mode-mismatch",
-            path,
-            f"high-risk file is group/world writable: {mode:04o}",
-        )
+    else:
+        if mode & 0o022:
+            return Issue(
+                "verification-mode-mismatch",
+                path,
+                f"high-risk file is group/world writable: {mode:04o}",
+            )
+        required_group_access = (mode & 0o500) >> 3
+        if (mode & required_group_access) != required_group_access:
+            return Issue(
+                "verification-mode-mismatch",
+                path,
+                "high-risk file does not preserve owner read/execute access "
+                f"for the sandbox group: {mode:04o}",
+            )
     return None
 
 
@@ -1900,6 +1927,9 @@ def _verify_dir(
         action,
         identity,
         is_root and policy == "confidentiality",
+        action == "unlock"
+        and policy == "high-risk"
+        and context.is_openclaw_native_mutable_path(relative_dir),
     )
     if dir_issue is not None:
         issues.append(dir_issue)
@@ -1968,7 +1998,17 @@ def _verify_dir(
                     )
                 )
             metadata_issue = _verify_metadata(
-                path, st, "file", policy, action, identity
+                path,
+                st,
+                "file",
+                policy,
+                action,
+                identity,
+                allow_openclaw_native_mutable=(
+                    action == "unlock"
+                    and policy == "high-risk"
+                    and context.is_openclaw_native_mutable_path(relative_path)
+                ),
             )
             if metadata_issue is not None:
                 issues.append(metadata_issue)

@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+import fs from "node:fs";
+import path from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 
 import {
@@ -157,6 +160,44 @@ describe("showSandboxStatus flow", () => {
     const output = harness.logSpy.mock.calls.map((call) => String(call[0])).join("\n");
     expect(output).toContain("SSH sessions: none");
     expect(output).not.toMatch(/^\s*Connected:/m);
+  });
+
+  it("reports durable read-only host directory exposure", async () => {
+    const source = fs.mkdtempSync(path.join(process.cwd(), ".status-text-host-mount-test-"));
+    try {
+      const harness = createStatusFlowHarness({
+        sandboxEntry: {
+          hostMounts: [{ source, target: "/sandbox/project", readOnly: true }],
+        },
+      });
+
+      await expect(harness.showSandboxStatus("alpha")).resolves.toBeUndefined();
+
+      const output = harness.logSpy.mock.calls.flat().join("\n");
+      expect(output).toContain("Host mounts:");
+      expect(output).toContain(`${source} -> /sandbox/project (read-only)`);
+    } finally {
+      fs.rmSync(source, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects control-character host mounts before terminal rendering", async () => {
+    const harness = createStatusFlowHarness({
+      sandboxEntry: {
+        hostMounts: [
+          {
+            source: "/srv/project\u001b[31m",
+            target: "/sandbox/project",
+            readOnly: true,
+          },
+        ],
+      },
+    });
+
+    await expect(harness.showSandboxStatus("alpha")).rejects.toThrow(
+      "unsafe terminal control characters",
+    );
+    expect(harness.logSpy.mock.calls.flat().join("\n")).not.toContain("\u001b[31m");
   });
 
   it("omits SSH sessions when the active-session probe is unavailable (#7805)", async () => {
@@ -507,7 +548,7 @@ describe("showSandboxStatus flow", () => {
     expect(output).not.toContain("Inference: healthy");
     expect(output).toContain("Inference: not verified (gateway/sandbox state not verified)");
     expect(output).toContain("gateway is still refusing connections after restart");
-    expect(output).toContain("Retry `openshell gateway start --name nemoclaw`");
+    expect(output).toContain("Start the gateway again with `nemoclaw onboard`.");
     expect(output).toContain("If the gateway never becomes healthy");
     expect(harness.collectSandboxStatusSnapshotSpy).toHaveBeenCalledWith("alpha", {
       preflight: {

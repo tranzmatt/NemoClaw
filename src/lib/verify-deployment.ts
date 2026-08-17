@@ -21,6 +21,8 @@ import { parseVersionFromText } from "./adapters/openshell/client";
 import { compareChannelSets, type RuntimeChannelStatus } from "./channel-runtime-status";
 import type { DashboardDeliveryChain } from "./dashboard/contract";
 import { listMessagingChannelsWithoutCredentials } from "./messaging/channels";
+
+import { retryUntilAsync } from "./core/retry";
 import {
   buildCustomOpenClawRuntimeFailureHints,
   classifyOpenClawRuntimeFailure,
@@ -116,7 +118,7 @@ export interface VerifyDeploymentOptions {
    * returns from createSandbox before the gateway process or the host port
    * forward have finished coming up. Each entry below adds one extra attempt
    * after the initial try, scheduled at the given delay from the previous
-   * attempt. The defaults give roughly a 25 s budget per probe before the
+   * attempt. The defaults give a 90 s budget per probe before the
    * wizard surfaces a ✗ marker.
    * Tests pass `[]` to disable retry.
    */
@@ -131,7 +133,9 @@ export interface VerifyDeploymentOptions {
   diagnoseCustomOpenClawRuntime?: boolean;
 }
 
-const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [1000, 2000, 5000, 7000, 10000];
+const DEFAULT_RETRY_DELAYS_MS: readonly number[] = [
+  1000, 2000, 5000, 7000, 10000, 15000, 20000, 30000,
+];
 // OpenClaw cron stops its provider preflight after 2.5 seconds. Require a
 // response within 2 seconds so onboarding leaves time for client overhead.
 const INFERENCE_ROUTE_REACHABILITY_MAX_SECONDS = 2;
@@ -196,14 +200,11 @@ async function verifyGatewayInSandbox(
   retryDelaysMs: readonly number[],
   sleep: (ms: number) => Promise<void>,
 ): Promise<{ reachable: boolean; httpCode: number; detail: string }> {
-  let last = probeGatewayInSandboxOnce(sandboxName, chain, deps);
-  if (last.reachable) return last;
-  for (const delayMs of retryDelaysMs) {
-    await sleep(delayMs);
-    last = probeGatewayInSandboxOnce(sandboxName, chain, deps);
-    if (last.reachable) return last;
-  }
-  return last;
+  return retryUntilAsync(() => probeGatewayInSandboxOnce(sandboxName, chain, deps), {
+    accept: (result) => result.reachable,
+    retryDelaysMs,
+    sleep,
+  });
 }
 
 /**
@@ -251,14 +252,11 @@ async function verifyInferenceRoute(
   retryDelaysMs: readonly number[],
   sleep: (ms: number) => Promise<void>,
 ): Promise<{ status: InferenceRouteStatus; detail: string }> {
-  let last = probeInferenceRouteOnce(sandboxName, deps);
-  if (last.status === "ok") return last;
-  for (const delayMs of retryDelaysMs) {
-    await sleep(delayMs);
-    last = probeInferenceRouteOnce(sandboxName, deps);
-    if (last.status === "ok") return last;
-  }
-  return last;
+  return retryUntilAsync(() => probeInferenceRouteOnce(sandboxName, deps), {
+    accept: (result) => result.status === "ok",
+    retryDelaysMs,
+    sleep,
+  });
 }
 
 /**
@@ -287,14 +285,11 @@ async function verifyDashboardFromHost(
   retryDelaysMs: readonly number[],
   sleep: (ms: number) => Promise<void>,
 ): Promise<{ reachable: boolean; detail: string }> {
-  let last = probeDashboardFromHostOnce(chain, deps);
-  if (last.reachable) return last;
-  for (const delayMs of retryDelaysMs) {
-    await sleep(delayMs);
-    last = probeDashboardFromHostOnce(chain, deps);
-    if (last.reachable) return last;
-  }
-  return last;
+  return retryUntilAsync(() => probeDashboardFromHostOnce(chain, deps), {
+    accept: (result) => result.reachable,
+    retryDelaysMs,
+    sleep,
+  });
 }
 
 /**
