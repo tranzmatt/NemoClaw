@@ -116,8 +116,9 @@ describe("registry lock ownership decisions", () => {
     ).toBe("break");
   });
 
-  it("never age-breaks an exact original or unverifiable process-bound owner", () => {
-    for (const ownerStatus of ["original", "unverifiable"] as const) {
+  it.each(["original", "unverifiable"] as const)(
+    "never age-breaks an exact original or unverifiable process-bound owner [case %#]",
+    (ownerStatus) => {
       expect(
         classifyExistingLock({
           ownerAlive: true,
@@ -128,16 +129,17 @@ describe("registry lock ownership decisions", () => {
           staleMs: STALE,
         }),
       ).toBe("wait");
-    }
-  });
+    },
+  );
 
-  it("retains the bounded age rule for ordinary or unreadable owners", () => {
-    for (const [ownerPid, nowMs, expected] of [
-      [4242, LOCK_MTIME + 1, "wait"],
-      [4242, LOCK_MTIME + STALE + 1, "break"],
-      [null, LOCK_MTIME + 1, "wait"],
-      [null, LOCK_MTIME + STALE + 1, "break"],
-    ] as const) {
+  it.each([
+    [4242, LOCK_MTIME + 1, "wait"],
+    [4242, LOCK_MTIME + STALE + 1, "break"],
+    [null, LOCK_MTIME + 1, "wait"],
+    [null, LOCK_MTIME + STALE + 1, "break"],
+  ] as const)(
+    "retains the bounded age rule for ordinary or unreadable owners [case %#]",
+    (ownerPid, nowMs, expected) => {
       expect(
         classifyExistingLock({
           ownerAlive: ownerPid !== null,
@@ -148,8 +150,8 @@ describe("registry lock ownership decisions", () => {
           staleMs: STALE,
         }),
       ).toBe(expected);
-    }
-  });
+    },
+  );
 });
 
 describe("process-bound registry locking", () => {
@@ -241,6 +243,25 @@ describe("process-bound registry locking", () => {
       withRegistryLockAt(test.registryFile, () => undefined, {
         ...exactDeps({ readProcessIdentity: () => null, wait }),
         maxRetries: 1,
+      }),
+    ).toThrow(/after 1 retries/);
+    expect(wait).toHaveBeenCalledOnce();
+    expect(fs.existsSync(test.lockDir)).toBe(true);
+  });
+
+  it("keeps a live owner when the host cannot read process identity (#9746)", () => {
+    const test = fixture("nemoclaw-unverifiable-host-lock-");
+    writeOrdinaryGeneration(test, 4242);
+    markStale(test.lockDir);
+    const wait = vi.fn();
+
+    expect(() =>
+      withRegistryLockAt(test.registryFile, () => undefined, {
+        isProcessAlive: () => true,
+        maxRetries: 1,
+        now: () => Number.MAX_SAFE_INTEGER,
+        readProcessIdentity: () => null,
+        wait,
       }),
     ).toThrow(/after 1 retries/);
     expect(wait).toHaveBeenCalledOnce();

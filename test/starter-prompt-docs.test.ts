@@ -32,7 +32,7 @@ const repoRoot = path.resolve(__dirname, "..");
 const starterPromptMarkdownSource = path.join(repoRoot, "docs", "resources", "starter-prompt.md");
 // CI resolves this Git commit and byte-compares its prompt-asset blobs with
 // the local files. The digests independently assert those same immutable bytes.
-const promptAssetRevision = "4394858b3bae38b04768619f99b9614161f1b565";
+const promptAssetRevision = "66b532695db0ae38b74725ce7c57e4c91be24b19";
 
 type PromptAsset = {
   path: string;
@@ -51,7 +51,7 @@ function definePromptAsset(assetPath: string, pinnedSha256: string): PromptAsset
 const promptAssets = {
   dgxSpark: definePromptAsset(
     "docs/resources/prompt-assets/dgx-spark.md",
-    "b0192f72e9a55349a7ca9c5ec3da639bd81a2c74b676f997b3e5193bc10053e1", // gitleaks:allow -- pinned prompt-asset SHA-256
+    "0025eb13e6295b5db2994d9898c5305166f43548473532bd9f2d629d08584801", // gitleaks:allow -- pinned prompt-asset SHA-256
   ),
   dgxStation: definePromptAsset(
     "docs/resources/prompt-assets/dgx-station.md",
@@ -444,26 +444,27 @@ function runCredentialForm(
 }
 
 describe("starter prompt docs CTA", () => {
-  it("generates one visible Fern Prompt from the shared Markdown source (#5048)", () => {
-    const prompt = readStarterPrompt();
-    const generatedSnippet = renderStarterPromptSnippet(prompt);
+  it.each(Array.from(starterPromptPages, (value) => [value]))(
+    "generates one visible Fern Prompt from the shared Markdown source [case %#] (#5048)",
+    (page) => {
+      const prompt = readStarterPrompt();
+      const generatedSnippet = renderStarterPromptSnippet(prompt);
 
-    expect(prompt).toMatch(/^# NemoClaw Instructions for a Non-Technical User$/m);
-    expect(STARTER_PROMPT_GENERATED_PATH).toBe("docs/_build/StarterPrompt.generated.mdx");
-    expect(generatedSnippet).toContain(
-      '<Prompt\n  title="Install NemoClaw with your coding agent"',
-    );
-    expect(generatedSnippet).not.toContain("hidePrompt");
-    expect(generatedSnippet).not.toContain("actions=");
-    expect(generatedSnippet).toContain(`>\n${prompt}\n</Prompt>`);
-    expect(generatedSnippet).not.toContain("<!--");
-    expect(prompt).not.toMatch(/<https?:\/\//);
-    expect(prompt).toContain("Use redacted placeholders such as `<PASTE_YOUR_API_KEY_HERE>`");
-    expect(read("docs/index.mdx")).toContain(
-      'import { CommandTerminal } from "./_components/CommandTerminal";\n\n<BadgeLinks',
-    );
+      expect(prompt).toMatch(/^# NemoClaw Instructions for a Non-Technical User$/m);
+      expect(STARTER_PROMPT_GENERATED_PATH).toBe("docs/_build/StarterPrompt.generated.mdx");
+      expect(generatedSnippet).toContain(
+        '<Prompt\n  title="Install NemoClaw with your coding agent"',
+      );
+      expect(generatedSnippet).not.toContain("hidePrompt");
+      expect(generatedSnippet).not.toContain("actions=");
+      expect(generatedSnippet).toContain(`>\n${prompt}\n</Prompt>`);
+      expect(generatedSnippet).not.toContain("<!--");
+      expect(prompt).not.toMatch(/<https?:\/\//);
+      expect(prompt).toContain("Use redacted placeholders such as `<PASTE_YOUR_API_KEY_HERE>`");
+      expect(read("docs/index.mdx")).toContain(
+        'import { CommandTerminal } from "./_components/CommandTerminal";\n\n<BadgeLinks',
+      );
 
-    for (const page of starterPromptPages) {
       const content = read(page);
       expect(content, `${page} includes the generated Fern Prompt`).toContain(
         '<Markdown src="/../docs/_build/StarterPrompt.generated.mdx" />',
@@ -471,8 +472,8 @@ describe("starter prompt docs CTA", () => {
       expect(content, `${page} does not use the retired custom components`).not.toMatch(
         /StarterPrompt(?:Button|Fallback)/,
       );
-    }
-  });
+    },
+  );
 
   it("rejects prompt Markdown that cannot generate one stable payload (#5048)", () => {
     const source = fs.readFileSync(starterPromptMarkdownSource, "utf8");
@@ -589,9 +590,11 @@ describe("starter prompt docs CTA", () => {
     expect(formSource).not.toContain("sessionStorage");
   });
 
-  it("keeps local prompt assets byte-aligned with their pinned revision blobs (#6990)", () => {
-    resolvePromptAssetRevision(promptAssetRevision, runGit);
-    for (const asset of Object.values(promptAssets)) {
+  it.each(Array.from(Object.values(promptAssets), (value) => [value]))(
+    "keeps local prompt assets byte-aligned with their pinned revision blobs [case %#] (#6990)",
+    (asset) => {
+      resolvePromptAssetRevision(promptAssetRevision, runGit);
+
       const localBytes = fs.readFileSync(path.join(repoRoot, asset.path));
       const pinnedBytes = readPinnedPromptAssetBlob(promptAssetRevision, asset, runGit);
       const pinnedSha256 = createHash("sha256").update(pinnedBytes).digest("hex");
@@ -602,8 +605,8 @@ describe("starter prompt docs CTA", () => {
         `${asset.path} does not byte-match its Git blob at ${promptAssetRevision}; commit the asset content, then repin every platform URL, promptAssetRevision, and digest to that content commit`,
       ).toBe(true);
       expect(pinnedSha256, `${asset.path} has a stale pinned SHA-256`).toBe(asset.pinnedSha256);
-    }
-  });
+    },
+  );
 
   it("fails closed when the immutable prompt asset revision or blobs cannot be resolved (#6990)", () => {
     expect(() => resolvePromptAssetRevision("main", () => fail("git must not run"))).toThrow(
@@ -692,7 +695,10 @@ describe("starter prompt docs CTA", () => {
       "`nvidia/Qwen3.6-35B-A3B-NVFP4` with the fixed catalog-backed vLLM profile",
     );
     expect(sparkSource).toContain(
-      "Leave `NEMOCLAW_PROVIDER`, `NEMOCLAW_MODEL`, `NEMOCLAW_VLLM_MODEL`, `NEMOCLAW_VLLM_PORT`, and `NEMOCLAW_VLLM_EXTRA_ARGS_JSON` unset",
+      "Leave `NEMOCLAW_PROVIDER`, `NEMOCLAW_MODEL`, `NEMOCLAW_VLLM_MODEL`, and `NEMOCLAW_VLLM_EXTRA_ARGS_JSON` unset",
+    );
+    expect(sparkSource).toContain(
+      "Preserve an existing `NEMOCLAW_VLLM_PORT` host-port override",
     );
     expect(stationSource).toContain("`nemotron-3-ultra-550b-a55b`");
     expect(stationSource).toContain("`nemotron-ultra`");
@@ -1109,11 +1115,12 @@ describe("starter prompt checkout line endings", () => {
     "docs/resources/local-credential-form.html",
   ];
 
-  it.each(
-    bytePinnedPaths,
-  )("checks out %s with LF so an autocrlf clone keeps the bytes this suite asserts (#8648)", (relativePath) => {
-    expect(readCheckoutEol(relativePath)).toContain(`${relativePath}: eol: lf`);
-  });
+  it.each(bytePinnedPaths)(
+    "checks out %s with LF so an autocrlf clone keeps the bytes this suite asserts (#8648)",
+    (relativePath) => {
+      expect(readCheckoutEol(relativePath)).toContain(`${relativePath}: eol: lf`);
+    },
+  );
 
   it("checks out a representative tracked text file with LF (#8648)", () => {
     const relativePath = "docs/resources/agent-skills.mdx";
