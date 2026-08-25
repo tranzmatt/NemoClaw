@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { type CaptureOpenshellResult, stripAnsi } from "../adapters/openshell/client";
+import {
+  checkOpenAiInferenceProviderProfile,
+  OPENAI_GATEWAY_PROVIDER_TYPE,
+} from "../adapters/openshell/provider-profile";
 import { retryUntilAsync } from "../core/retry";
 import {
   matchesGatewayProviderBinding,
@@ -47,9 +51,7 @@ export function sleepInferenceSetRouteConvergence(milliseconds: number): Promise
 export function probeInferenceSetSandboxRoute(
   input: SandboxInferenceInvocationInput,
 ): SandboxInferenceInvocationResult {
-  const probe: typeof import("./sandbox/inference-invocation-probe") = require(
-    "./sandbox/inference-invocation-probe",
-  );
+  const probe: typeof import("./sandbox/inference-invocation-probe") = require("./sandbox/inference-invocation-probe");
   return probe.probeSandboxInferenceInvocation(
     input,
     {},
@@ -87,9 +89,7 @@ export async function probeInferenceSetSandboxRouteUntilConverged(
   const inferenceApiChanged = options.previousInferenceApi !== options.targetInferenceApi;
   return await retryUntilAsync(() => deps.probe(options.input), {
     accept: (result) =>
-      result.ok ||
-      !inferenceApiChanged ||
-      (result.httpStatus !== 400 && result.httpStatus !== 404),
+      result.ok || !inferenceApiChanged || (result.httpStatus !== 400 && result.httpStatus !== 404),
     retryDelaysMs: ROUTE_FAMILY_CONVERGENCE_RETRY_DELAYS_MS,
     onRetry: deps.onRetry,
     sleep: deps.sleep,
@@ -114,6 +114,7 @@ type CaptureProviderCommand = (
     ignoreError: true;
     includeStreams: true;
     maxBuffer: number;
+    timeout?: number;
     env?: NodeJS.ProcessEnv;
   },
 ) => CaptureOpenshellResult;
@@ -284,6 +285,25 @@ export function prepareInferenceSetProviderBinding(options: {
   });
 
   const apply = (): void => {
+    if (surface.type === OPENAI_GATEWAY_PROVIDER_TYPE) {
+      const profile = checkOpenAiInferenceProviderProfile({
+        runOpenshell: (args, runnerOptions) =>
+          captureOpenshell(
+            args[0] === "provider" && args[1] === "profile"
+              ? [args[0], args[1], "-g", gatewayName, ...args.slice(2)]
+              : args,
+            {
+              ignoreError: true,
+              includeStreams: true,
+              maxBuffer: OPEN_SHELL_FAILURE_CAPTURE_MAX_BUFFER,
+              timeout: runnerOptions?.timeout,
+            },
+          ),
+      });
+      if (!profile.ok) {
+        throw new InferenceSetError(profile.messages.join("\n").trim(), 1);
+      }
+    }
     const result = captureOpenshell(
       mutationArgs({
         action,

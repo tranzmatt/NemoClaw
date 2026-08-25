@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 
-import { ADVISOR_INTERESTS } from "./specialists.mts";
+import { ADVISOR_INTERESTS, ADVISOR_SPECIALISTS } from "./specialists.mts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const DEFAULT_WORKFLOW = join(ROOT, ".github", "workflows", "pr-review-advisor.yaml");
@@ -15,6 +15,12 @@ const DEFAULT_POLICY = join(ROOT, "tools", "pr-review-advisor", "openshell-polic
 const ACTION_PIN = /^[^@\s]+\/[^@\s]+@[0-9a-f]{40}(?:\s*#.*)?$/u;
 const SANDBOX_NAME = /^(?!.*--)[a-z]([a-z0-9-]*[a-z0-9])?$/u;
 const INTERESTS = new Set(ADVISOR_INTERESTS);
+const SPECIALIST_MATRIX_EXPRESSION =
+  "${{ fromJSON(needs.discover-specialists.outputs.matrix) }}";
+const BASE_REF_EXPRESSION =
+  "${{ github.event_name == 'pull_request_target' && 'target/base' || (github.event_name == 'workflow_dispatch' && inputs.target_repo != '' && inputs.target_pr != '' && 'target/base' || inputs.base_ref) }}";
+const HEAD_REF_EXPRESSION =
+  "${{ github.event_name == 'pull_request_target' && 'HEAD' || (github.event_name == 'workflow_dispatch' && inputs.target_repo != '' && inputs.target_pr != '' && 'HEAD' || inputs.head_ref) }}";
 const READ_PERMISSIONS = {
   actions: "read",
   checks: "read",
@@ -115,11 +121,15 @@ function checkSandboxNames(errors: string[], jobs: Array<[string, Value]>): void
   const names: string[] = [];
   for (const [label, job] of jobs) {
     const rows = object(object(job.strategy).matrix).advisor;
-    if (!Array.isArray(rows) || rows.length === 0) {
+    const resolvedRows =
+      rows === SPECIALIST_MATRIX_EXPRESSION
+        ? ADVISOR_SPECIALISTS.map(({ sandboxName }) => ({ sandbox_name: sandboxName }))
+        : rows;
+    if (!Array.isArray(resolvedRows) || resolvedRows.length === 0) {
       errors.push(label + " matrix must declare a non-empty advisor array");
       continue;
     }
-    rows.map(object).forEach((row, index) => {
+    resolvedRows.map(object).forEach((row, index) => {
       const name = typeof row.sandbox_name === "string" ? row.sandbox_name : "";
       names.push(name);
       if (name.length > 19 || !SANDBOX_NAME.test(name))
@@ -157,9 +167,11 @@ export function validatePrReviewAdvisorWorkflowBoundary(
       "workflow-level permissions must be empty so each job declares its privilege domain",
     );
   const jobs = object(workflow.jobs);
+  const discovery = object(jobs["discover-specialists"]);
   const specialists = object(jobs["review-specialists"]);
   const review = object(jobs.review);
   const publish = object(jobs.publish);
+  checkPermissions(errors, "discover-specialists", discovery, { contents: "read" });
   checkPermissions(errors, "review-specialists", specialists, READ_PERMISSIONS);
   checkPermissions(errors, "review", review, READ_PERMISSIONS);
   checkPermissions(errors, "publish", publish, { contents: "read", "pull-requests": "write" });
@@ -176,13 +188,10 @@ export function validatePrReviewAdvisorWorkflowBoundary(
     ["synthesis", review],
   ]);
   const rows = object(object(specialists.strategy).matrix).advisor;
-  const interests = Array.isArray(rows) ? rows.map((row) => object(row).interest) : [];
-  if (
-    interests.length !== INTERESTS.size ||
-    new Set(interests).size !== INTERESTS.size ||
-    interests.some((interest) => !INTERESTS.has(interest))
-  )
-    errors.push("specialist matrix must declare the five review interests");
+  if (rows !== SPECIALIST_MATRIX_EXPRESSION)
+    errors.push("specialist matrix must use the discovered specialist prompts");
+  if (specialists.needs !== "discover-specialists")
+    errors.push("specialist matrix must depend on prompt discovery");
   if (specialists["continue-on-error"] !== undefined)
     errors.push("specialist failures must block synthesis");
   if (review.needs !== "review-specialists")
@@ -192,6 +201,12 @@ export function validatePrReviewAdvisorWorkflowBoundary(
     errors.push(
       "specialist job env.PR_REVIEW_ADVISOR_INTEREST must be ${{ matrix.advisor.interest }}",
     );
+  const prepareInputs = namedStep(specialists, "Prepare advisor sandbox inputs");
+  const prepareEnvironment = object(prepareInputs?.env);
+  if (prepareEnvironment.BASE_REF !== BASE_REF_EXPRESSION)
+    errors.push("Prepare advisor sandbox inputs must receive the selected base ref");
+  if (prepareEnvironment.HEAD_REF !== HEAD_REF_EXPRESSION)
+    errors.push("Prepare advisor sandbox inputs must receive the selected head ref");
   requireWith(
     errors,
     namedStep(specialists, "Upload native specialist session"),
@@ -217,6 +232,7 @@ export function validatePrReviewAdvisorWorkflowBoundary(
     if (key in object(artifact?.with))
       errors.push("Download primary advisor artifact must not set with." + key);
   }
+  checkActionPins(errors, "discover-specialists", discovery);
   checkActionPins(errors, "review-specialists", specialists);
   checkActionPins(errors, "review", review);
   checkActionPins(errors, "publish", publish);

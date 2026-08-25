@@ -56,6 +56,7 @@ import {
 } from "./mcp-bridge-onboard-env.ts";
 import { MCP_BRIDGE_PHASES } from "./mcp-bridge-phases.ts";
 import {
+  restartBridgeWithoutHostSecret,
   retryAfterHermesRestartTransportFailure,
   retryHermesGatewayDraining,
 } from "./mcp-bridge-reliability.ts";
@@ -77,6 +78,7 @@ import {
   assertAuthenticatedMcpDiscoveryWithOneRestart,
   assertAuthenticatedMcpRediscovery,
   assertAuthenticatedMcpToolDiscovery,
+  runHermesInitialMcpReadiness,
 } from "./mcp-bridge-tool-discovery.ts";
 import { assertTrustedPrivateMcpRebindingDenied } from "./mcp-bridge-trusted-private.ts";
 import { MCP_PROVIDER_REWRITE_PROBE_SOURCE } from "./mcp-provider-rewrite-probe.ts";
@@ -667,19 +669,6 @@ async function rotateBridgeCredential(
   expectExitZero(restart, `${artifactPrefix} mcp credential rotation`);
 }
 
-async function restartBridgeWithoutHostSecret(
-  host: HostCliClient,
-  sandboxName: string,
-  artifactPrefix: string,
-): Promise<void> {
-  const restart = await host.nemoclaw([sandboxName, "mcp", "restart", SERVER_NAME], {
-    artifactName: `${artifactPrefix}-mcp-restart-provider-reuse`,
-    env: buildAvailabilityProbeEnv(),
-    timeoutMs: 12 * 60_000,
-  });
-  expectExitZero(restart, `${artifactPrefix} mcp restart without host secret`);
-}
-
 async function rebuildWithoutMcpHostSecret(
   host: HostCliClient,
   sandboxName: string,
@@ -1129,46 +1118,63 @@ mcpBridgeShardTest("hermes")(
       expectedAdapter: "hermes-config",
       artifactPrefix: "hermes",
     });
-    const initialDiscoveryOffset = fakeMcp.requests.length;
     const providerName = await addBridgeAndReadStatus(host, {
       sandboxName: HERMES_SANDBOX_NAME,
       mcpUrl,
       expectedAdapter: "hermes-config",
       artifactPrefix: "hermes",
     });
-    await assertAuthenticatedMcpDiscoveryWithOneRestart(fakeMcp, {
-      requestOffset: initialDiscoveryOffset,
-      expectedSecret: HOST_SECRET,
-      label: "Hermes initial MCP discovery",
-      restart: async () => {
-        progress.event("Hermes MCP discovery did not reach the fixture; restarting once");
-        await restartBridgeWithoutHostSecret(host, HERMES_SANDBOX_NAME, "hermes-discovery-retry");
+    const initialDiscoveryRequestOffset = fakeMcp.requests.length;
+    const initialDiscoveryObservationOffset = fakeMcp.observations.length;
+    await runHermesInitialMcpReadiness({
+      discover: () =>
+        assertAuthenticatedMcpDiscoveryWithOneRestart(fakeMcp, {
+          requestOffset: initialDiscoveryRequestOffset,
+          observationOffset: initialDiscoveryObservationOffset,
+          expectedSecret: HOST_SECRET,
+          label: "Hermes initial MCP discovery",
+          artifacts,
+          artifactName: "hermes-initial-mcp-discovery-retry-evidence.json",
+          restart: async () => {
+            progress.event(
+              "Hermes initial MCP discovery classified no-request-observed after the initial-discovery offset; restarting once",
+            );
+            await restartBridgeWithoutHostSecret(
+              host,
+              HERMES_SANDBOX_NAME,
+              "hermes-discovery-retry",
+            );
+          },
+        }),
+      inspectToolStatus: () =>
+        assertAuthenticatedMcpToolDiscovery(host, fakeMcp, {
+          artifacts,
+          sandboxName: HERMES_SANDBOX_NAME,
+          artifactPrefix: "hermes",
+          hostSecret: HOST_SECRET,
+          progress,
+        }),
+      prepareModelTurn: async () => {
+        await assertBridgeInfrastructure(host, sandbox, {
+          sandboxName: HERMES_SANDBOX_NAME,
+          artifactPrefix: "hermes",
+          providerName,
+          mcpUrl,
+        });
+        await assertHermesConfig(sandbox, HERMES_SANDBOX_NAME, mcpUrl);
+        await assertHermesInspectionRejectsUnmanagedFields(sandbox, HERMES_SANDBOX_NAME);
+        await assertSecretAbsentFromSandbox(sandbox, HERMES_SANDBOX_NAME, ["/sandbox/.hermes"]);
+        progress.phase("restore Hermes shields, restart, and prove rollback");
+        await assertHermesManagedAddSurvivesLockedGatewayRestartAndStateLayout(
+          host,
+          sandbox,
+          HERMES_SANDBOX_NAME,
+          mcpUrl,
+        );
       },
+      runModelTurn: () =>
+        assertHermesToolCall("hermes-real-mcp-tool-call-immediately-after-shields-down"),
     });
-    await assertAuthenticatedMcpToolDiscovery(host, fakeMcp, {
-      artifacts,
-      sandboxName: HERMES_SANDBOX_NAME,
-      artifactPrefix: "hermes",
-      hostSecret: HOST_SECRET,
-      progress,
-    });
-    await assertBridgeInfrastructure(host, sandbox, {
-      sandboxName: HERMES_SANDBOX_NAME,
-      artifactPrefix: "hermes",
-      providerName,
-      mcpUrl,
-    });
-    await assertHermesConfig(sandbox, HERMES_SANDBOX_NAME, mcpUrl);
-    await assertHermesInspectionRejectsUnmanagedFields(sandbox, HERMES_SANDBOX_NAME);
-    await assertSecretAbsentFromSandbox(sandbox, HERMES_SANDBOX_NAME, ["/sandbox/.hermes"]);
-    progress.phase("restore Hermes shields, restart, and prove rollback");
-    await assertHermesManagedAddSurvivesLockedGatewayRestartAndStateLayout(
-      host,
-      sandbox,
-      HERMES_SANDBOX_NAME,
-      mcpUrl,
-    );
-    await assertHermesToolCall("hermes-real-mcp-tool-call-immediately-after-shields-down");
     await assertHermesReloadRollback(sandbox, HERMES_SANDBOX_NAME, mcpUrl);
     await assertSecretAbsentFromSandbox(
       sandbox,

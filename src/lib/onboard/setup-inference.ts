@@ -19,10 +19,7 @@ import {
   withModelRouterPortLifecycleLock,
 } from "../inference/gateway-route-mutation-lock";
 import { getManagedVllmProviderBinding } from "../inference/local";
-import {
-  type OllamaModelHolder,
-  supersededOllamaModel,
-} from "../inference/ollama/model-ownership";
+import { type OllamaModelHolder, supersededOllamaModel } from "../inference/ollama/model-ownership";
 import {
   getOllamaProxyToken,
   persistAndProbeOllamaProxy,
@@ -39,6 +36,10 @@ import type { Session } from "../state/onboard-session";
 import { createSandboxHostLocalInferenceProvenance } from "../state/registry/host-local-inference";
 import { shouldFrontOllamaWithProxy } from "./local-inference-topology";
 import { resolveModelRouterPort } from "./model-router";
+import {
+  type RoutedProviderDeps,
+  upsertRoutedProvider as upsertRoutedInferenceProvider,
+} from "./routed-inference";
 
 export { assertNoOpenShellGatewayEndpointOverride };
 
@@ -118,6 +119,11 @@ import type {
   VllmDeps,
 } from "./inference-providers";
 import * as inferenceProviders from "./inference-providers";
+import {
+  ensureOpenAiInferenceProviderProfile,
+  type InferenceProviderProfileDeps,
+  OPENAI_GATEWAY_PROVIDER_TYPE,
+} from "./inference-providers/provider-profile";
 import { createLocalInferenceRouteApplier } from "./local-inference-route";
 import type { ProviderInferenceSetupOptions } from "./machine/handlers/provider-inference";
 import {
@@ -281,6 +287,55 @@ export function bindGatewayUpsertProvider(
 ): CommonDeps["upsertProvider"] {
   return (name, type, credentialEnv, baseUrl, env) =>
     upsertProvider(name, type, credentialEnv, baseUrl, env, gatewayName);
+}
+
+export function bindOpenAiProviderProfile(
+  upsertProvider: CommonDeps["upsertProvider"],
+  runOpenshell: InferenceProviderProfileDeps["runOpenshell"],
+  error: CommonDeps["error"],
+  exitProcess: CommonDeps["exitProcess"],
+): CommonDeps["upsertProvider"] {
+  return (name, type, ...rest) => {
+    if (type === OPENAI_GATEWAY_PROVIDER_TYPE) {
+      ensureOpenAiInferenceProviderProfile({
+        runOpenshell,
+        log: error,
+        exit: exitProcess,
+      });
+    }
+    return upsertProvider(name, type, ...rest);
+  };
+}
+
+export function createRoutedResumeProviderUpsert(deps: {
+  upsertProvider: SetupInferenceDeps["upsertProvider"];
+  runGatewayOpenshell: InferenceProviderProfileDeps["runOpenshell"];
+  hydrateCredentialEnv: RoutedProviderDeps["hydrateCredentialEnv"];
+  error?: CommonDeps["error"];
+  exitProcess?: CommonDeps["exitProcess"];
+}) {
+  return (
+    gatewayName: string,
+    provider: string,
+    endpointUrl: string | null,
+    credentialEnv: string | null,
+  ) => {
+    const result = upsertRoutedInferenceProvider(provider, endpointUrl, credentialEnv, {
+      upsertProvider: bindOpenAiProviderProfile(
+        bindGatewayUpsertProvider(deps.upsertProvider, gatewayName),
+        deps.runGatewayOpenshell,
+        deps.error ?? console.error,
+        deps.exitProcess ?? ((code) => process.exit(code)),
+      ),
+      hydrateCredentialEnv: deps.hydrateCredentialEnv,
+    });
+    return {
+      ok: result.ok,
+      endpointUrl: result.endpointUrl,
+      message: result.result.message,
+      status: result.result.status,
+    };
+  };
 }
 
 export function selectGatewayForFollowupOrExit(
@@ -485,8 +540,7 @@ function releaseSupersededOllamaModel(
   // still owns its model.
   if (!previous || result.retry) return;
   try {
-    const withOwnershipLock =
-      deps.withOllamaModelOwnershipLock ?? withOllamaModelOwnershipLock;
+    const withOwnershipLock = deps.withOllamaModelOwnershipLock ?? withOllamaModelOwnershipLock;
     withOwnershipLock(() => {
       const peers = deps.listSandboxes?.().sandboxes ?? [];
       const superseded = supersededOllamaModel(previous, nextModel, peers);
@@ -638,12 +692,29 @@ export function createSetupInference(
         };
 
         const defaultUpsertProvider = bindGatewayUpsertProvider(deps.upsertProvider, gatewayName);
+        const providerExitProcess: CommonDeps["exitProcess"] = hostLocalSelection
+          ? (code: number): never => {
+              throw new HostLocalInferenceBranchExit(code);
+            }
+          : deps.exitProcess;
+        const providerError: CommonDeps["error"] = hostLocalSelection
+          ? (message: string) => {
+              hostLocalProviderErrors.push(message);
+            }
+          : deps.error;
+        const profiledUpsertProvider = bindOpenAiProviderProfile(
+          (...args) => {
+            const selectedUpsertProvider =
+              hostLocalGatewayMutation?.upsertProvider ?? defaultUpsertProvider;
+            return selectedUpsertProvider(...args);
+          },
+          runGatewayOpenshell,
+          providerError,
+          providerExitProcess,
+        );
         const commonDeps = {
           runOpenshell: runGatewayOpenshell,
-          upsertProvider: (...args: Parameters<CommonDeps["upsertProvider"]>) => {
-            const exactUpsertProvider = hostLocalGatewayMutation?.upsertProvider;
-            return (exactUpsertProvider ?? defaultUpsertProvider)(...args);
-          },
+          upsertProvider: profiledUpsertProvider,
           verifyInferenceRoute: (selectedProvider: string, selectedModel: string) => {
             if (!hostLocalRoute && sandboxName) {
               reserveRoute(sandboxName, selectedProvider, selectedModel);
@@ -663,16 +734,8 @@ export function createSetupInference(
           registry: {
             updateSandbox: (name: string) => reserveRoute(name, provider, model),
           },
-          exitProcess: hostLocalSelection
-            ? (code: number): never => {
-                throw new HostLocalInferenceBranchExit(code);
-              }
-            : deps.exitProcess,
-          error: hostLocalSelection
-            ? (message: string) => {
-                hostLocalProviderErrors.push(message);
-              }
-            : deps.error,
+          exitProcess: providerExitProcess,
+          error: providerError,
           log: deps.log,
         } satisfies CommonDeps;
 
@@ -1036,18 +1099,17 @@ export function createSetupInference(
     // happens before the lock opens, so a serialized re-onboard can neither
     // replace the row under the read nor select the captured model before
     // this cleanup runs.
-    const mutateGatewayRouteAndReleaseSupersededModel =
-      async (): Promise<SetupInferenceResult> => {
-        let previousSandbox: OllamaModelHolder | null = null;
-        try {
-          previousSandbox = sandboxName ? (deps.getSandbox?.(sandboxName) ?? null) : null;
-        } catch {
-          /* An unreadable registry skips GPU release; it must not fail onboarding. */
-        }
-        const result = await mutateGatewayRoute();
-        releaseSupersededOllamaModel(previousSandbox, model, result, deps);
-        return result;
-      };
+    const mutateGatewayRouteAndReleaseSupersededModel = async (): Promise<SetupInferenceResult> => {
+      let previousSandbox: OllamaModelHolder | null = null;
+      try {
+        previousSandbox = sandboxName ? (deps.getSandbox?.(sandboxName) ?? null) : null;
+      } catch {
+        /* An unreadable registry skips GPU release; it must not fail onboarding. */
+      }
+      const result = await mutateGatewayRoute();
+      releaseSupersededOllamaModel(previousSandbox, model, result, deps);
+      return result;
+    };
     return sandboxName
       ? deps.withSandboxMutationLock(sandboxName, mutateGatewayRouteAndReleaseSupersededModel)
       : mutateGatewayRouteAndReleaseSupersededModel();
