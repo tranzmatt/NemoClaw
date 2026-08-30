@@ -48,10 +48,13 @@ import {
 } from "./auto-pair-approval";
 import {
   captureLaunchReadiness,
+  createBoundLaunchReadinessDeps,
   LaunchReadinessEvidenceError,
   type LaunchReadinessFailedCheck,
   type LaunchReadinessHealthDeps,
+  type LaunchReadinessObservationStage,
   LaunchReadinessObservationError as ObservationError,
+  recordLaunchReadinessObservationFailure,
   requireLaunchSemanticHealth,
   resolveLaunchInteractiveCommand,
   resolveTrustedLaunchAgent,
@@ -71,6 +74,7 @@ import {
 } from "./launch-readiness/openclaw-pairing-qualification";
 
 export { createProbeTimingRecorder, type ProbeTimingRecorder } from "./probe/timing";
+export { createBoundLaunchReadinessDeps };
 
 const LIVE_POLICY_MAX_BYTES = 2 * 1_024 * 1_024;
 const ALLOWED_OPENSHELL_DRIVERS = new Set(["docker", "kubernetes", "vm"]);
@@ -187,6 +191,18 @@ function recordPerformanceStage(stage: LaunchReadinessPerformanceStage, startedA
     });
   } catch {
     // Measurements are diagnostic evidence and never control launch behavior.
+  }
+}
+
+function recordObservationTiming(
+  deps: LaunchReadinessDeps,
+  stage: LaunchReadinessObservationStage,
+  startedAt: number,
+): void {
+  try {
+    deps.recordObservationTiming?.(stage, Math.max(0, performance.now() - startedAt));
+  } catch {
+    // Timing evidence must never change readiness behavior.
   }
 }
 
@@ -517,7 +533,7 @@ export function buildLaunchReadinessRegistryProjection(
   const lifecycleGeneration = normalizedString(entry.lifecycleGeneration);
   const liveIdentityFingerprint = normalizedString(entry.lifecycleLiveIdentityFingerprint);
   if (!lifecycleGeneration || !liveIdentityFingerprint) throw new ObservationError("identity");
-  if (entry.pendingRouteReservation === true || entry.reservationSessionId) {
+  if (entry.pendingRouteReservation === true) {
     throw new ObservationError("config");
   }
   if (entry.baselineExclusionTransition) throw new ObservationError("config");
@@ -743,6 +759,7 @@ async function captureLaunchIdentity(
   if (!lifecycleGeneration || !recordedFingerprint) throw new ObservationError("identity");
 
   let live: ReturnType<SandboxRecreateObserver>;
+  const sandboxIdentityStartedAt = performance.now();
   try {
     live = (deps.observeSandbox ?? observeSandboxOnGateway)({
       sandboxName,
@@ -750,31 +767,79 @@ async function captureLaunchIdentity(
       gatewayPort,
     });
   } catch {
+    recordLaunchReadinessObservationFailure(deps, "sandbox-identity");
     throw new LaunchReadinessEvidenceError();
+  } finally {
+    recordObservationTiming(deps, "sandbox-identity", sandboxIdentityStartedAt);
   }
-  if (live.state === "missing") throw new ObservationError("identity");
-  if (live.state !== "ready") throw new ObservationError("health");
+  if (live.state === "missing") {
+    recordLaunchReadinessObservationFailure(deps, "sandbox-identity");
+    throw new ObservationError("identity");
+  }
+  if (live.state !== "ready") {
+    recordLaunchReadinessObservationFailure(deps, "sandbox-identity");
+    throw new ObservationError("health");
+  }
   if (live.liveIdentityFingerprint !== recordedFingerprint) {
+    recordLaunchReadinessObservationFailure(deps, "sandbox-identity");
     throw new ObservationError("identity");
   }
 
-  const livePolicy = captureLivePolicy(sandboxName, gatewayName, deps);
+  const policyStartedAt = performance.now();
+  let livePolicy: string;
+  try {
+    livePolicy = captureLivePolicy(sandboxName, gatewayName, deps);
+  } catch (error) {
+    recordLaunchReadinessObservationFailure(deps, "policy-get");
+    throw error;
+  } finally {
+    recordObservationTiming(deps, "policy-get", policyStartedAt);
+  }
   const inferenceSelection = normalizeInferenceSelection(entry);
   const inference = registry.getSandboxEntryInference(entry);
-  const inferenceResult = (deps.capture ?? ((args) => captureLaunchReadiness(args)))(
-    buildGatewayInferenceGetArgs(gatewayName),
-  );
-  if (inferenceResult.status !== 0) throw new LaunchReadinessEvidenceError();
-  const liveInference = parseGatewayInference(inferenceResult.output);
-  const liveInferenceAbsent = reportsInferenceNotConfigured(inferenceResult.output);
+  const inferenceGetStartedAt = performance.now();
+  let inferenceResult: ReturnType<typeof captureLaunchReadiness>;
+  try {
+    inferenceResult = (deps.capture ?? ((args) => captureLaunchReadiness(args)))(
+      buildGatewayInferenceGetArgs(gatewayName),
+    );
+  } catch (error) {
+    recordLaunchReadinessObservationFailure(deps, "inference-get");
+    throw error;
+  } finally {
+    recordObservationTiming(deps, "inference-get", inferenceGetStartedAt);
+  }
+  if (inferenceResult.status !== 0) {
+    recordLaunchReadinessObservationFailure(deps, "inference-get");
+    throw new LaunchReadinessEvidenceError();
+  }
+  let liveInference: ReturnType<typeof parseGatewayInference>;
+  let liveInferenceAbsent: boolean;
+  try {
+    liveInference = parseGatewayInference(inferenceResult.output);
+    liveInferenceAbsent = reportsInferenceNotConfigured(inferenceResult.output);
+  } catch (error) {
+    recordLaunchReadinessObservationFailure(deps, "inference-get");
+    throw error;
+  }
   if (inference.kind === "configured") {
-    if (!liveInference && !liveInferenceAbsent) throw new LaunchReadinessEvidenceError();
+    if (!liveInference && !liveInferenceAbsent) {
+      recordLaunchReadinessObservationFailure(deps, "inference-get");
+      throw new LaunchReadinessEvidenceError();
+    }
     if (planInferenceRouteReconcile(liveInference, inference).kind !== "aligned") {
+      recordLaunchReadinessObservationFailure(deps, "inference-get");
       throw new ObservationError("config");
     }
   } else {
-    if (liveInference) throw new ObservationError("config");
-    if (!liveInferenceAbsent) throw new LaunchReadinessEvidenceError();
+    if (liveInference) {
+      recordLaunchReadinessObservationFailure(deps, "inference-get");
+      throw new ObservationError("config");
+    }
+    if (!liveInferenceAbsent) {
+      recordLaunchReadinessObservationFailure(deps, "inference-get");
+      throw new LaunchReadinessEvidenceError();
+    }
   }
 
   await requireLaunchSemanticHealth(
@@ -922,7 +987,6 @@ function resolveOpenClawPairingSettlementTarget(
     entry.name !== sandboxName ||
     (entry.agent !== null && entry.agent !== "openclaw") ||
     entry.pendingRouteReservation === true ||
-    entry.reservationSessionId ||
     !Number.isInteger(entry.gatewayPort) ||
     (entry.gatewayPort ?? 0) < 1 ||
     (entry.gatewayPort ?? 0) > 65535
@@ -945,8 +1009,7 @@ function resolveOpenClawPairingSettlementTarget(
   // command shape, so its caller may preserve that unknown value as the empty
   // string while retaining the exact registry and live-lifecycle checks.
   const customDockerfile = normalizedString(entry.fromDockerfile);
-  const version =
-    recordedVersion ?? (allowUnknownCustomVersion && customDockerfile ? "" : null);
+  const version = recordedVersion ?? (allowUnknownCustomVersion && customDockerfile ? "" : null);
   const expectedVersion = normalizedString(agent.expected_version);
   const stateDirectory = normalizedString(agent.config?.dir);
   const lifecycleGeneration = normalizedString(entry.lifecycleGeneration);
@@ -1014,12 +1077,7 @@ async function waitForPortablePairingObservation(
     const remaining = deadline - now();
     if (remaining <= 0) return { kind: "timeout" };
     try {
-      const value = observe(
-        sandboxName,
-        target.gatewayName,
-        target.version,
-        target.stateDirectory,
-      );
+      const value = observe(sandboxName, target.gatewayName, target.version, target.stateDirectory);
       if (deadline - now() <= 0) return { kind: "timeout" };
       const decision = decide(value);
       if (deadline - now() <= 0) return { kind: "timeout" };
@@ -1040,6 +1098,7 @@ export async function settlePortableOpenClawPairing(
   sandboxName: string,
   options: {
     readonly portableRequired?: boolean;
+    readonly revalidatePolicyRequirements?: (operation: string) => void;
   } = {},
   deps: LaunchReadinessDeps = {},
 ): Promise<PortableOpenClawPairingSettlementResult> {
@@ -1054,9 +1113,11 @@ export async function settlePortableOpenClawPairing(
     deps.observeOpenClawPairingSettlement ?? observeOpenClawPairingSettlement;
   const runProducer = deps.runPortablePairingProducer ?? runPortableOpenClawPairingRequestProducer;
   const runApproval = deps.runPortablePairingApproval ?? runPortableOpenClawPairingApproval;
+  const revalidatePolicyRequirements = options.revalidatePolicyRequirements;
   const now = deps.now ?? (() => performance.now());
   const sleep =
-    deps.sleep ?? ((milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
+    deps.sleep ??
+    ((milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds)));
 
   return withSandboxLock(sandboxName, async () => {
     let firstEntry = getSandbox(sandboxName);
@@ -1076,6 +1137,7 @@ export async function settlePortableOpenClawPairing(
       firstEntry.policyPresetsFinalized === true &&
       portableLifecycleReceiptMatchesGeneration(firstReceipt, firstEntry.lifecycleGeneration)
     ) {
+      revalidatePolicyRequirements?.(`update the recorded agent for sandbox '${sandboxName}'`);
       if (!updateSandbox(sandboxName, { agent: "openclaw" })) {
         return incompletePortablePairing("portable-runtime-identity-invalid");
       }
@@ -1151,12 +1213,23 @@ export async function settlePortableOpenClawPairing(
         return incompletePortablePairing("portable-pairing-incomplete");
       }
       const first = initial.value;
-      if (first.state === "settled") return { kind: "settled" };
+      if (first.state === "settled") {
+        revalidatePolicyRequirements?.(
+          `publish settled Portable OpenClaw pairing for sandbox '${sandboxName}'`,
+        );
+        return { kind: "settled" };
+      }
 
       // A canonical pending transition is the producer's completed output.
       if (first.state === "pairing-only") {
+        revalidatePolicyRequirements?.(
+          `request Portable OpenClaw pairing for sandbox '${sandboxName}'`,
+        );
         runProducer(sandboxName, target.gatewayName);
       }
+      revalidatePolicyRequirements?.(
+        `approve Portable OpenClaw pairing for sandbox '${sandboxName}'`,
+      );
       runApproval(sandboxName, target.gatewayName, first.deviceIdentitySha256);
 
       const finalDeadline = Math.min(
@@ -1183,9 +1256,13 @@ export async function settlePortableOpenClawPairing(
         now,
         sleep,
       );
-      return final.kind === "observed"
-        ? { kind: "settled" }
-        : incompletePortablePairing("portable-pairing-incomplete");
+      if (final.kind !== "observed") {
+        return incompletePortablePairing("portable-pairing-incomplete");
+      }
+      revalidatePolicyRequirements?.(
+        `publish settled Portable OpenClaw pairing for sandbox '${sandboxName}'`,
+      );
+      return { kind: "settled" };
     });
   });
 }
