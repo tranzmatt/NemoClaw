@@ -200,6 +200,7 @@ describe("Hermes Portable probe-only forward recovery", () => {
       settleMs: 2,
       settleCount: 1,
       totalMs: 9,
+      result: "proved",
     });
   });
 
@@ -226,11 +227,22 @@ describe("Hermes Portable probe-only forward recovery", () => {
   it("rolls back a possibly started forward when detached mutation transport throws", () => {
     const fixture = createRecoveryFixture();
     const runMutation = fixture.input.deps.runCurrentMutation;
+    const captureRollbackList = fixture.input.deps.captureRollbackList;
+    const rollbackSequence: string[] = [];
+    const onComplete = vi.fn((evidence: { readonly result: "proved" | "failed" }) =>
+      rollbackSequence.push(`timing:${evidence.result}`),
+    );
     Object.assign(fixture.input.deps, {
       runCurrentMutation: runThen(runMutation, "start", () => {
         throw new Error("detached mutation transport canary");
       }),
+      captureRollbackList: (args: readonly string[], timeout: number) => {
+        const result = captureRollbackList(args, timeout);
+        rollbackSequence.push("rollback-list");
+        return result;
+      },
     });
+    Object.assign(fixture.input, { timing: { onComplete } });
 
     expect(() => recoverHermesPortableLaunchForwards(fixture.input)).toThrow(
       expect.objectContaining({ failure: "recovery-failed" }),
@@ -244,6 +256,10 @@ describe("Hermes Portable probe-only forward recovery", () => {
       "nemoclaw",
     ]);
     expect(fixture.records.has(18_789)).toBe(false);
+    expect(onComplete).toHaveBeenCalledWith(
+      expect.objectContaining({ result: "failed", startCount: 1 }),
+    );
+    expect(rollbackSequence.at(-1)).toBe("timing:failed");
   });
 
   it("rejects a returned nonzero start without the exact settled owner", () => {
@@ -523,6 +539,35 @@ describe("Hermes Portable connect composition", () => {
       portableRecoveryResult: { kind: "already-running" },
     });
     configureMissingHermesForwardCapture(harness);
+    harness.recoverPortableDemoLifecycleSpy.mockImplementation((...args) => {
+      args[5]?.onComplete({
+        receiptReadMs: 1,
+        receiptReadCount: 2,
+        socketAuthorityMs: 3,
+        socketAuthorityCount: 4,
+        openshellExecutableMs: 5,
+        openshellExecutableCount: 6,
+        podmanExecutableMs: 7,
+        podmanExecutableCount: 8,
+        containerInspectMs: 9,
+        containerInspectCount: 10,
+        transactionCompareMs: 11,
+        transactionCompareCount: 12,
+      });
+      args[6]?.onComplete({
+        preGuardMs: 13,
+        preGuardCount: 14,
+        podmanCaptureMs: 15,
+        podmanCaptureCount: 16,
+        postGuardMs: 17,
+        postGuardCount: 18,
+        jsonParseMs: 19,
+        jsonParseCount: 20,
+        identityCompareMs: 21,
+        identityCompareCount: 22,
+      });
+      return { kind: "already-running" };
+    });
 
     await expect(harness.connectSandbox("alpha", { probeOnly: true })).resolves.toBeUndefined();
 
@@ -533,6 +578,9 @@ describe("Hermes Portable connect composition", () => {
       expect.objectContaining({
         assertCurrent: harness.assertHermesPortableOperatingCommandCurrentSpy,
       }),
+      expect.objectContaining({ onComplete: expect.any(Function) }),
+      expect.objectContaining({ onComplete: expect.any(Function) }),
+      expect.objectContaining({ onComplete: expect.any(Function) }),
     );
     const startCall = harness.runOpenshellSpy.mock.calls.find(
       ([args]) => Array.isArray(args) && args[0] === "forward" && args[1] === "start",
@@ -572,6 +620,12 @@ describe("Hermes Portable connect composition", () => {
     );
     expect(harness.logSpy.mock.calls.flat().join("\n")).toMatch(
       /Hermes Portable forward recovery timing: list=\d+ms listCount=2 stop=0ms stopCount=0 start=\d+ms startCount=1 settle=\d+ms settleCount=1 total=\d+ms result=proved/u,
+    );
+    expect(harness.logSpy.mock.calls.flat().join("\n")).toContain(
+      "Hermes Portable currentness timing: receiptRead=1ms receiptReadCount=2 socketAuthority=3ms socketAuthorityCount=4 openshellExecutable=5ms openshellExecutableCount=6 podmanExecutable=7ms podmanExecutableCount=8 containerInspect=9ms containerInspectCount=10 transactionCompare=11ms transactionCompareCount=12",
+    );
+    expect(harness.logSpy.mock.calls.flat().join("\n")).toContain(
+      "Hermes Portable inspection timing: preGuard=13ms preGuardCount=14 podmanCapture=15ms podmanCaptureCount=16 postGuard=17ms postGuardCount=18 jsonParse=19ms jsonParseCount=20 identityCompare=21ms identityCompareCount=22",
     );
   });
 
@@ -679,6 +733,9 @@ describe("Hermes Portable connect composition", () => {
       "Probe complete: launch readiness is healthy",
     );
     expect(harness.publishLaunchReadinessSpy).not.toHaveBeenCalled();
+    expect(harness.logSpy.mock.calls.flat().join("\n")).toMatch(
+      /Hermes Portable forward recovery timing: .*listCount=1 .*result=failed/u,
+    );
     expect(
       harness.runOpenshellSpy.mock.calls.some(
         ([args]) => Array.isArray(args) && ["start", "stop"].includes(String(args[1])),
