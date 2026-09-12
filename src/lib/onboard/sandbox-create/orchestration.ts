@@ -689,24 +689,23 @@ export function assertApfCreateIntent(
   }
 }
 
-function assertProviderlessApfCreateInput(input: {
-  readonly createIntent: SandboxCreateIntent | null;
-  readonly agent: AgentDefinition | null;
-  readonly model: string;
-  readonly provider: string;
-  readonly preferredInferenceApi: string | null;
-  readonly webSearchConfig: WebSearchConfig | null;
-  readonly enabledChannels: readonly string[] | null;
-  readonly hermesToolGateways: readonly string[];
-}): void {
-  if (input.createIntent?.apfInterceptorRequested !== true) return;
+function validateProviderlessApfCreateInput(
+  input: {
+    readonly createIntent: SandboxCreateIntent | null;
+    readonly agent: AgentDefinition | null;
+    readonly model: string;
+    readonly provider: string;
+    readonly preferredInferenceApi: string | null;
+    readonly webSearchConfig: WebSearchConfig | null;
+    readonly enabledChannels: string[] | null;
+    readonly hermesToolGateways: readonly string[];
+  },
+  assertAgent: (agent: AgentDefinition | null, resolvedAgentName?: string | null) => void,
+): string[] | null {
+  if (input.createIntent?.apfInterceptorRequested !== true) return input.enabledChannels;
   const resolved = input.createIntent.resolved;
-  const requestedAgent = input.agent?.name.trim().toLowerCase() ?? "openclaw";
-  const resolvedAgent = resolved?.policy.options.agentName?.trim().toLowerCase() || null;
+  assertAgent(input.agent, resolved?.policy.options.agentName);
   const hasProviderIntent =
-    requestedAgent !== "openclaw" ||
-    (resolvedAgent !== null &&
-      (resolvedAgent !== "openclaw" || resolvedAgent !== requestedAgent)) ||
     input.webSearchConfig !== null ||
     input.createIntent.reuseRegisteredCredentials === true ||
     [
@@ -728,7 +727,8 @@ function assertProviderlessApfCreateInput(input: {
       resolved?.hermesToolGateways,
       resolved?.extraPlaceholderKeys,
     ].some((values) => (values?.length ?? 0) > 0);
-  if (!hasProviderIntent) return;
+  // Providerless input has no messaging intent; do not discover stored channel credentials.
+  if (!hasProviderIntent) return [];
   throw new Error(
     "Interceptor onboarding supports providerless sandbox creation only. No sandbox or provider was created.",
   );
@@ -1274,7 +1274,7 @@ type SandboxProviderCleanupAuthority =
       readonly revalidateSandboxIdentity: (operation: string) => void;
     };
 
-export function runAuthorityBoundProviderCleanup(
+export async function runAuthorityBoundProviderCleanup(
   input: {
     readonly sandboxName: string;
     readonly runProviderPreDeleteCleanup: SandboxCreateOrchestrationRuntime["runSandboxProviderPreDeleteCleanup"];
@@ -1282,7 +1282,7 @@ export function runAuthorityBoundProviderCleanup(
     readonly redact: SandboxCreateOrchestrationRuntime["redact"];
     readonly tolerateMissingSandbox?: boolean;
   } & SandboxProviderCleanupAuthority,
-): void {
+): Promise<void> {
   const revalidateSandboxIdentity =
     "observeSandbox" in input
       ? (operation: string): void => {
@@ -1295,7 +1295,7 @@ export function runAuthorityBoundProviderCleanup(
         }
       : input.revalidateSandboxIdentity;
   revalidateSandboxIdentity(`cleaning up providers for sandbox '${input.sandboxName}'`);
-  input.runProviderPreDeleteCleanup(input.sandboxName, {
+  await input.runProviderPreDeleteCleanup(input.sandboxName, {
     runOpenshell: input.runOpenshell,
     redact: input.redact,
     ...(input.tolerateMissingSandbox ? { tolerateMissingSandbox: true } : {}),
@@ -1607,16 +1607,19 @@ export function createSandboxWithBaseImageResolution(runtime: SandboxCreateOrche
     } = runtime;
 
     assertApfCreateIntent(createIntent);
-    assertProviderlessApfCreateInput({
-      createIntent,
-      agent,
-      model,
-      provider,
-      preferredInferenceApi,
-      webSearchConfig,
-      enabledChannels,
-      hermesToolGateways,
-    });
+    enabledChannels = validateProviderlessApfCreateInput(
+      {
+        createIntent,
+        agent,
+        model,
+        provider,
+        preferredInferenceApi,
+        webSearchConfig,
+        enabledChannels,
+        hermesToolGateways,
+      },
+      sandboxAgent.assertProviderlessSandboxAgent,
+    );
     assertProviderlessInterceptorEnvironment(
       createIntent?.apfInterceptorRequested === true,
       process.env,
@@ -2261,7 +2264,7 @@ export function createSandboxWithBaseImageResolution(runtime: SandboxCreateOrche
 
       revalidateSandboxIdentity(true, `recreating sandbox '${sandboxName}'`);
       if (recreateRuntime.beginDelete() === "source") {
-        runAuthorityBoundProviderCleanup({
+        await runAuthorityBoundProviderCleanup({
           sandboxName,
           revalidateSandboxIdentity: (operation) => revalidateSandboxIdentity(true, operation),
           runProviderPreDeleteCleanup: runSandboxProviderPreDeleteCleanup,
@@ -2419,8 +2422,8 @@ export function createSandboxWithBaseImageResolution(runtime: SandboxCreateOrche
                   )
                 ).messagingTokenDefs;
               },
-              runProviderPreDeleteCleanup: (verifiedIdentityRevalidation) => {
-                runAuthorityBoundProviderCleanup({
+              runProviderPreDeleteCleanup: async (verifiedIdentityRevalidation) => {
+                await runAuthorityBoundProviderCleanup({
                   sandboxName,
                   runProviderPreDeleteCleanup: runSandboxProviderPreDeleteCleanup,
                   runOpenshell,
