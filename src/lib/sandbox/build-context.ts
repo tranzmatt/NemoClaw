@@ -194,6 +194,10 @@ function stageLegacySandboxBuildContext(
     path.join(rootDir, "src", "lib", "tool-disclosure.ts"),
     path.join(buildCtx, "src", "lib", "tool-disclosure.ts"),
   );
+  fs.copyFileSync(
+    path.join(rootDir, "src", "lib", "providerless-inference.ts"),
+    path.join(buildCtx, "src", "lib", "providerless-inference.ts"),
+  );
   stageManagedStartupRuntimeSources(rootDir, buildCtx);
   normalizeReadModesForDockerCopy(path.join(buildCtx, "src"));
   fs.rmSync(path.join(buildCtx, "nemoclaw", "node_modules"), {
@@ -365,6 +369,10 @@ function stageOptimizedSandboxBuildContext(
     path.join(rootDir, "src", "lib", "tool-disclosure.ts"),
     path.join(buildCtx, "src", "lib", "tool-disclosure.ts"),
   );
+  fs.copyFileSync(
+    path.join(rootDir, "src", "lib", "providerless-inference.ts"),
+    path.join(buildCtx, "src", "lib", "providerless-inference.ts"),
+  );
   stageManagedStartupRuntimeSources(rootDir, buildCtx);
   normalizeReadModesForDockerCopy(path.join(buildCtx, "src"));
   fs.copyFileSync(
@@ -399,11 +407,6 @@ function stageOptimizedSandboxBuildContext(
   fs.copyFileSync(
     path.join(rootDir, "scripts", "patch-openclaw-device-self-approval.mts"),
     path.join(stagedScriptsDir, "patch-openclaw-device-self-approval.mts"),
-  );
-  fs.mkdirSync(path.join(stagedScriptsDir, "openclaw"), { recursive: true });
-  fs.copyFileSync(
-    path.join(rootDir, "scripts", "openclaw", "patch-gateway-daemon-dialback.mts"),
-    path.join(stagedScriptsDir, "openclaw", "patch-gateway-daemon-dialback.mts"),
   );
   fs.copyFileSync(
     path.join(rootDir, "scripts", "extract-semver.sh"),

@@ -17,7 +17,10 @@ import {
   type OpenShellRuntimeSelection,
   runOpenshell,
 } from "../../adapters/openshell/runtime";
-import { OPENSHELL_PROBE_TIMEOUT_MS } from "../../adapters/openshell/timeouts";
+import {
+  OPENSHELL_HEAVY_TIMEOUT_MS,
+  OPENSHELL_PROBE_TIMEOUT_MS,
+} from "../../adapters/openshell/timeouts";
 import * as agentRuntime from "../../agent/runtime";
 import { getGatewayHttpsEndpoint } from "../../core/gateway-address";
 import { DASHBOARD_PORT, HERMES_OPENAI_API_PORT } from "../../core/ports";
@@ -113,7 +116,8 @@ export function createHermesPortableForwardRecoveryInput(input: {
     intent: input.intent,
     sandboxName: input.sandboxName,
     gatewayName: input.gatewayName,
-    operationTimeoutMs: 30_000,
+    // Initial inspection, sequential starts, and joint verification share one deadline.
+    operationTimeoutMs: OPENSHELL_HEAVY_TIMEOUT_MS,
     ports: input.ports,
     probeTimeoutMs: OPENSHELL_PROBE_TIMEOUT_MS,
     forwardService: {
@@ -153,7 +157,7 @@ export function createHermesPortableForwardRecoveryInput(input: {
           stdio: "ignore",
           timeout,
         }),
-      isForwardServiceOwner: (target) => isForwardServiceListenerOwner(target),
+      isForwardServiceOwner: (target, options) => isForwardServiceListenerOwner(target, options),
       launchForwardService: (target, options) => launchForwardService(target, options),
       isPortReachable: isLocalForwardReachable,
     },
@@ -388,10 +392,10 @@ export function teardownSandboxDashboardForward(
  * non-OpenClaw agents, then falls back to the active agent's declared port.
  * Returns true when the detached OpenShell service makes the port reachable.
  */
-export function ensureSandboxPortForward(
+export async function ensureSandboxPortForward(
   sandboxName: string,
   options: SandboxForwardRecoveryOptions = {},
-): boolean {
+): Promise<boolean> {
   const port = resolveSandboxDashboardPort(sandboxName);
   const remoteBindRequested = isRemoteDashboardBindRequested(process.env.NEMOCLAW_DASHBOARD_BIND);
   const allInterfaceBindRequired = remoteBindRequested || isWsl({ isWsl: options.isWsl });
@@ -515,7 +519,7 @@ function inspectSandboxPortForwardListener(
   }
 }
 
-export function ensureSandboxPortForwardForPort(
+export async function ensureSandboxPortForwardForPort(
   sandboxName: string,
   port: number,
   options: {
@@ -525,7 +529,7 @@ export function ensureSandboxPortForwardForPort(
     beforeStart?: () => boolean;
     runtimeSelection?: OpenShellRuntimeSelection;
   } = {},
-): boolean {
+): Promise<boolean> {
   const {
     afterSuccess = () => true,
     forwardTarget = String(port),
@@ -583,7 +587,7 @@ export function ensureSandboxPortForwardForPort(
       launchRuntime.workspace,
       authority.endpoint,
     );
-    launchForwardService(target, {
+    await launchForwardService(target, {
       sourceEnvironment: buildSelectedOpenShellSubprocessEnv(launchRuntime),
       verifyReady: () => {
         assertForwardGatewayAuthorityCurrent(gatewayName, authority);
@@ -604,10 +608,10 @@ export function ensureSandboxPortForwardForPort(
   }
 }
 
-export function ensureHermesDashboardPortForwardIfEnabled(
+export async function ensureHermesDashboardPortForwardIfEnabled(
   sandboxName: string,
   runtimeSelection?: OpenShellRuntimeSelection,
-): boolean | null {
+): Promise<boolean | null> {
   return ensureHermesDashboardPortForward(sandboxName, {
     isPortForwardHealthy: (name, port) =>
       isSandboxPortForwardHealthy(name, port, undefined, runtimeSelection),
@@ -625,10 +629,10 @@ function getSandboxMessagingHostForward(
   return getActiveMessagingHostForward(plan);
 }
 
-export function ensureMessagingHostForwardHealthy(
+export async function ensureMessagingHostForwardHealthy(
   sandboxName: string,
   runtimeSelection?: OpenShellRuntimeSelection,
-): boolean | null {
+): Promise<boolean | null> {
   const forward = getSandboxMessagingHostForward(sandboxName);
   if (!forward) return null;
   const health = isSandboxPortForwardHealthy(
@@ -641,11 +645,11 @@ export function ensureMessagingHostForwardHealthy(
   return ensureSandboxPortForwardForPort(sandboxName, forward.port, { runtimeSelection });
 }
 
-export function recoverMessagingHostForward(
+export async function recoverMessagingHostForward(
   sandboxName: string,
   { quiet, runtimeSelection }: { quiet: boolean; runtimeSelection?: OpenShellRuntimeSelection },
-): boolean | null {
-  const recovered = ensureMessagingHostForwardHealthy(sandboxName, runtimeSelection);
+): Promise<boolean | null> {
+  const recovered = await ensureMessagingHostForwardHealthy(sandboxName, runtimeSelection);
   if (!quiet && recovered === false) {
     console.error("  Messaging webhook port forward could not be re-established.");
   }
@@ -692,11 +696,11 @@ function resolveDeclaredAgentForwardPorts(
  * recorded API port, or recovery demands a port that belongs to a sibling
  * sandbox and reports a failure the sandbox cannot repair.
  */
-export function ensureDeclaredAgentForwardPortsHealthy(
+export async function ensureDeclaredAgentForwardPortsHealthy(
   sandboxName: string,
   primaryPort: number,
   runtimeSelection?: OpenShellRuntimeSelection,
-): boolean | null {
+): Promise<boolean | null> {
   const agent = agentRuntime.getSessionAgent(sandboxName);
   if (!agent) return null;
   const hermesDashboard = getHermesDashboardRecoveryConfig(sandboxName);
@@ -712,7 +716,7 @@ export function ensureDeclaredAgentForwardPortsHealthy(
   for (const port of ports) {
     const health = isSandboxPortForwardHealthy(sandboxName, port, undefined, runtimeSelection);
     if (health === true) continue;
-    if (!ensureSandboxPortForwardForPort(sandboxName, port, { runtimeSelection })) {
+    if (!(await ensureSandboxPortForwardForPort(sandboxName, port, { runtimeSelection }))) {
       allHealthy = false;
     }
   }
@@ -878,12 +882,12 @@ export function resolveSandboxLaunchForwardPorts(sandboxName: string): number[] 
   return resolveSandboxLaunchForwardPortsFromAuthority(sandboxName, sandbox, agent, primaryPort);
 }
 
-export function recoverDeclaredAgentForwardPorts(
+export async function recoverDeclaredAgentForwardPorts(
   sandboxName: string,
   recoveryPort: number,
   { quiet, runtimeSelection }: { quiet: boolean; runtimeSelection?: OpenShellRuntimeSelection },
-): boolean | null {
-  const recovered = ensureDeclaredAgentForwardPortsHealthy(
+): Promise<boolean | null> {
+  const recovered = await ensureDeclaredAgentForwardPortsHealthy(
     sandboxName,
     recoveryPort,
     runtimeSelection,

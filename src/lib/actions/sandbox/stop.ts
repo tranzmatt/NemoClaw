@@ -21,7 +21,7 @@ import {
   captureSandboxOwnershipPhases,
   hermesPortableLifecycleLockOptions,
   resolvePersistedSandboxOwnershipGateway,
-  withSandboxLifecycleLockSync,
+  withSandboxLifecycleLock,
 } from "./gateway-state";
 import {
   resolveSandboxLifecycleProvider,
@@ -122,7 +122,13 @@ export function discoverActiveOllamaSandboxNames(
     const activeSandboxes: string[] = [];
     for (const peerName of peerNames) {
       const phase = phases.get(peerName);
-      if (phase === undefined || phase === "Error" || phase === "Failed" || phase === "Evicted") {
+      if (
+        phase === undefined ||
+        phase === "Stopped" ||
+        phase === "Error" ||
+        phase === "Failed" ||
+        phase === "Evicted"
+      ) {
         continue;
       }
       if (phase === null || phase === "Unknown") {
@@ -251,7 +257,7 @@ export interface SandboxStopDeps {
   decideOllamaModelOwnership?: typeof decideOllamaModelOwnership;
   loadPersistedOllamaHost?: () => OllamaHostRoute | null;
   withOllamaModelOwnershipLock?: typeof import("../../inference/ollama/proxy").withOllamaModelOwnershipLock;
-  withLifecycleLockSync?: typeof withSandboxLifecycleLockSync;
+  withLifecycleLock?: typeof withSandboxLifecycleLock;
   log?: (message: string) => void;
   warn?: (message: string) => void;
 }
@@ -260,22 +266,22 @@ export interface SandboxStopDeps {
  * Stop the selected provider workload while preserving registry, workspace,
  * credentials, and shared gateway state.
  */
-export function stopSandbox(
+export async function stopSandbox(
   sandboxName: string,
   deps: SandboxStopDeps = {},
-): SandboxLifecycleResult {
+): Promise<SandboxLifecycleResult> {
   const environment = deps.environment ?? process.env;
-  return (deps.withLifecycleLockSync ?? withSandboxLifecycleLockSync)(
+  return (deps.withLifecycleLock ?? withSandboxLifecycleLock)(
     sandboxName,
     () => stopSandboxWithinLifecycleFence(sandboxName, deps),
     hermesPortableLifecycleLockOptions(sandboxName, environment),
   );
 }
 
-function stopSandboxWithinLifecycleFence(
+async function stopSandboxWithinLifecycleFence(
   sandboxName: string,
   deps: SandboxStopDeps,
-): SandboxLifecycleResult {
+): Promise<SandboxLifecycleResult> {
   const log = deps.log ?? console.log;
   const warn = deps.warn ?? console.warn;
   const sandbox = (deps.getSandbox ?? registry.getSandbox)(sandboxName);
@@ -288,6 +294,7 @@ function stopSandboxWithinLifecycleFence(
   if (!resolved.ok) return resolved.result;
 
   const input = {
+    readRegistry: deps.getSandbox ?? registry.getSandbox,
     environment: deps.environment ?? process.env,
     log,
     sandbox: resolved.sandbox,
@@ -297,7 +304,7 @@ function stopSandboxWithinLifecycleFence(
   if (preflight) return preflight;
 
   let channelsStopped = false;
-  const outcome = resolved.lifecycle.stop(input, {
+  const outcome = await resolved.lifecycle.stop(input, {
     beforeStop() {
       if (channelsStopped) return;
       channelsStopped = true;
