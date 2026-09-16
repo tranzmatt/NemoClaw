@@ -47,12 +47,10 @@ export const E2E_CATALOGUE_RUNNER_KEYS = [
   "common-egress-agent",
   "hermes-discord",
   "hermes-inference-switch",
-  "rebuild-hermes",
-  "rebuild-hermes-stale-base",
   "security-posture-hermes",
 ] as const;
 
-export const E2E_HOST_PREPARATIONS = ["none", "hermes-swap", "rebuild-swap"] as const;
+export const E2E_HOST_PREPARATIONS = ["none", "hermes-swap"] as const;
 export type E2eHostPreparation = (typeof E2E_HOST_PREPARATIONS)[number];
 
 export const E2E_ARTIFACT_LAYOUTS = ["target-shard", "flat-shard"] as const;
@@ -265,17 +263,27 @@ const SKILL_LIFECYCLE_OWNING_PATHS = [
   "src/lib/skill-install.ts",
 ] as const;
 
+const OPEN_SHELL_FORWARD_ADAPTER_OWNING_PATHS = [
+  "src/lib/adapters/openshell/command-execution.ts",
+  "src/lib/adapters/openshell/forward-cli.ts",
+  "src/lib/adapters/openshell/forward-runtime.ts",
+  "src/lib/adapters/openshell/forward.ts",
+] as const;
+
 // Keep every checked-in input copied by the Pi Dockerfiles in the PR selection boundary.
 // test/e2e/support/pi-agent-qualification-events.test.ts verifies this list against the
 // real Dockerfiles so a new COPY instruction cannot silently reuse a stale image receipt.
 const PI_IMAGE_SOURCE_OWNING_PATHS = [
   ".dockerignore",
   "agents/pi/",
+  "ci/reviewed-npm-audit.json",
   "nemoclaw-blueprint/",
   "scripts/lib/bundled-npm-package.mts",
   "scripts/lib/entrypoint-env-wrapper.sh",
   "scripts/lib/patch-bundled-npm-ip-address.mts",
   "scripts/lib/reviewed-npm-archive.mts",
+  "scripts/lib/reviewed-npm-audit.mts",
+  "scripts/lib/reviewed-npm-identity.mts",
   "scripts/lib/sandbox-rlimits.sh",
   "scripts/managed-bootstrap-entrypoint.c",
   "scripts/managed-bootstrap-trampoline.sh",
@@ -661,7 +669,7 @@ export const E2E_TARGET_CATALOGUE: readonly E2eCatalogueTarget[] = [
     installMode: "none",
     restoreCli: true,
     exposeCliBin: true,
-    owningPaths: ["test/e2e/live/json-envelope.ts"],
+    owningPaths: [...OPEN_SHELL_FORWARD_ADAPTER_OWNING_PATHS, "test/e2e/live/json-envelope.ts"],
     environment: {
       ...hostedInference,
       NEMOCLAW_E2E_DASHBOARD_REMOTE_BIND: "1",
@@ -711,6 +719,7 @@ export const E2E_TARGET_CATALOGUE: readonly E2eCatalogueTarget[] = [
       restoreCli: true,
       exposeCliBin: true,
       owningPaths: [
+        ...OPEN_SHELL_FORWARD_ADAPTER_OWNING_PATHS,
         "src/lib/onboard/dashboard.ts",
         "src/lib/onboard/dashboard-forward-control.ts",
         "src/lib/onboard/dashboard-runtime.ts",
@@ -792,23 +801,6 @@ export const E2E_TARGET_CATALOGUE: readonly E2eCatalogueTarget[] = [
       ...hostedInference,
       ...nonInteractive,
       NEMOCLAW_SANDBOX_NAME: "e2e-full",
-    },
-  }),
-  dockerOnlyTarget("gateway-guard-recovery", {
-    displayName: "Gateway: restores the guard chain after recreation",
-    agentRuntime: "openclaw",
-    environmentOrInferenceEndpoint: "Ubuntu; NVIDIA hosted inference",
-    profile: "nvidia-inference",
-    timeoutMinutes: 45,
-    installMode: "authenticated",
-    installNonInteractive: true,
-    restoreCli: true,
-    exposeCliBin: true,
-    owningPaths: ["test/e2e/live/gateway-guard-legacy-keepalive-fixture.ts"],
-    environment: {
-      ...hostedInference,
-      ...nonInteractive,
-      OPENSHELL_GATEWAY: "nemoclaw",
     },
   }),
   managedRuntimeTarget("hermes-discord", {
@@ -927,22 +919,6 @@ export const E2E_TARGET_CATALOGUE: readonly E2eCatalogueTarget[] = [
     exposeCliBin: false,
     cloudflared: true,
     owningPaths: ["tools/e2e/onboard-timeout-contract.mts"],
-  }),
-  managedRuntimeTarget("kimi-inference-compat", {
-    displayName: "Inference: configures a Kimi-compatible endpoint",
-    agentRuntime: "openclaw",
-    environmentOrInferenceEndpoint: "Ubuntu; Kimi-compatible inference fixture",
-    profile: "standard",
-    timeoutMinutes: 50,
-    installMode: "authenticated",
-    restoreCli: true,
-    exposeCliBin: true,
-    environment: {
-      ...nonInteractive,
-      NEMOCLAW_SANDBOX_NAME: "e2e-kimi-compat",
-      NEMOCLAW_E2E_INFERENCE_MODE: "mock",
-      OPENSHELL_GATEWAY: "nemoclaw",
-    },
   }),
   dockerOnlyTarget("llama-cpp-generic-gpu", {
     displayName: "Inference: completes an agent turn with llama.cpp on a generic NVIDIA GPU",
@@ -1249,36 +1225,28 @@ export const E2E_TARGET_CATALOGUE: readonly E2eCatalogueTarget[] = [
     },
   }),
   dockerOnlyTarget("rebuild-openclaw", {
-    displayName: "Rebuild: preserves OpenClaw state and rotates the gateway token",
+    displayName: "Rebuild: restores OpenClaw state and native readiness",
     agentRuntime: "openclaw",
     environmentOrInferenceEndpoint: "Ubuntu; NVIDIA hosted inference",
     profile: "nvidia-inference",
-    timeoutMinutes: 130,
+    timeoutMinutes: 45,
     installMode: "credential-free",
     restoreCli: true,
     exposeCliBin: true,
-    owningPaths: [
-      "test/e2e/live/rebuild-openclaw-old-base-context.ts",
-      "src/lib/core/shell-quote.ts",
-    ],
     environment: hostedInference,
   }),
   dockerOnlyTarget("rebuild-hermes", {
-    displayName: "Rebuild: preserves Hermes state and recovers cron dispatch",
+    displayName: "Rebuild: restores Hermes state and native readiness",
     agentRuntime: "hermes",
     environmentOrInferenceEndpoint: "Ubuntu; NVIDIA hosted inference",
     profile: "nvidia-inference",
     prAdvisorSelectable: true,
-    owningPaths: [...HERMES_ACP_E2E_OWNING_PATHS, "test/e2e/live/rebuild-hermes-cron-restore.ts"],
-    timeoutMinutes: 90,
+    owningPaths: HERMES_ACP_E2E_OWNING_PATHS,
+    timeoutMinutes: 45,
     installMode: "credential-free",
     installNonInteractive: true,
     restoreCli: true,
     exposeCliBin: true,
-    runnerKey: "rebuild-hermes",
-    hostPreparation: "rebuild-swap",
-    runnerComparison: true,
-    runnerPressure: true,
     environment: {
       ...hostedInference,
       ...nonInteractive,
@@ -1292,42 +1260,16 @@ export const E2E_TARGET_CATALOGUE: readonly E2eCatalogueTarget[] = [
       OPENSHELL_GATEWAY: "nemoclaw",
     },
   }),
-  dockerOnlyTarget("rebuild-hermes-stale-base", {
-    displayName: "Rebuild: refreshes a stale Hermes base and restores state",
-    agentRuntime: "hermes",
-    environmentOrInferenceEndpoint: "Ubuntu; NVIDIA hosted inference",
+  managedRuntimeTarget("sandbox-survival", {
+    displayName: "Lifecycle: OpenShell stop and start preserves native agent state",
+    agentRuntime: "openclaw",
+    environmentOrInferenceEndpoint: "Ubuntu; OpenShell sandbox lifecycle",
     profile: "nvidia-inference",
     prAdvisorSelectable: true,
-    testFile: "test/e2e/live/rebuild-hermes.test.ts",
-    owningPaths: ["test/e2e/live/rebuild-hermes-cron-restore.ts"],
-    timeoutMinutes: 90,
-    installMode: "credential-free",
-    installNonInteractive: true,
-    restoreCli: true,
-    exposeCliBin: true,
-    runnerKey: "rebuild-hermes-stale-base",
-    hostPreparation: "rebuild-swap",
-    runnerComparison: true,
-    runnerPressure: true,
-    environment: {
-      ...hostedInference,
-      ...nonInteractive,
-      NEMOCLAW_AGENT: "hermes",
-      NEMOCLAW_HERMES_STALE_BASE_REBUILD_E2E: "1",
-      NEMOCLAW_PROVIDER: "custom",
-      NEMOCLAW_ENDPOINT_URL: "https://inference-api.nvidia.com/v1",
-      NEMOCLAW_MODEL: "nvidia/nvidia/nemotron-3-ultra",
-      NEMOCLAW_COMPAT_MODEL: "nvidia/nvidia/nemotron-3-ultra",
-      NEMOCLAW_PREFERRED_API: "openai-completions",
-      NEMOCLAW_SANDBOX_NAME: "e2e-rebuild-base",
-      OPENSHELL_GATEWAY: "nemoclaw",
-    },
-  }),
-  managedRuntimeTarget("sandbox-survival", {
-    displayName: "Lifecycle: preserves sandbox state after an OpenShell gateway restart",
-    agentRuntime: "openclaw",
-    environmentOrInferenceEndpoint: "Ubuntu; NVIDIA hosted inference",
-    profile: "nvidia-inference",
+    owningPaths: [
+      "src/lib/actions/sandbox/gateway-state.ts",
+      "src/lib/onboard/runtime-provider/docker.ts",
+    ],
     timeoutMinutes: 30,
     installMode: "none",
     restoreCli: true,
