@@ -165,7 +165,11 @@ describe("runInferenceSet compatible providers", () => {
     );
 
     expect(deps.calls.rewriteConfigUrlsWithDnsPinning).not.toHaveBeenCalled();
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual([
       "alpha",
       expect.objectContaining({
         provider: "compatible-endpoint",
@@ -176,7 +180,7 @@ describe("runInferenceSet compatible providers", () => {
       }),
     ]);
     expect(deps.calls.restartSandboxGateway).toHaveBeenCalledOnce();
-    expect(deps.calls.restartSandboxGateway).toHaveBeenCalledWith("alpha");
+    expect(deps.calls.restartSandboxGateway).toHaveBeenCalledWith("alpha", "nemoclaw");
   });
 
   it("rejects custom-compatible provider switches without trusted endpoint metadata", async () => {
@@ -245,7 +249,11 @@ describe("runInferenceSet compatible providers", () => {
     );
 
     expect(deps.calls.rewriteConfigUrlsWithDnsPinning).not.toHaveBeenCalled();
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual([
       "alpha",
       expect.objectContaining({
         provider: "compatible-endpoint",
@@ -404,7 +412,11 @@ describe("runInferenceSet compatible providers", () => {
           env: { COMPATIBLE_API_KEY: "real-upstream-secret" },
         }),
       ]);
-      expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
+      expect(
+        deps.calls.updateSandbox.mock.calls
+          .filter(([, fields]) => fields.provider !== undefined)
+          .at(-1),
+      ).toEqual([
         "alpha",
         expect.objectContaining({
           provider: "compatible-endpoint",
@@ -805,7 +817,11 @@ describe("runInferenceSet compatible providers", () => {
     // HTTP precedent of persisting the validated/pinned address. The
     // The canonical provider key stays stable while its invocation-local
     // value is replaced by the route-scoped adapter token.
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual([
       "alpha",
       expect.objectContaining({
         provider: "compatible-endpoint",
@@ -815,7 +831,14 @@ describe("runInferenceSet compatible providers", () => {
         preferredInferenceApi: "openai-responses",
       }),
     ]);
-    expect(deps.calls.restartSandboxGateway).toHaveBeenCalledWith("alpha");
+    expect(deps.getSession()).toMatchObject({
+      provider: "compatible-endpoint",
+      model: "mock-responses-model",
+      endpointUrl: "http://host.openshell.internal:11438/route/test-route",
+      credentialEnv: "COMPATIBLE_API_KEY",
+      preferredInferenceApi: "openai-responses",
+    });
+    expect(deps.calls.restartSandboxGateway).toHaveBeenCalledWith("alpha", "nemoclaw");
   });
 
   it("accepts explicit compatible Anthropic endpoint metadata for provider-family switches", async () => {
@@ -858,7 +881,11 @@ describe("runInferenceSet compatible providers", () => {
       deps,
     );
 
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual([
       "alpha",
       expect.objectContaining({
         provider: "compatible-anthropic-endpoint",

@@ -41,6 +41,7 @@ function expectNoInferenceMutation(calls: ReturnType<typeof createDeps>["calls"]
   expect(calls.captureOpenshell).not.toHaveBeenCalled();
   expect(calls.updateSandbox).not.toHaveBeenCalled();
   expect(calls.writeSandboxConfig).not.toHaveBeenCalled();
+  expect(calls.updateSession).not.toHaveBeenCalled();
   expect(calls.recomputeSandboxConfigHash).not.toHaveBeenCalled();
   expect(calls.restartSandboxGateway).not.toHaveBeenCalled();
 }
@@ -126,10 +127,11 @@ describe("runInferenceSet accepts the installer provider name — facet 1 (#6321
 
     // The persisted provider must be the normalized OpenShell name, not the
     // installer alias, so the sandbox registry stays canonical.
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
-      "alpha",
-      expect.objectContaining({ provider: "compatible-anthropic-endpoint" }),
-    ]);
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual(["alpha", expect.objectContaining({ provider: "compatible-anthropic-endpoint" })]);
   });
 
   it("still rejects a genuinely unsupported provider name", async () => {
@@ -157,6 +159,7 @@ describe("runInferenceSet accepts the installer provider name — facet 1 (#6321
     );
     expect(deps.calls.updateSandbox).not.toHaveBeenCalled();
     expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.updateSession).not.toHaveBeenCalled();
     expect(deps.calls.recomputeSandboxConfigHash).not.toHaveBeenCalled();
     expect(deps.calls.restartSandboxGateway).not.toHaveBeenCalled();
   });
@@ -210,12 +213,25 @@ describe("runInferenceSet accepts the installer provider name — facet 1 (#6321
       ],
       expect.objectContaining({ ignoreError: true }),
     );
-    expect(deps.calls.writeSandboxConfig).toHaveBeenCalledTimes(1);
-    const writtenConfig = deps.calls.writeSandboxConfig.mock.calls[0]?.[2] as ConfigObject;
-    expect((writtenConfig.models as Record<string, ConfigValue>).providers).toMatchObject({
-      [provider]: nativeProviderConfig,
-    });
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
+    expect(deps.calls.writeSandboxConfig).not.toHaveBeenCalled();
+    expect(deps.calls.setOpenClawConfigValues).toHaveBeenCalledOnce();
+    expect(deps.calls.setOpenClawConfigValues).toHaveBeenCalledWith(
+      "alpha",
+      expect.arrayContaining([
+        expect.objectContaining({
+          dotpath: "models.providers.inference",
+          value: expect.objectContaining({
+            models: expect.arrayContaining([expect.objectContaining({ id: "vendor/model-b" })]),
+          }),
+        }),
+      ]),
+      "nemoclaw-18080",
+    );
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual([
       "alpha",
       expect.objectContaining({
         provider,
@@ -470,10 +486,11 @@ describe("runInferenceSet SSRF-block guidance — facet 2 (#6321)", () => {
     ).resolves.toBeTruthy();
     expect(guard).not.toHaveBeenCalled();
     expect(adapterGuard).not.toHaveBeenCalled();
-    expect(deps.calls.updateSandbox.mock.calls.at(-1)).toEqual([
-      "alpha",
-      expect.objectContaining({ endpointSource: "onboard" }),
-    ]);
+    expect(
+      deps.calls.updateSandbox.mock.calls
+        .filter(([, fields]) => fields.provider !== undefined)
+        .at(-1),
+    ).toEqual(["alpha", expect.objectContaining({ endpointSource: "onboard" })]);
   });
 
   it("accepts the same onboard-provenanced internal endpoint after canonicalization (#6321)", async () => {
