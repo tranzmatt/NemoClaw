@@ -650,7 +650,6 @@ const {
   waitForGatewayHttpReadyBase,
   probeGatewayTcpReady,
 });
-
 const {
   getOpenshellBinary,
   openshellShellCommand,
@@ -658,6 +657,8 @@ const {
   runOpenshell,
   runCaptureOpenshell,
   captureOpenshell,
+  inferenceRouteMutator,
+  inferenceRouteObserver,
   gatewayLifecycleAdapter,
   gatewayReuseAdapter,
   getDockerDriverGatewayEndpointArg,
@@ -668,9 +669,9 @@ const {
   },
   getGatewayPort: () => GATEWAY_PORT,
   getDockerDriverGatewayEndpoint,
+  redactDiagnostic: runner.redactFullWithUrls,
 });
 const sandboxExec = sandboxCommandCli.createCliOpenShellSandboxCommandExecutor({ hostCwd: ROOT });
-
 const { isSandboxReady, parseSandboxStatus, getSandboxStateFromOutputs } = gatewayState;
 const waitForSandboxReady = sandboxReadinessTracing.createCliSandboxReadyWaiter({
   isLinuxDockerDriverGatewayEnabled,
@@ -680,7 +681,6 @@ const waitForSandboxReady = sandboxReadinessTracing.createCliSandboxReadyWaiter(
 });
 const { hasStaleGateway, isGatewayHealthy, getGatewayReuseState } =
   gatewayBinding.createGatewayNameBoundClassifiers(gatewayState, () => GATEWAY_NAME);
-
 const { getGatewayReuseSnapshot, selectNamedGatewayForReuseIfNeeded } =
   gatewayReuse.createGatewayReuseHelpers({
     gatewayName: () => GATEWAY_NAME,
@@ -688,7 +688,6 @@ const { getGatewayReuseSnapshot, selectNamedGatewayForReuseIfNeeded } =
     lifecycle: gatewayLifecycleAdapter,
     cliDisplayName,
   });
-
 const { refreshDockerDriverGatewayReuseState } =
   gatewayReuse.createDockerDriverGatewayReuseApplication({
     gatewayName: () => GATEWAY_NAME,
@@ -708,7 +707,6 @@ const { refreshDockerDriverGatewayReuseState } =
     rememberDockerDriverGatewayPid,
     runDockerNetworkInspect: docker.dockerRun,
   });
-
 const { getSandboxReuseState, getSandboxRecreateObservation, waitForSandboxRecreateDeleteAbsence } =
   sandboxReuse.createSandboxReuseHelpers({
     runCaptureOpenshell,
@@ -1438,7 +1436,6 @@ const sandboxCreateOrchestrationRuntime = {
   assessHost,
   baseImageResolutionFlow,
   cliDisplayName,
-  cliName,
   completeOrdinaryOnboardSandboxCreation,
   confirmRecreateForSelectionDrift,
   createOnboardCreatedSandboxCompletion,
@@ -1447,6 +1444,7 @@ const sandboxCreateOrchestrationRuntime = {
   dashboardRuntime,
   dcodeAutoApprovalFlow,
   detectMessagingCredentialRotation,
+  openShellGpuDiagnostics: dockerGpuSandboxCreate.cliOpenShellGpuDiagnostics,
   get ensureAgentFixedForward() {
     return ensureAgentFixedForward;
   },
@@ -2305,6 +2303,8 @@ function getSetupInferenceDeps(): SetupInferenceDeps {
     step,
     getGatewayName: () => GATEWAY_NAME,
     runOpenshell,
+    inferenceRouteMutator,
+    inferenceRouteObserver,
     upsertProvider,
     verifyInferenceRoute,
     verifyOnboardInferenceSmoke,
@@ -2593,7 +2593,7 @@ async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
   onboardRuntimeBoundary.reset();
   const portableRetirementEntry = portableRetirementAuthority.beginPortableOnboardRetirementEntry({
     alreadyHeld: opts.onboardLockAlreadyHeld === true,
-    command: `nemoclaw onboard${initialEntryOptions.resume ? " --resume" : ""}${initialEntryOptions.fresh ? " --fresh" : ""}${initialEntryOptions.nonInteractive ? " --non-interactive" : ""}${initialEntryOptions.requestedFromDockerfile ? ` --from ${initialEntryOptions.requestedFromDockerfile}` : ""}`,
+    command: `nemoclaw onboard${initialEntryOptions.resume ? " --resume" : ""}${initialEntryOptions.fresh ? " --fresh" : ""}${initialEntryOptions.nonInteractive ? " --non-interactive" : ""}${initialEntryOptions.requestedFromDockerfile ? ` --from ${initialEntryOptions.requestedFromDockerfile}` : ""}${initialEntryOptions.requestedFromImage ? ` --from-image ${initialEntryOptions.requestedFromImage}` : ""}`,
     displayName: cliDisplayName(),
     homeDir: process.env.HOME || os.homedir(),
     loadRegistry: registry.load,
@@ -2601,23 +2601,20 @@ async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
     sessionFile: onboardSession.SESSION_FILE,
     withLifecycleLock: sandboxMutationLock.withMcpLifecycleLock,
   });
-  let portableEnvScope:
+  let portableEnvScope = null as
     | import("./onboard/session-bootstrap").PortableOnboardEnvironmentScope
-    | null = null;
+    | null;
   const restorePortableEnvScope = () => portableEnvScope?.restore();
-  // Secure removal remains gated on successful migration of every staged legacy credential.
   let stagedLegacyKeys: string[] = [];
   let onboardTrace: ReturnType<typeof onboardTracing.startOnboardTrace> = {
     collector: null,
     span: null,
   };
-  let completed = false;
-  let preserveIncompleteSession = false;
+  let [completed, preserveIncompleteSession, preserveDeferredExitSession] = [false, false, false];
   registerIncompleteOnboardExitHandlerForSession(
     { ...onboardSession, releaseOnboardLock: portableRetirementEntry.release },
     () => completed || preserveIncompleteSession,
   );
-  let preserveDeferredExitSession = false;
   try {
     await portableRetirementEntry.run(async () => {
       const entryOptions = resolveEntryOptions();
@@ -2661,12 +2658,13 @@ async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
       });
       onboardTrace = onboardTracing.startOnboardTrace(opts, process.env);
       let selectedMessagingChannels: string[] = [];
-      let { session, fromDockerfile } =
+      let { session, fromDockerfile, fromImage } =
         await onboardSessionBootstrap.prepareOnboardSessionValidated(
           {
             resume,
             fresh,
             requestedFromDockerfile,
+            requestedFromImage: entryOptions.requestedFromImage ?? null,
             requestedSandboxName,
             cannotPrompt,
             nonInteractive: isNonInteractive(),
@@ -3052,7 +3050,6 @@ async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
           resumeAgentChanged,
           requestedObservabilityEnabled: runtimeControlRequests.requestedObservabilityEnabled,
           requestedDcodeAutoApprovalMode: runtimeControlRequests.requestedDcodeAutoApprovalMode,
-          rebuildPreservedEnv: opts.rebuildPreservedEnv,
           hostMounts: effectiveHostMounts,
           endpointProvenance,
           recreateSandbox: isRecreateSandbox,
@@ -3124,6 +3121,8 @@ async function runOnboard(opts: OnboardOptions = {}): Promise<void> {
                   hermesApiPortReservationScope,
                   ...createArgs,
                   opts.allowRemovedImmutabilityStateRecord === true,
+                  fromImage ?? null,
+                  opts.toolDisclosure ?? null,
                 ),
               ),
             ),
