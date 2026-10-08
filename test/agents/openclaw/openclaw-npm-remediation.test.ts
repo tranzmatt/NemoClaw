@@ -17,13 +17,17 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  buildRemediatedOpenClawArchive,
+  buildRemediatedOpenClawPluginArchive,
+  fatalOpenClawNpmRemediationDiagnostic,
   hashPackageTree,
   patchCurrentOpenClawCorePackageGraph,
   patchLegacyOpenClawCorePackageGraph,
   patchOpenClawDiagnosticsOtelPackageGraph,
   patchOpenClawDiscordPackageGraph,
   patchOpenClawPluginPackageGraph,
+  patchOpenClawSlackProxyPackageGraph,
+  OpenClawNpmRemediationCommandError,
+  runOpenClawNpmRemediationCommand,
 } from "../../../scripts/lib/openclaw-npm-remediation.mts";
 
 const temporaryDirectories: string[] = [];
@@ -466,6 +470,64 @@ afterEach(() => {
 });
 
 describe("OpenClaw npm remediation", () => {
+  it("bounds a non-returning remediation command and keeps its diagnostic generic", () => {
+    const startedAt = Date.now();
+    let failure: unknown;
+    try {
+      runOpenClawNpmRemediationCommand(
+        process.execPath,
+        ["-e", 'process.stdout.write("private command output"); setInterval(() => {}, 1000);'],
+        undefined,
+        process.env,
+        "fetch replacement",
+        64 * 1024 * 1024,
+        750,
+      );
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(OpenClawNpmRemediationCommandError);
+    expect(failure).toMatchObject({
+      couldNotStart: false,
+      operation: "fetch replacement",
+      timedOut: true,
+      timeoutMs: 750,
+      message: "Remediation command timed out after 750 ms.",
+    });
+    expect(fatalOpenClawNpmRemediationDiagnostic(failure)).toBe(
+      "OpenClaw npm remediation operation 'fetch replacement' timed out after 750 ms.",
+    );
+    expect(String(failure)).not.toContain("private command output");
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+
+  it("replaces bundled Slack proxy-addr bytes and rejects an unexpected source version", () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "nemoclaw-slack-proxy-"));
+    temporaryDirectories.push(directory);
+    const target = path.join(directory, "node_modules/@slack/bolt/node_modules/proxy-addr");
+    const replacement = path.join(directory, "replacement");
+    mkdirSync(target, { recursive: true });
+    mkdirSync(replacement);
+    writeJson(path.join(directory, "package.json"), {
+      name: "@openclaw/slack",
+      version: "2026.9.2",
+    });
+    const metadata = {
+      name: "proxy-addr",
+      dependencies: { forwarded: "0.2.0", "ipaddr.js": "1.9.1" },
+    };
+    writeJson(path.join(target, "package.json"), { ...metadata, version: "2.0.7" });
+    writeJson(path.join(replacement, "package.json"), { ...metadata, version: "2.0.8" });
+    writeFileSync(path.join(target, "index.js"), "vulnerable");
+    writeFileSync(path.join(replacement, "index.js"), "patched");
+    patchOpenClawSlackProxyPackageGraph(directory, replacement);
+    expect(readFileSync(path.join(target, "index.js"), "utf8")).toBe("patched");
+    expect(readJson(path.join(target, "package.json"))).toMatchObject({ version: "2.0.8" });
+    expect(() => patchOpenClawSlackProxyPackageGraph(directory, replacement)).toThrow(
+      "must be proxy-addr@2.0.7",
+    );
+  });
   it("hashes package entries through opened file descriptors", () => {
     const directory = mkdtempSync(path.join(tmpdir(), "nemoclaw-openclaw-tree-integrity-"));
     temporaryDirectories.push(directory);
@@ -829,9 +891,9 @@ describe("OpenClaw npm remediation", () => {
       packageSpec: "openclaw@2026.3.11",
       workingDirectory: fixture.workingDirectory,
     };
-    const remediated = buildRemediatedOpenClawArchive(request);
+    const remediated = buildRemediatedOpenClawPluginArchive(request);
     expect(() =>
-      buildRemediatedOpenClawArchive({
+      buildRemediatedOpenClawPluginArchive({
         ...request,
         expectedPatchedMetadataIntegrity: "sha512-deliberate-mismatch",
       }),

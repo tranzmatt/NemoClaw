@@ -1085,6 +1085,7 @@ usage() {
   printf "    curl -fsSL https://www.nvidia.com/nemoclaw.sh | bash -s -- [options]\n\n"
   printf "  ${C_DIM}Options:${C_RESET}\n"
   printf "    --non-interactive    Skip prompts (uses env vars / defaults)\n"
+  printf "    --express-install    Select Station Express for CI qualification (requires software acceptance)\n"
   printf "    --yes-i-accept-third-party-software Accept the third-party software notice without prompting\n"
   printf "    --defer-onboarding   Install NemoClaw without onboarding for a supported agent when NVIDIA inference credentials are absent\n"
   printf "                          Use only with NEMOCLAW_AGENT=hermes or langchain-deepagents-code, no registered sandboxes, no local model profile,\n"
@@ -5931,6 +5932,24 @@ is_n1x_host() {
   n1x_fastos_release_is_trusted && n1x_has_pci_gpu
 }
 
+# Concept ISO 1.0.2 reports an NVIDIA BOS kernel but has no FastOS marker.
+# This signal only explains why the Deferred preview was not offered; it does
+# not qualify the host for N1x or waive any readiness finding.
+is_nvidia_bos_arm64_host_without_n1x_marker() {
+  [ "$(uname -s 2>/dev/null)" = "Linux" ] || return 1
+  case "$(uname -m 2>/dev/null)" in
+    arm64 | aarch64) ;;
+    *) return 1 ;;
+  esac
+  case "$(uname -r 2>/dev/null)" in
+    *-nvidia-bos) ;;
+    *) return 1 ;;
+  esac
+  local marker=""
+  marker="$(n1x_fastos_release_path)"
+  [ ! -e "$marker" ] && [ ! -L "$marker" ]
+}
+
 detect_express_platform() {
   local firmware_state="" release_state=""
   if is_wsl_host; then
@@ -6045,6 +6064,26 @@ fail_force_station_terminal_required() {
   error "--force-station-install selects the DGX Station express prompt, which needs an interactive terminal. Re-run from a terminal (for a curl|bash pipe, /dev/tty must be available), or omit --force-station-install."
 }
 
+validate_noninteractive_express_install() {
+  [ "${EXPRESS_INSTALL:-}" = "1" ] || return 0
+  [ "$1" = "DGX Station" ] \
+    || error "--express-install requires a supported DGX Station (detected: ${1:-unsupported platform})."
+  [ "${ACCEPT_THIRD_PARTY_SOFTWARE:-${NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE:-}}" = "1" ] \
+    || error "--express-install requires --yes-i-accept-third-party-software or NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1."
+  if [ "${STATION_DEEPSEEK:-}" = "1" ] || [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
+    error "--express-install cannot be combined with the interactive --station-deepseek or --force-station-install flags."
+  fi
+  [ "${DEFER_ONBOARDING:-}" != "1" ] \
+    || error "--express-install cannot be combined with --defer-onboarding."
+  [ "${NEMOCLAW_NO_EXPRESS:-}" != "1" ] \
+    || error "--express-install cannot be combined with NEMOCLAW_NO_EXPRESS=1 or a local model profile."
+  [ -z "${NEMOCLAW_PROVIDER:-}" ] \
+    || error "--express-install selects its provider; remove NEMOCLAW_PROVIDER."
+  [ -z "${NEMOCLAW_NON_INTERACTIVE_SUDO_MODE:-}" ] \
+    || error "--express-install cannot enable sudo prompts; unset NEMOCLAW_NON_INTERACTIVE_SUDO_MODE."
+  _STATION_INSTALL_MODE="express"
+}
+
 validate_force_station_install_override() {
   local platform="$1" release_state
   if [ "${FORCE_STATION_INSTALL:-}" != "1" ]; then
@@ -6134,6 +6173,7 @@ preflight_explicit_express_flags() {
   _PREFLIGHT_EXPRESS_PLATFORM="$(detect_express_platform)" \
     || error "Cannot classify NVIDIA platform identity. Refusing to continue installation."
   validate_express_platform_boundary "$_PREFLIGHT_EXPRESS_PLATFORM"
+  validate_noninteractive_express_install "$_PREFLIGHT_EXPRESS_PLATFORM"
   validate_force_station_install_override "$_PREFLIGHT_EXPRESS_PLATFORM"
   validate_station_deepseek_override "$_PREFLIGHT_EXPRESS_PLATFORM"
 }
@@ -6714,7 +6754,9 @@ activate_express_install() {
   fi
   NON_INTERACTIVE=1
   export NEMOCLAW_NON_INTERACTIVE=1
-  export NEMOCLAW_NON_INTERACTIVE_SUDO_MODE=prompt
+  if [ "${EXPRESS_INSTALL:-}" != "1" ]; then
+    export NEMOCLAW_NON_INTERACTIVE_SUDO_MODE=prompt
+  fi
   export NEMOCLAW_YES=1
   export NEMOCLAW_POLICY_MODE=suggested
   unset NEMOCLAW_STATION_EXPRESS
@@ -6783,7 +6825,13 @@ run_station_host_preparation() {
   if [ "${FORCE_STATION_INSTALL:-}" = "1" ]; then
     helper_args+=(--force-station-install)
   fi
-  bash "$helper" "${helper_args[@]}" 2>&1 | filter_station_host_preparation_output
+  if [ "${EXPRESS_INSTALL:-}" = "1" ]; then
+    sudo -n true >/dev/null 2>&1 \
+      || error "--express-install requires non-interactive sudo for Station host preparation. Ask the host operator to prepare the required access."
+    NEMOCLAW_STATION_PREP_SUDO_NONINTERACTIVE=1 bash "$helper" "${helper_args[@]}" 2>&1 | filter_station_host_preparation_output
+  else
+    bash "$helper" "${helper_args[@]}" 2>&1 | filter_station_host_preparation_output
+  fi
 }
 
 filter_station_host_preparation_output() {
@@ -7180,10 +7228,6 @@ prepare_installer_host() {
   ensure_openshell_build_deps
 }
 
-# Prompt the user to opt into express install on qualified platforms or the
-# Deferred N1x preview. Sets non-interactive + provider/model env vars when accepted. Skipped when
-# the user already passed --non-interactive, set NEMOCLAW_PROVIDER, or has
-# no TTY.
 describe_express_install() {
   local platform="$1"
   local inference_summary=""
@@ -7331,6 +7375,7 @@ maybe_offer_express_install() {
   platform="$(detect_express_platform)" \
     || error "Cannot classify NVIDIA platform identity. Refusing to continue installation."
   validate_express_platform_boundary "$platform"
+  validate_noninteractive_express_install "$platform"
   validate_force_station_install_override "$platform"
   validate_station_deepseek_override "$platform"
 
@@ -7357,8 +7402,12 @@ maybe_offer_express_install() {
     resume_loaded_station_install "$platform"
     return 0
   fi
-  # Not on a platform we have an express recipe for — say nothing.
+  # A Concept ISO-style host is outside the N1x preview identity boundary.
   if [ -z "$platform" ]; then
+    if is_nvidia_bos_arm64_host_without_n1x_marker; then
+      warn "NVIDIA BOS ARM64 host has no /etc/fastos-release, as reported for Concept ISO 1.0.2."
+      warn "The Deferred N1x Express preview requires a trusted N1x FASTOS marker. Continuing with ordinary onboarding."
+    fi
     return 0
   fi
   # On a detected Express platform but a skip condition applies — explain why so
@@ -7400,6 +7449,11 @@ maybe_offer_express_install() {
   if [ "$platform" = "DGX Station" ] && [[ -e "$resume_file" || -L "$resume_file" ]]; then
     load_station_express_resume
     resume_loaded_station_install "$platform"
+    return 0
+  fi
+  if [ "${EXPRESS_INSTALL:-}" = "1" ]; then
+    activate_express_install "$platform"
+    info "Using express install for ${platform}."
     return 0
   fi
   if [ "${NON_INTERACTIVE:-}" = "1" ]; then
@@ -7541,6 +7595,7 @@ main() {
   FORCE_FRESH_INSTALL=""
   STATION_DEEPSEEK=""
   FORCE_STATION_INSTALL=""
+  EXPRESS_INSTALL=""
   LOCAL_MODEL_RUNTIME=""
   EXPERIMENTAL_PROFILE="${NEMOCLAW_EXPERIMENTAL_PROFILE:-}"
   local expect_experimental_profile=""
@@ -7551,6 +7606,11 @@ main() {
       continue
     fi
     case "$arg" in
+      --express-install)
+        EXPRESS_INSTALL=1
+        NON_INTERACTIVE=1
+        NON_INTERACTIVE_SOURCE="the --express-install flag"
+        ;;
       --non-interactive)
         NON_INTERACTIVE=1
         NON_INTERACTIVE_SOURCE="the --non-interactive flag"
