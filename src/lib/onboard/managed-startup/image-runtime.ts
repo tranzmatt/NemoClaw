@@ -15,7 +15,9 @@ import {
   HERMES_RELAY_PLUGINS_STAGING_FILE,
   HERMES_SWITCHYARD_DEPLOYMENT_FILE,
   HERMES_SWITCHYARD_DEPLOYMENT_STAGING_FILE,
+  assertSwitchyardRootApplyEnvironment,
   readHermesSwitchyardRoutingEnvironment,
+  readSwitchyardProviderBindingsEnvironment,
   serializeHermesSwitchyardRouting,
 } from "../../hermes-switchyard-routing";
 import {
@@ -953,7 +955,17 @@ function verifyCommittedRoutingFile(target: string, expected: Buffer): void {
     Number(installed.stat.mode & 0o777n) !== 0o444 ||
     !installed.bytes.equals(expected)
   ) {
-    fail(`committed Hermes routing artifact drifted: ${target}`);
+    fail(
+      `committed Hermes routing artifact drifted: ${target}\n` +
+        "Hermes startup stopped because its protected routing configuration does not match this image.\n" +
+        "Do not edit the protected routing files to bypass this check.\n" +
+        "To start a fresh Hermes sandbox, run on the host:\n" +
+        "  nemoclaw onboard --fresh --agent hermes --name <new-name> --switchyard-config <routing-config.json>\n" +
+        "Replace <new-name> with an unused sandbox name and <routing-config.json> with your Switchyard routing JSON file.\n" +
+        "This creates a fresh workspace; it does not recover data from the failed sandbox.\n" +
+        "Restoring your previous data requires an independently maintained backup.\n" +
+        "Do not delete the failed sandbox while data recovery is unresolved.",
+    );
   }
 }
 
@@ -990,7 +1002,10 @@ export function installHermesSwitchyardRoutingFiles(
     removeSafeRootFile(paths.switchyardDeploymentTarget);
     return;
   }
-  const serialized = serializeHermesSwitchyardRouting(routing);
+  const serialized = serializeHermesSwitchyardRouting(
+    routing,
+    readSwitchyardProviderBindingsEnvironment(configurationEnvironment, routing),
+  );
   const expectedRelay = Buffer.from(serialized.relayPluginsToml, "utf8");
   const expectedRelayState = Buffer.from(serialized.relayPluginStateJson, "utf8");
   const expectedDeployment = Buffer.from(serialized.switchyardDeploymentToml, "utf8");
@@ -1040,7 +1055,10 @@ export function verifyHermesSwitchyardRoutingFiles(
     assertRoutingFileAbsent(paths.switchyardDeploymentTarget);
     return;
   }
-  const serialized = serializeHermesSwitchyardRouting(routing);
+  const serialized = serializeHermesSwitchyardRouting(
+    routing,
+    readSwitchyardProviderBindingsEnvironment(configurationEnvironment, routing),
+  );
   verifyCommittedRoutingFile(
     paths.relayPluginsTarget,
     Buffer.from(serialized.relayPluginsToml, "utf8"),
@@ -1662,6 +1680,22 @@ function applyAdapter(
   if (mapped.agent !== context.agent) {
     fail(`mapped ${mapped.agent} environment for ${context.agent}`);
   }
+  if (context.agent === "openclaw") {
+    // A replacement can retain a fresh native owner from another PID namespace.
+    // Prove it has ended before the generator or validator opens restored state.
+    execute(
+      [
+        "/usr/local/bin/node",
+        "/usr/local/lib/nemoclaw/openclaw-legacy-migrations.mts",
+        "--wait-gateway-executable",
+        "/usr/local/bin/openclaw",
+        "2026.10.5",
+      ],
+      "sandbox",
+      mapped.configurationEnvironment,
+      mapped.applicationRuntime,
+    );
+  }
   const commandPlan = buildManagedStartupImageActionPlan({
     agent: mapped.agent,
     actions: mapped.actions,
@@ -1747,6 +1781,13 @@ export async function applyManagedStartupImageProfile(
   }
   if (profile.agent !== expectedAgent) {
     fail(`managed startup profile targets ${profile.agent}, expected ${expectedAgent}`);
+  }
+  if (profile.agentConfig.agent === "hermes" && profile.agentConfig.switchyardRouting) {
+    if (!profile.agentConfig.switchyardBindings) fail("Switchyard provider bindings are missing");
+    assertSwitchyardRootApplyEnvironment(env, {
+      routing: profile.agentConfig.switchyardRouting,
+      bindings: profile.agentConfig.switchyardBindings,
+    });
   }
   requireManagedStartupExchangeDirectory();
   const mapped = mapManagedStartupProfileToAgentEnvironment(profile, env);

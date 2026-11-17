@@ -77,8 +77,12 @@ import { cloneSandboxWorkloadReceipt } from "./registry/workload.js";
 import * as registry from "./registry.js";
 import { isSshTransportFailure } from "./ssh-transport.js";
 import {
+  DCODE_QUICKJS_DIAGNOSTIC,
+  formatDcodeScanDiagnostic,
+  type NativeScanDiagnostic,
   inspectExtractedDcodeSessionsDatabase,
   inspectExtractedOpenClawDatabase,
+  normalizeDcodeSessionDiagnostic,
 } from "./snapshot/sqlite-credential-scan.js";
 import { withoutOpenClawSqliteMachineAuthority } from "./snapshot/openclaw-sqlite-sanitizer.js";
 import { nemoclawStateRoot } from "./state-root.js";
@@ -106,6 +110,10 @@ const NATIVE_STATE_CREDENTIAL_SCAN_MAX_BYTES = 16 * 1024 * 1024;
 // These paths are NemoClaw control-plane state, not native agent state. The
 // target image regenerates config.json and its root-owned blueprint cache. The
 // OpenClaw doctor marker and warm-up sessions are transient lifecycle state.
+// Native doctor/update captures are private rollback snapshots, explicitly
+// excluded by OpenClaw from backups and support exports. They may contain
+// pre-sanitization credentials; preserve the active state through its normal
+// sanitization path instead of exporting these generation-local snapshots.
 // Hermes' PID and lock files identify processes in one sandbox generation;
 // restoring them over the replacement gateway makes a healthy process appear
 // stale to authenticated lifecycle commands.
@@ -113,6 +121,8 @@ const NATIVE_STATE_CAPTURE_TAR_EXCLUDES = [
   "--exclude='./.nemoclaw/config.json'",
   "--exclude='./.nemoclaw/blueprints'",
   "--exclude='./.openclaw/.nemoclaw-post-upgrade-doctor'",
+  "--exclude='./.openclaw.update-captures'",
+  "--exclude='./.openclaw-data.update-captures'",
   "--exclude='./.openclaw/agents/main/sessions/nemoclaw-onboard-warmup-*'",
   "--exclude='./.openclaw/state/openclaw.sqlite'",
   "--exclude='./.openclaw/state/openclaw.sqlite-journal'",
@@ -1733,6 +1743,7 @@ function scanNativeTarFilePayload(
   hermesManagedConfig: boolean,
   privateKeyHeader: boolean,
   dependencyBinary: boolean,
+  dcodeSidecar: boolean,
   deadlineMs: number | undefined,
 ): boolean | null | "deadline" {
   const chunk = Buffer.allocUnsafe(NATIVE_CREDENTIAL_SCAN_CHUNK_BYTES);
@@ -1747,7 +1758,17 @@ function scanNativeTarFilePayload(
     if (dependencyBinary && offset === position && chunk.subarray(0, count).includes(0)) {
       return false;
     }
-    const raw = overlap + chunk.subarray(0, count).toString("utf8");
+    let raw = overlap + chunk.subarray(0, count).toString("utf8");
+    if (dcodeSidecar) raw = normalizeDcodeSessionDiagnostic(raw);
+    // Carry normalized diagnostics so an overlap cannot retain only their token assignment.
+    overlap = raw.slice(-NATIVE_CREDENTIAL_SCAN_OVERLAP_CHARS);
+    if (dcodeSidecar && remaining > count) {
+      const diagnosticStart = raw.lastIndexOf("\0");
+      if (diagnosticStart >= 0 && DCODE_QUICKJS_DIAGNOSTIC.startsWith(raw.slice(diagnosticStart))) {
+        // The next chunk completes this possible diagnostic. At EOF, scan incomplete bytes normally.
+        raw = raw.slice(0, diagnosticStart);
+      }
+    }
     if (npmConfig && npmConfigContainsCredentialDirective(raw)) return true;
     // Provider profiles describe whether injected material is secret with a
     // boolean schema field. Mask only that declaration; an opaque string in
@@ -1774,7 +1795,6 @@ function scanNativeTarFilePayload(
     ) {
       return true;
     }
-    overlap = raw.slice(-NATIVE_CREDENTIAL_SCAN_OVERLAP_CHARS);
     offset += count;
     remaining -= count;
   }
@@ -2174,6 +2194,7 @@ function nativeArchiveRawCredentialViolation(
   archivePath: string,
   deadlineMs: number | undefined,
   rawEntries?: string[],
+  reportDiagnostic: (diagnostic: NativeScanDiagnostic) => void = () => {},
 ): NativeArchiveCredentialViolation {
   let descriptor: number | null = null;
   try {
@@ -2217,10 +2238,12 @@ function nativeArchiveRawCredentialViolation(
           hermesManagedConfig,
           !dependencyTree,
           dependencyTree,
+          dcodeSessionsDatabaseRole === "sidecar",
           deadlineMs,
         );
         if (violation === "deadline") return { entry, deadlineExpired: true };
         if (violation === null) return "native state credential scan";
+        if (violation) reportDiagnostic({ kind: "credential-content" });
         return violation ? entry : null;
       },
       deadlineMs,
@@ -2236,9 +2259,15 @@ function nativeArchiveCredentialViolation(
   archivePath: string,
   entries: readonly string[],
   deadlineMs: number | undefined,
+  reportDiagnostic: (diagnostic: NativeScanDiagnostic) => void = () => {},
 ): NativeArchiveCredentialViolation {
   const rawEntries: string[] = [];
-  const rawViolation = nativeArchiveRawCredentialViolation(archivePath, deadlineMs, rawEntries);
+  const rawViolation = nativeArchiveRawCredentialViolation(
+    archivePath,
+    deadlineMs,
+    rawEntries,
+    reportDiagnostic,
+  );
   if (rawViolation) return rawViolation;
   if (rawEntries.length !== entries.length) return "native state credential scan";
   const candidates: Array<{
@@ -2295,6 +2324,7 @@ function nativeArchiveCredentialViolation(
     ({ dcodeSessionsDatabaseRole }) => dcodeSessionsDatabaseRole === "sidecar",
   );
   if (!dcodeSessionsDatabase && orphanedDcodeSessionsDatabaseSidecar) {
+    reportDiagnostic({ kind: "sqlite-inspection", reason: "file-access" });
     return orphanedDcodeSessionsDatabaseSidecar.entry;
   }
 
@@ -2321,7 +2351,8 @@ function nativeArchiveCredentialViolation(
           deadlineExpired: true,
         };
       }
-      throw error;
+      reportDiagnostic({ kind: "extraction" });
+      return candidates[0]?.entry ?? "native state credential scan";
     }
     if ((extracted.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") {
       return {
@@ -2330,6 +2361,7 @@ function nativeArchiveCredentialViolation(
       };
     }
     if (extracted.status !== 0 || extracted.error || extracted.signal) {
+      reportDiagnostic({ kind: "extraction" });
       return candidates[0]?.entry ?? "native state credential scan";
     }
     for (const candidate of candidates) {
@@ -2338,7 +2370,8 @@ function nativeArchiveCredentialViolation(
         const containsCredential = inspectExtractedDcodeSessionsDatabase(
           scanRoot,
           candidate.entry,
-          (reason) => console.error(`DCode session database inspection failed (${reason}).`),
+          (reason) => reportDiagnostic({ kind: "sqlite-inspection", reason }),
+          (finding) => reportDiagnostic({ kind: "credential-content", finding }),
         );
         if (containsCredential !== false) return candidate.entry;
         continue;
@@ -2347,13 +2380,20 @@ function nativeArchiveCredentialViolation(
         const containsCredential = inspectExtractedOpenClawDatabase(
           scanRoot,
           candidate.entry,
-          (reason) => console.error(`OpenClaw database inspection failed (${reason}).`),
+          (reason) => {
+            console.error(`OpenClaw database inspection failed (${reason}).`);
+            reportDiagnostic({ kind: "sqlite-inspection", reason });
+          },
         );
-        if (containsCredential !== false) return candidate.entry;
+        if (containsCredential !== false) {
+          if (containsCredential) reportDiagnostic({ kind: "credential-content" });
+          return candidate.entry;
+        }
         continue;
       }
       const extractedCandidate = readExtractedNativeCredentialCandidate(scanRoot, candidate.entry);
       if (!extractedCandidate) {
+        reportDiagnostic({ kind: "extraction" });
         return candidate.entry;
       }
       if (extractedCandidate.kind === "oversize") {
@@ -2375,6 +2415,7 @@ function nativeArchiveCredentialViolation(
           !candidate.isEnv &&
           !structuredContentIsCredentialFree(candidate.entry, raw))
       ) {
+        reportDiagnostic({ kind: "credential-content" });
         return candidate.entry;
       }
     }
@@ -2735,6 +2776,7 @@ function capturePreparedNativeState(
           '  rm -f -- "$stage/.nemoclaw/config.json"',
           '  rm -rf -- "$stage/.nemoclaw/blueprints"',
           '  rm -f -- "$stage/.openclaw/.nemoclaw-post-upgrade-doctor"',
+          '  rm -rf -- "$stage/.openclaw.update-captures" "$stage/.openclaw-data.update-captures"',
           '  rm -rf -- "$stage"/.openclaw/agents/main/sessions/nemoclaw-onboard-warmup-*',
           '  rm -f -- "$stage/.openclaw/state/openclaw.sqlite"*',
           '  rm -f -- "$stage/.openclaw-data/state/openclaw.sqlite"*',
@@ -2919,7 +2961,9 @@ function backupNativeSandboxState(
           'ancestors=" $self "',
           "cursor=$PPID",
           'while [ "$cursor" -gt 1 ] 2>/dev/null; do ancestors="$ancestors$cursor "; parent=""; { while IFS=":" read -r key value; do if [ "$key" = "PPid" ]; then set -- $value; parent=${1:-}; break; fi; done; } 2>/dev/null < "/proc/$cursor/status" || break; cursor=$parent; [ -n "$cursor" ] || break; done',
-          'collect_candidates() { candidates=""; for proc in /proc/[0-9]*; do pid=${proc##*/}; case "$ancestors" in *" $pid "*) continue ;; esac; owner=""; while IFS=":" read -r key value; do if [ "$key" = "Uid" ]; then set -- $value; owner=${1:-}; break; fi; done 2>/dev/null < "$proc/status" || :; [ "$owner" = "$uid" ] && candidates="$candidates $pid"; done; }',
+          // A foreign or vanished final PID is normal; do not let its failed UID
+          // comparison become the function status under set -e.
+          'collect_candidates() { candidates=""; for proc in /proc/[0-9]*; do pid=${proc##*/}; case "$ancestors" in *" $pid "*) continue ;; esac; owner=""; while IFS=":" read -r key value; do if [ "$key" = "Uid" ]; then set -- $value; owner=${1:-}; break; fi; done 2>/dev/null < "$proc/status" || :; [ "$owner" = "$uid" ] && candidates="$candidates $pid"; done; return 0; }',
           'stopped=""',
           'resume() { [ -z "$stopped" ] || kill -CONT $stopped 2>/dev/null || :; rm -rf -- "$db_stage"; }',
           "trap resume EXIT HUP INT TERM",
@@ -3019,7 +3063,9 @@ function backupNativeSandboxState(
     if (rawArchiveViolation && typeof rawArchiveViolation !== "string") {
       rmSync(backupPath, { recursive: true, force: true });
       return nativeStateFailure(
-        `Native archive credential scan exceeded the backup deadline at '${rawArchiveViolation.entry}'`,
+        agentName === "langchain-deepagents-code"
+          ? formatDcodeScanDiagnostic(rawArchiveViolation.entry, { kind: "deadline-expiry" })
+          : `Native archive credential scan exceeded the backup deadline at '${rawArchiveViolation.entry}'`,
       );
     }
     if (rawArchiveViolation === "native state sparse archive entry") {
@@ -3074,26 +3120,38 @@ function backupNativeSandboxState(
       rmSync(backupPath, { recursive: true, force: true });
       return nativeStateFailure(`Native state archive sanitation failed: ${sanitationFailure}`);
     }
+    let scanDiagnostic: NativeScanDiagnostic = { kind: "archive-inspection" };
     const credentialViolation = nativeArchiveCredentialViolation(
       archivePath,
       validation.entries,
       options.deadlineMs,
+      (diagnostic) => {
+        scanDiagnostic = diagnostic;
+      },
     );
     if (credentialViolation) {
       rmSync(backupPath, { recursive: true, force: true });
       if (typeof credentialViolation !== "string") {
         return nativeStateFailure(
-          `Native archive credential scan exceeded the backup deadline at '${credentialViolation.entry}'`,
+          agentName === "langchain-deepagents-code"
+            ? formatDcodeScanDiagnostic(credentialViolation.entry, { kind: "deadline-expiry" })
+            : `Native archive credential scan exceeded the backup deadline at '${credentialViolation.entry}'`,
         );
       }
       return nativeStateFailure(
-        `Rebuild was aborted because the native state archive contains credential-bearing or uninspectable content at '${credentialViolation}'. Move credentials to supported OpenShell credential storage and retry.`,
+        agentName === "langchain-deepagents-code"
+          ? formatDcodeScanDiagnostic(credentialViolation, scanDiagnostic)
+          : `Rebuild was aborted because the native state archive contains credential-bearing or uninspectable content at '${credentialViolation}'. Move credentials to supported OpenShell credential storage and retry.`,
       );
     }
     if (backupDeadlineExpired(options.deadlineMs)) {
+      const deadlineFailure =
+        agentName === "langchain-deepagents-code"
+          ? formatDcodeScanDiagnostic("native state archive", { kind: "deadline-expiry" })
+          : "Native archive validation exceeded the backup deadline";
       if (!options.deferSanitizationDeadlineCleanup) {
         rmSync(backupPath, { recursive: true, force: true });
-        return nativeStateFailure("Native archive validation exceeded the backup deadline");
+        return nativeStateFailure(deadlineFailure);
       }
       const incompleteManifest: RebuildManifest = {
         version: MANIFEST_VERSION,
@@ -3114,7 +3172,7 @@ function backupNativeSandboxState(
       };
       writeManifest(backupPath, incompleteManifest);
       return {
-        ...nativeStateFailure("Native archive validation exceeded the backup deadline"),
+        ...nativeStateFailure(deadlineFailure),
         manifest: incompleteManifest,
       };
     }
